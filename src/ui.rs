@@ -1,7 +1,8 @@
 //! Ratatui front-end: a scrolling transcript, a multi-line input box and a
 //! one-line footer, in the spirit of pi's minimal interface.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -151,6 +152,10 @@ pub struct App {
   anchor: Option<usize>,
   /// Offset and maximum offset used by the last draw, for relative scrolling.
   view: (usize, usize),
+  /// Rendered markdown, keyed by message text and width rather than by entry,
+  /// so reloading a session or compacting cannot serve another entry's lines.
+  /// Rebuilt each draw by moving live entries across, which evicts the rest.
+  markdown: HashMap<(u64, u16, bool), Vec<Line<'static>>>,
   usage: Usage,
   /// Size of the last completion request, for the footer and compaction.
   /// `None` until the provider reports usage for a request (pi hides the
@@ -200,6 +205,7 @@ impl App {
       queued: VecDeque::new(),
       anchor: None,
       view: (0, 0),
+      markdown: HashMap::new(),
       usage: Usage::new(),
       context_tokens: None,
       tick: 0,
@@ -811,7 +817,10 @@ impl App {
     if self.scrollbar == ScrollbarMode::Always && content_area.width > 1 {
       content_area.width -= 1;
     }
-    let paragraph = Paragraph::new(self.transcript_lines()).wrap(Wrap { trim: false });
+    // Markdown arrives pre-wrapped to this width, so `Wrap` passes it through
+    // untouched and still handles the entries that stay literal.
+    let lines = self.transcript_lines(content_area.width);
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let total = paragraph.line_count(content_area.width);
     let viewport = content_area.height as usize;
     let max_scroll = total.saturating_sub(viewport);
@@ -969,10 +978,19 @@ impl App {
     f.render_widget(Paragraph::new(Line::from(left)), footer_area);
   }
 
-  fn transcript_lines(&self) -> Vec<Line<'static>> {
+  /// Builds the transcript for a `width`-column viewport.
+  ///
+  /// Assistant text is the only markdown here: tool output, diffs and
+  /// reasoning are literal, and parsing them as markdown would mangle them.
+  fn transcript_lines(&mut self, width: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let dim = Style::default().add_modifier(Modifier::DIM);
-    for entry in &self.entries {
+    let mut cached = std::mem::take(&mut self.markdown);
+    let mut live = HashMap::with_capacity(cached.len());
+    // Only the last entry can still be growing, and only while a turn is in
+    // flight. Everything else is final, and is parsed as written.
+    let streaming = self.run.is_some().then(|| self.entries.len().saturating_sub(1));
+    for (i, entry) in self.entries.iter().enumerate() {
       match entry {
         Entry::User(text) => {
           lines.push(Line::default());
@@ -986,9 +1004,19 @@ impl App {
         }
         Entry::Assistant(text) => {
           lines.push(Line::default());
-          for l in text.lines() {
-            lines.push(Line::raw(l.to_string()));
-          }
+          // Only the streaming entry changes between frames; the rest come
+          // back from the cache untouched, so a long transcript costs one
+          // parse per message rather than one per draw. `streaming` is part
+          // of the key so the completed text is not served its mid-stream
+          // rendering, which closes tokens this one should leave literal.
+          let streaming = streaming == Some(i);
+          let key = (hash(text), width, streaming);
+          let rendered = match cached.remove(&key) {
+            Some(rendered) => rendered,
+            None => crate::markdown::render(text, width, streaming),
+          };
+          lines.extend(rendered.iter().cloned());
+          live.insert(key, rendered);
         }
         Entry::Reasoning(text) => {
           lines.push(Line::default());
@@ -1100,8 +1128,16 @@ impl App {
         }
       }
     }
+    self.markdown = live;
     lines
   }
+}
+
+/// Identifies a message by content, for the rendered-markdown cache.
+fn hash(text: &str) -> u64 {
+  let mut hasher = DefaultHasher::new();
+  text.hash(&mut hasher);
+  hasher.finish()
 }
 
 /// Alt+Enter and Shift+Enter (where the terminal reports it) insert a newline.

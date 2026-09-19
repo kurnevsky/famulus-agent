@@ -2,6 +2,7 @@ mod agent;
 mod compaction;
 mod edit;
 mod images;
+mod markdown;
 mod session;
 mod tools;
 mod ui;
