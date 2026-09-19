@@ -82,7 +82,11 @@ tail), the moves `/tree` makes, and renames. Aborted turns keep the prompt and
 any partial answer. Because entries name their parent, one file holds every
 branch the conversation took, not only the one it is on.
 
-- `src/session.rs` – store, session file, listing, and replay. A message
+- `src/session.rs` – store, session file, listing, and replay. Tool results
+  travel in a message of their own, after the one that asked for them, so
+  rebuilding the transcript pairs each with the call it answers rather than
+  taking the history as it comes — a turn that ran two commands at once would
+  otherwise read as both commands and then both outputs. A message
   record also notes which of the tool calls it answers came back an error:
   nothing in a tool result says so, and without it a reopened session would
   draw every command as though it had worked.
@@ -157,6 +161,13 @@ with them under a cursor.
 ⚙ bash cargo test --all --release -- --nocapture
 ```
 
+Everything in the transcript is bound to its tool call by the call's own id,
+not by where it happens to sit: the line a command's live output goes under,
+the result that replaces it, and the pairing rebuilt on reload. Tools run one
+at a time (rig's `tool_concurrency` defaults to 1 and fa leaves it there), but
+were that raised, two commands in flight would still each keep their own
+output.
+
 A command's output is green when it succeeded and red when it did not, live
 and on a session reopened later alike. Other tools stay dim, since exit status
 is a thing commands have; a failed `read` or `edit` is still red.
@@ -215,7 +226,11 @@ mouse usually requires holding `Shift`.
   `AgentEvent`s to the UI over a channel. Tool-call argument fragments are
   accumulated per call and sent whole, so the UI has nothing to reassemble.
   Tool calls and results are reported
-  through an `AgentHook` so they stay ordered and carry an error flag. On the
+  through an `AgentHook`, which carries the call id and an error flag.
+  Nothing in rig hands a tool its own call id and the hook that knows it runs
+  before the body rather than around it, so for `bash` the hook rewrites the
+  arguments to carry it — the one channel between the two. It is stripped from
+  the schema, so the model is never asked for it and never sends it. On the
   OpenAI path a `CompletionModel` wrapper moves images out of tool results into
   a follow-up user message, since the chat completions API only accepts text
   in tool messages (the same workaround pi's provider uses). Gemini accepts

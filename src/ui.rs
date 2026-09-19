@@ -15,7 +15,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Scrollbar, Scrollb
 use ratatui::{DefaultTerminal, Frame};
 use ratatui_textarea::{TextArea, WrapMode};
 use rig_core::completion::{Message, Usage};
-use rig_core::message::{AssistantContent, ToolResultContent, UserContent};
+use rig_core::message::{AssistantContent, ToolCall, ToolResult, ToolResultContent, UserContent};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -191,12 +191,16 @@ enum Entry {
   ToolCall {
     name: String,
     summary: String,
+    /// The call this is, so its output finds it again when several tools are
+    /// in flight at once and finish in whatever order they finish.
+    call: String,
     started: Instant,
   },
   ToolResult {
     name: String,
     output: String,
     is_error: bool,
+    call: String,
     /// Still streaming; `output` is a live snapshot.
     running: bool,
     /// Numbered diff for `edit`, rendered instead of `output`.
@@ -932,7 +936,7 @@ impl App {
         Some(writing) => (writing.name, writing.args) = (name, args),
         None => self.writing.push(Writing { id, name, args }),
       },
-      AgentEvent::ToolCall { name, args } => {
+      AgentEvent::ToolCall { name, args, call } => {
         // The oldest call still being written is this one: calls are run in
         // the order they were written, so it stops being a line the model is
         // typing and becomes one the transcript keeps.
@@ -943,27 +947,15 @@ impl App {
         self.entries.push(Entry::ToolCall {
           name,
           summary,
+          call,
           started: Instant::now(),
         });
       }
-      AgentEvent::ToolOutput(text) => match self.entries.last_mut() {
-        Some(Entry::ToolResult {
-          running: true, output, ..
-        }) => *output = text,
-        Some(Entry::ToolCall { name, started, .. }) => {
-          let (name, started) = (name.clone(), *started);
-          self.entries.push(Entry::ToolResult {
-            name,
-            output: text,
-            is_error: false,
-            running: true,
-            diff: None,
-            started,
-            took: None,
-          });
-        }
-        _ => {}
-      },
+      // Output goes under the call it came from, wherever that call's line
+      // has ended up — not under whatever the transcript happens to end with.
+      AgentEvent::ToolOutput { call, text } => {
+        place_output(&mut self.entries, call, text);
+      }
       AgentEvent::ToolResult {
         name,
         output,
@@ -971,25 +963,10 @@ impl App {
         call,
         diff,
       } => {
-        if is_error && let Some(call) = call {
-          self.failing.insert(call);
+        if is_error {
+          self.failing.insert(call.clone());
         }
-        if matches!(self.entries.last(), Some(Entry::ToolResult { running: true, .. })) {
-          self.entries.pop();
-        }
-        let started = match self.entries.last() {
-          Some(Entry::ToolCall { started, .. }) => *started,
-          _ => Instant::now(),
-        };
-        self.entries.push(Entry::ToolResult {
-          name,
-          output,
-          is_error,
-          running: false,
-          diff,
-          started,
-          took: Some(started.elapsed()),
-        });
+        place_result(&mut self.entries, name, output, is_error, call, diff);
       }
       AgentEvent::Error(err) => {
         self.entries.push(Entry::Error(err));
@@ -1386,6 +1363,7 @@ impl App {
           diff,
           started,
           took,
+          ..
         } => {
           if let Some(diff) = diff {
             // An edit is shown as a diff: removed red, added green, context
@@ -1537,11 +1515,178 @@ fn filter_commands(matcher: &mut Matcher, query: &str) -> Vec<Match> {
   scored.into_iter().map(|(_, m)| m).collect()
 }
 
+/// Where the call `call` was announced.
+///
+/// Searched from the end: a reopened session brings its old calls back as
+/// entries, and a server that numbers calls from one per turn hands out ids
+/// the transcript already holds. The live one is the one written last.
+fn call_at(entries: &[Entry], call: &str) -> Option<usize> {
+  entries.iter().rposition(|entry| match entry {
+    Entry::ToolCall { call: at, .. } => at == call,
+    _ => false,
+  })
+}
+
+/// Where that call's output is being drawn while it runs.
+fn running_at(entries: &[Entry], call: &str) -> Option<usize> {
+  entries.iter().rposition(|entry| match entry {
+    Entry::ToolResult {
+      running: true,
+      call: at,
+      ..
+    } => at == call,
+    _ => false,
+  })
+}
+
+/// Draw a running command's latest output under the call it came from.
+///
+/// Under the call, rather than at the end of the transcript: two commands can
+/// be in flight at once, and the one that speaks is not always the one that
+/// started last.
+fn place_output(entries: &mut Vec<Entry>, call: String, text: String) {
+  if let Some(i) = running_at(entries, &call)
+    && let Some(Entry::ToolResult { output, .. }) = entries.get_mut(i)
+  {
+    *output = text;
+    return;
+  }
+  let Some(i) = call_at(entries, &call) else { return };
+  let Some(Entry::ToolCall { name, started, .. }) = entries.get(i) else {
+    return;
+  };
+  let (name, started) = (name.clone(), *started);
+  entries.insert(
+    i + 1,
+    Entry::ToolResult {
+      name,
+      output: text,
+      is_error: false,
+      call,
+      running: true,
+      diff: None,
+      started,
+      took: None,
+    },
+  );
+}
+
+/// Replace a command's live output with what it finally said, in place, or
+/// put it under the call that asked for it.
+fn place_result(
+  entries: &mut Vec<Entry>,
+  name: String,
+  output: String,
+  is_error: bool,
+  call: String,
+  diff: Option<String>,
+) {
+  if let Some(i) = running_at(entries, &call) {
+    entries.remove(i);
+  }
+  let at = call_at(entries, &call).map_or(entries.len(), |i| i + 1);
+  let started = match entries.get(at.saturating_sub(1)) {
+    Some(Entry::ToolCall { started, .. }) => *started,
+    _ => Instant::now(),
+  };
+  entries.insert(
+    at,
+    Entry::ToolResult {
+      name,
+      output,
+      is_error,
+      call,
+      running: false,
+      diff,
+      started,
+      took: Some(started.elapsed()),
+    },
+  );
+}
+
+/// Every tool result in a history, and which call each answers.
+struct Results<'a> {
+  results: Vec<&'a ToolResult>,
+  /// Both of the ids a result can be claimed by, to its place above.
+  by_id: HashMap<String, usize>,
+}
+
+impl<'a> Results<'a> {
+  fn collect(history: &'a [Message]) -> Self {
+    let mut results = Vec::new();
+    let mut by_id = HashMap::new();
+    for message in history {
+      let Message::User { content } = message else { continue };
+      for result in content.iter().filter_map(|c| match c {
+        UserContent::ToolResult(result) => Some(result),
+        _ => None,
+      }) {
+        for id in crate::session::result_ids(result) {
+          by_id.insert(id, results.len());
+        }
+        results.push(result);
+      }
+    }
+    Self { results, by_id }
+  }
+
+  fn index(&self, ids: impl Iterator<Item = String>) -> Option<usize> {
+    ids.filter_map(|id| self.by_id.get(&id)).next().copied()
+  }
+
+  fn entry(&self, index: usize, session: &Session, now: Instant) -> Entry {
+    let result = self.results[index];
+    let output = result
+      .content
+      .iter()
+      .map(|c| match c {
+        ToolResultContent::Text(t) => t.text.clone(),
+        ToolResultContent::Json { value } => value.to_string(),
+        ToolResultContent::Image(_) => "[image]".to_string(),
+      })
+      .collect::<Vec<_>>()
+      .join("\n");
+    Entry::ToolResult {
+      name: result.name.clone(),
+      output,
+      call: result.call.as_str().to_string(),
+      // A failed tool result reads like any other in the transcript, so
+      // whether it was one is something the session remembers — against this
+      // result's own call, since one message can answer several calls with
+      // different luck.
+      is_error: crate::session::result_ids(result).any(|id| session.failed(&id)),
+      running: false,
+      diff: None,
+      started: now,
+      took: None,
+    }
+  }
+}
+
+/// Every way a tool call names itself, matching `session::result_ids`.
+fn call_ids(call: &ToolCall) -> impl Iterator<Item = String> + '_ {
+  [
+    Some(call.id.as_str().to_string()),
+    call.provider.as_ref().map(|p| p.call_id.clone()),
+  ]
+  .into_iter()
+  .flatten()
+}
+
 /// Rebuild the transcript view from a resumed session's history.
+///
+/// Tool results travel in a message of their own, after the one that asked
+/// for them, and a turn can ask for several at once — so taking the history
+/// as it comes would read as every call and then every output, in whatever
+/// order the provider sent the answers back. Each result is instead put with
+/// the call it answers, which is the order the transcript had while it was
+/// live.
 fn entries_from_history(session: &Session) -> Vec<Entry> {
   let history = &session.history;
   let now = Instant::now();
   let mut entries = Vec::new();
+  let results = Results::collect(history);
+  let mut answered: HashSet<usize> = HashSet::new();
   for message in history {
     match message {
       Message::System { .. } => {}
@@ -1558,31 +1703,14 @@ fn entries_from_history(session: &Session) -> Vec<Entry> {
                 None => Entry::User(t.text.clone()),
               });
             }
+            // An output nothing claimed — a result whose call is not in this
+            // branch — is still shown, where it was written.
             UserContent::ToolResult(r) => {
-              let output = r
-                .content
-                .iter()
-                .map(|c| match c {
-                  ToolResultContent::Text(t) => t.text.clone(),
-                  ToolResultContent::Json { value } => value.to_string(),
-                  ToolResultContent::Image(_) => "[image]".to_string(),
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-              // A failed tool result reads like any other in the transcript,
-              // so whether it was one is something the session remembers —
-              // against this result's own call, not the message's, since one
-              // message can answer several calls with different luck.
-              let is_error = crate::session::result_ids(r).any(|id| session.failed(&id));
-              entries.push(Entry::ToolResult {
-                name: r.name.clone(),
-                output,
-                is_error,
-                running: false,
-                diff: None,
-                started: now,
-                took: None,
-              });
+              if let Some(i) = results.index(crate::session::result_ids(r))
+                && answered.insert(i)
+              {
+                entries.push(results.entry(i, session, now));
+              }
             }
             _ => {}
           }
@@ -1598,11 +1726,21 @@ fn entries_from_history(session: &Session) -> Vec<Entry> {
                 entries.push(Entry::Reasoning(text));
               }
             }
-            AssistantContent::ToolCall(call) => entries.push(Entry::ToolCall {
-              name: call.function.name.clone(),
-              summary: summarize_args(&call.function.name, &call.function.arguments),
-              started: now,
-            }),
+            AssistantContent::ToolCall(call) => {
+              entries.push(Entry::ToolCall {
+                name: call.function.name.clone(),
+                summary: summarize_args(&call.function.name, &call.function.arguments),
+                call: call.id.as_str().to_string(),
+                started: now,
+              });
+              // The output belongs under the call that asked for it, not
+              // after every call of the turn.
+              if let Some(i) = results.index(call_ids(call))
+                && answered.insert(i)
+              {
+                entries.push(results.entry(i, session, now));
+              }
+            }
             AssistantContent::Image(_) => {}
           }
         }
@@ -2016,6 +2154,186 @@ mod tests {
     // A tool with nothing worth showing early says nothing, rather than
     // guessing.
     assert_eq!(writing_summary("mystery", r#"{"a":"b"#), "");
+  }
+
+  /// Each entry as one line, for asserting what the transcript reads like.
+  fn shapes(entries: &[Entry]) -> Vec<String> {
+    entries
+      .iter()
+      .map(|entry| match entry {
+        Entry::User(text) => format!("user {text}"),
+        Entry::Assistant(text) => format!("said {text}"),
+        Entry::ToolCall { name, summary, .. } => format!("call {name} {summary}"),
+        Entry::ToolResult { name, output, .. } => format!("out {name} {}", first_line(output)),
+        _ => "other".into(),
+      })
+      .collect()
+  }
+
+  #[test]
+  fn two_commands_in_one_turn_keep_their_own_output_on_reload() {
+    // A turn that ran two commands at once, with the provider answering them
+    // in the other order — which is allowed, and which taking the history as
+    // it comes would render as both commands and then both outputs.
+    let call = |id: &str, cmd: &str| AssistantContent::tool_call(id, "bash", serde_json::json!({ "command": cmd }));
+    let result = |id: &str, out: &str| UserContent::tool_result(id, "bash", vec![ToolResultContent::text(out)]);
+    let session = session_of(vec![
+      Message::user("build and test"),
+      Message::Assistant {
+        id: None,
+        content: vec![
+          AssistantContent::text("Doing both."),
+          call("1", "cargo build"),
+          call("2", "cargo test"),
+        ],
+      },
+      Message::User {
+        content: vec![result("2", "test output"), result("1", "build output")],
+      },
+      Message::assistant("Both fine."),
+    ]);
+    assert_eq!(
+      shapes(&entries_from_history(&session)),
+      [
+        "user build and test",
+        "said Doing both.",
+        "call bash cargo build",
+        "out bash build output",
+        "call bash cargo test",
+        "out bash test output",
+        "said Both fine.",
+      ]
+    );
+  }
+
+  fn announced(summary: &str, call: &str) -> Entry {
+    Entry::ToolCall {
+      name: "bash".into(),
+      summary: summary.into(),
+      call: call.into(),
+      started: Instant::now(),
+    }
+  }
+
+  #[test]
+  fn output_finds_its_own_call_when_two_are_in_flight() {
+    // Both commands announced, then output arriving in the other order —
+    // which taking the last entry would put under the wrong one.
+    let mut entries = vec![announced("slow", "a"), announced("quick", "b")];
+    place_output(&mut entries, "b".into(), "quick is talking".into());
+    place_output(&mut entries, "a".into(), "slow is talking".into());
+    assert_eq!(
+      shapes(&entries),
+      [
+        "call bash slow",
+        "out bash slow is talking",
+        "call bash quick",
+        "out bash quick is talking",
+      ]
+    );
+
+    // More output replaces that call's own line rather than adding another.
+    place_output(&mut entries, "a".into(), "slow said more".into());
+    assert_eq!(
+      shapes(&entries),
+      [
+        "call bash slow",
+        "out bash slow said more",
+        "call bash quick",
+        "out bash quick is talking",
+      ]
+    );
+
+    // And the finished results land in the same places, in whatever order
+    // the two commands happen to end.
+    place_result(
+      &mut entries,
+      "bash".into(),
+      "quick done".into(),
+      false,
+      "b".into(),
+      None,
+    );
+    place_result(
+      &mut entries,
+      "bash".into(),
+      "slow failed".into(),
+      true,
+      "a".into(),
+      None,
+    );
+    assert_eq!(
+      shapes(&entries),
+      [
+        "call bash slow",
+        "out bash slow failed",
+        "call bash quick",
+        "out bash quick done",
+      ]
+    );
+    // Each kept its own verdict.
+    let failed: Vec<bool> = entries
+      .iter()
+      .filter_map(|e| match e {
+        Entry::ToolResult { is_error, .. } => Some(*is_error),
+        _ => None,
+      })
+      .collect();
+    assert_eq!(failed, [true, false]);
+  }
+
+  #[test]
+  fn a_new_command_does_not_land_on_a_reloaded_one_of_the_same_id() {
+    // Reopened sessions bring their old calls back as entries, and a server
+    // that numbers calls from one per turn will hand out an id the
+    // transcript already holds. The live one is the one still being written,
+    // so the search runs from the end.
+    let mut entries = vec![
+      announced("old command", "call_1"),
+      Entry::ToolResult {
+        name: "bash".into(),
+        output: "old output".into(),
+        is_error: false,
+        call: "call_1".into(),
+        running: false,
+        diff: None,
+        started: Instant::now(),
+        took: None,
+      },
+      announced("new command", "call_1"),
+    ];
+    place_output(&mut entries, "call_1".into(), "new output".into());
+    place_result(
+      &mut entries,
+      "bash".into(),
+      "new output".into(),
+      false,
+      "call_1".into(),
+      None,
+    );
+    assert_eq!(
+      shapes(&entries),
+      [
+        "call bash old command",
+        "out bash old output",
+        "call bash new command",
+        "out bash new output",
+      ]
+    );
+  }
+
+  #[test]
+  fn an_output_whose_call_is_missing_is_still_shown() {
+    // A result with nothing to pair against — a branch that kept the answer
+    // but not the question — is drawn where it was written rather than lost.
+    let session = session_of(vec![Message::User {
+      content: vec![UserContent::tool_result(
+        "gone",
+        "bash",
+        vec![ToolResultContent::text("orphan output")],
+      )],
+    }]);
+    assert_eq!(shapes(&entries_from_history(&session)), ["out bash orphan output"]);
   }
 
   #[test]

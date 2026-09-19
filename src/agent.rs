@@ -13,7 +13,7 @@ use rig_agent::agent::{
 };
 use rig_agent::client::AgentClientExt;
 use rig_agent::streaming::StreamingPrompt;
-use rig_agent::tool::ToolOutput;
+use rig_agent::tool::{Tool, ToolOutput};
 use rig_core::client::completion::CompletionClient;
 use rig_core::completion::{
   CompletionError, CompletionModel, CompletionRequest, CompletionResponse, Message, ProviderCapabilities, Usage,
@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::compaction::{self, Compacted, Settings};
-use crate::tools::{BashTool, EditDiff, EditTool, ReadTool, WriteTool};
+use crate::tools::{BashTool, CALL_ARG, EditDiff, EditTool, ReadTool, WriteTool};
 
 /// Events streamed from a run to the UI.
 #[derive(Debug)]
@@ -35,6 +35,9 @@ pub enum AgentEvent {
   ToolCall {
     name: String,
     args: serde_json::Value,
+    /// The call, so its output and result find it again even when several
+    /// tools are in flight at once.
+    call: String,
   },
   /// A tool call being written, before it is run. `args` is the JSON as far
   /// as it has arrived, which is usually not yet parseable; `name` is empty
@@ -47,7 +50,10 @@ pub enum AgentEvent {
     args: String,
   },
   /// Live output of the running tool (bash), replacing earlier snapshots.
-  ToolOutput(String),
+  ToolOutput {
+    call: String,
+    text: String,
+  },
   ToolResult {
     name: String,
     output: String,
@@ -56,7 +62,7 @@ pub enum AgentEvent {
     /// failed is not something a transcript records — a failed result looks
     /// like any other on the wire — so a session that wants to redraw it
     /// later has to keep the flag against this id itself.
-    call: Option<String>,
+    call: String,
     /// Numbered diff for `edit`, shown in place of the output text.
     diff: Option<String>,
   },
@@ -103,6 +109,15 @@ pub struct Config {
   pub vision: bool,
 }
 
+/// The id of the call a hook is reporting.
+///
+/// Rig's handle is always there — minted when the provider issued none — and
+/// the `Option` is only in the shape of the event, so there is no absent case
+/// to have an answer for.
+fn call_id(id: Option<&str>) -> String {
+  id.unwrap_or_default().to_string()
+}
+
 /// Reports tool calls and results to the UI. Both go through the hook path so
 /// they stay ordered, and the result carries an accurate error flag, which the
 /// transcript-level stream items do not.
@@ -115,15 +130,25 @@ impl AgentHook for UiHook {
     let args = serde_json::from_str(event.args).unwrap_or_else(|_| serde_json::Value::String(event.args.to_string()));
     let _ = self.tx.send(AgentEvent::ToolCall {
       name: event.tool_name.to_string(),
-      args,
+      args: args.clone(),
+      call: call_id(event.tool_call_id),
     });
-    ToolCallAction::Run
+    // A command reports its output while it runs, and nothing in rig tells a
+    // tool which call it is. Rewriting the arguments is the one channel from
+    // here into the body, so the id goes down it — see `tools::CALL_ARG`.
+    match (event.tool_name, args) {
+      (BashTool::NAME, serde_json::Value::Object(mut args)) => {
+        args.insert(CALL_ARG.to_string(), call_id(event.tool_call_id).into());
+        ToolCallAction::Rewrite(args.into())
+      }
+      _ => ToolCallAction::Run,
+    }
   }
 
   async fn on_tool_result(&self, _ctx: &HookContext, event: ToolResultEvent<'_>) -> ToolResultAction {
     let _ = self.tx.send(AgentEvent::ToolResult {
       name: event.tool_name.to_string(),
-      call: event.tool_call_id.map(str::to_string),
+      call: call_id(event.tool_call_id),
       diff: event.tool_context.result::<EditDiff>().map(|d| d.diff.clone()),
       output: render_output(event.presentation),
       is_error: event.raw_result.is_error() || event.raw_result.is_refused(),
@@ -180,8 +205,8 @@ pub fn build_agents(cfg: &Config, cwd: &Path, tx: mpsc::UnboundedSender<AgentEve
     .tool(EditTool { cwd: cwd.to_path_buf() })
     .tool(BashTool {
       cwd: cwd.to_path_buf(),
-      on_output: Some(Arc::new(move |text| {
-        let _ = output_tx.send(AgentEvent::ToolOutput(text));
+      on_output: Some(Arc::new(move |call, text| {
+        let _ = output_tx.send(AgentEvent::ToolOutput { call, text });
       })),
     })
     .build();
@@ -516,7 +541,7 @@ mod tests {
         AgentEvent::Reasoning(_) => "reasoning".into(),
         AgentEvent::ToolCall { name, .. } => format!("call:{name}"),
         AgentEvent::ToolCallDelta { .. } => "writing".into(),
-        AgentEvent::ToolOutput(_) => "output".into(),
+        AgentEvent::ToolOutput { .. } => "output".into(),
         AgentEvent::ToolResult { is_error, .. } => {
           format!("result:{}", if *is_error { "err" } else { "ok" })
         }
