@@ -2,6 +2,7 @@
 //! append-only JSONL file in one global directory, created lazily on the first
 //! persisted message, and resumable later.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -24,16 +25,35 @@ enum Record {
     created: DateTime<Local>,
     cwd: String,
     model: String,
+    /// The session this one was forked from, for provenance. Absent on
+    /// sessions that were started rather than branched, and on files written
+    /// before forking existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent: Option<String>,
   },
   /// A transcript message appended after a turn (or recovered from an abort).
-  Message { message: Message },
-  /// Compaction replaced the history with a summary plus the kept tail.
-  Compaction { summary: String, history: Vec<Message> },
-  /// The user rewound the session; the history is cut to `len` messages.
   ///
-  /// A length rather than the messages themselves: replay rebuilds the same
-  /// history this counted, so the two always agree and the file stays small.
-  Rewind { len: usize },
+  /// `id` and `parent` are what make the file a tree rather than a list: a
+  /// message written after going back names the entry it was written under,
+  /// and the path that was left keeps its own entries.
+  Message {
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent: Option<String>,
+    message: Message,
+  },
+  /// Compaction replaced everything above it with a summary. The turns it
+  /// kept verbatim follow as entries of their own, so they stay places the
+  /// conversation can go back to.
+  Compaction {
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent: Option<String>,
+    summary: String,
+  },
+  /// The conversation moved to an existing entry; what follows branches
+  /// there. `None` moves back before the first message.
+  Leaf { id: Option<String> },
   /// The user named the session.
   Name { name: String },
 }
@@ -157,23 +177,46 @@ fn read_info(path: &Path) -> Result<SessionInfo> {
     message_count: 0,
     first_message: String::new(),
   };
+  // Enough of the tree to count the branch the session is on. A file that
+  // has been gone back through holds more entries than the conversation does,
+  // and it is the conversation the picker is describing.
+  let mut parents: HashMap<String, Option<String>> = HashMap::new();
+  let mut checkpoints: HashSet<String> = HashSet::new();
+  let mut leaf: Option<String> = None;
   for line in lines {
     let Ok(record) = serde_json::from_str::<Record>(&line?) else {
       continue;
     };
     match record {
-      Record::Message { message } => {
-        info.message_count += 1;
+      Record::Message { id, parent, message } => {
         if info.first_message.is_empty()
           && let Some(text) = user_text(&message)
         {
           info.first_message = first_line(&text);
         }
+        parents.insert(id.clone(), parent);
+        leaf = Some(id);
       }
-      Record::Compaction { .. } | Record::Rewind { .. } => {}
+      Record::Compaction { id, parent, .. } => {
+        parents.insert(id.clone(), parent);
+        checkpoints.insert(id.clone());
+        leaf = Some(id);
+      }
+      Record::Leaf { id } => leaf = id,
       Record::Name { name } => info.name = Some(name),
       Record::Header { .. } => {}
     }
+  }
+  let mut at = leaf;
+  // A checkpoint ends the walk, standing for everything above it. The bound
+  // is against a parent link that loops: the file is only as good as what
+  // last wrote it.
+  while let Some(id) = at.filter(|_| info.message_count <= parents.len()) {
+    info.message_count += 1;
+    if checkpoints.contains(&id) {
+      break;
+    }
+    at = parents.get(&id).cloned().flatten();
   }
   Ok(info)
 }
@@ -203,6 +246,18 @@ pub fn user_text(message: &Message) -> Option<String> {
   Some(text)
 }
 
+/// The compaction checkpoint as it travels in a history: a user message
+/// wearing the summary markers.
+fn is_summary(message: &Message) -> bool {
+  let Message::User { content } = message else {
+    return false;
+  };
+  content.iter().any(|c| match c {
+    UserContent::Text(t) => t.text.starts_with(compaction::SUMMARY_PREFIX),
+    _ => false,
+  })
+}
+
 fn first_line(text: &str) -> String {
   text
     .lines()
@@ -214,6 +269,27 @@ fn first_line(text: &str) -> String {
     .collect()
 }
 
+/// One entry of the session tree.
+///
+/// Going back does not delete anything: it moves the leaf, and what the
+/// conversation said down the path it left stays here as a sibling branch,
+/// which is what makes it possible to walk back into it later.
+pub struct Node {
+  pub id: String,
+  pub parent: Option<String>,
+  pub kind: NodeKind,
+}
+
+pub enum NodeKind {
+  Message(Message),
+  /// A compaction checkpoint: it stands for everything above it, so a branch
+  /// that reaches one needs nothing further up. What the compaction kept
+  /// verbatim follows it as entries of its own.
+  Checkpoint {
+    summary: String,
+  },
+}
+
 /// The live conversation and, when persistence is on, its file.
 pub struct Session {
   pub id: String,
@@ -221,7 +297,17 @@ pub struct Session {
   pub cwd: String,
   pub model: String,
   pub created: DateTime<Local>,
+  /// The branch ending at `leaf`, rebuilt whenever the leaf moves. Kept here
+  /// rather than walked on demand because every turn reads it.
   pub history: Vec<Message>,
+  /// Every entry ever written, in the order it was written.
+  nodes: Vec<Node>,
+  /// Where the conversation currently ends; `None` is before the first entry.
+  leaf: Option<String>,
+  /// Counter behind `mint`, past every id already in the file.
+  ids: u64,
+  /// The session this one was forked from, written into its header.
+  parent: Option<String>,
   /// Where new sessions get their file; `None` disables persistence.
   dir: Option<PathBuf>,
   /// Open once the first record is written.
@@ -237,6 +323,10 @@ impl Session {
       model: model.to_string(),
       created: Local::now(),
       history: Vec::new(),
+      nodes: Vec::new(),
+      leaf: None,
+      ids: 0,
+      parent: None,
       dir: store.map(|s| s.dir.clone()),
       file: None,
     }
@@ -252,6 +342,7 @@ impl Session {
       created,
       cwd,
       model,
+      parent,
     } = serde_json::from_str(&header).context("invalid session header")?
     else {
       bail!("{} has no session header", path.display());
@@ -263,6 +354,10 @@ impl Session {
       model,
       created,
       history: Vec::new(),
+      nodes: Vec::new(),
+      leaf: None,
+      ids: 0,
+      parent,
       dir: path.parent().map(Path::to_path_buf),
       file: None,
     };
@@ -273,17 +368,99 @@ impl Session {
       }
       let record: Record =
         serde_json::from_str(&line).with_context(|| format!("{}: bad record on line {}", path.display(), n + 2))?;
-      match record {
-        Record::Message { message } => session.history.push(message),
-        Record::Compaction { history, .. } => session.history = history,
-        Record::Rewind { len } => session.history.truncate(len),
-        Record::Name { name } => session.name = Some(name),
-        Record::Header { .. } => {}
-      }
+      let (id, parent, kind) = match record {
+        Record::Message { id, parent, message } => (id, parent, NodeKind::Message(message)),
+        Record::Compaction { id, parent, summary } => (id, parent, NodeKind::Checkpoint { summary }),
+        Record::Leaf { id } => {
+          session.leaf = id;
+          continue;
+        }
+        Record::Name { name } => {
+          session.name = Some(name);
+          continue;
+        }
+        Record::Header { .. } => continue,
+      };
+      session.remember(&id);
+      session.leaf = Some(id.clone());
+      session.nodes.push(Node { id, parent, kind });
     }
+    session.history = session.branch(session.leaf.as_deref());
     let file = OpenOptions::new().append(true).open(path)?;
     session.file = Some((path.to_path_buf(), file));
     Ok(session)
+  }
+
+  /// Where the conversation currently ends.
+  pub fn leaf(&self) -> Option<&str> {
+    self.leaf.as_deref()
+  }
+
+  pub fn nodes(&self) -> &[Node] {
+    &self.nodes
+  }
+
+  fn node(&self, id: &str) -> Option<&Node> {
+    self.nodes.iter().find(|node| node.id == id)
+  }
+
+  /// The entry a cut at `id` would leave the conversation ending at.
+  pub fn parent_of(&self, id: &str) -> Option<&str> {
+    self.node(id).and_then(|node| node.parent.as_deref())
+  }
+
+  /// The entries from the root down to `leaf`, oldest first.
+  ///
+  /// A checkpoint ends the walk: it already carries everything above it.
+  fn ancestry(&self, leaf: Option<&str>) -> Vec<&Node> {
+    let mut chain = Vec::new();
+    let mut at = leaf;
+    // A parent link that goes nowhere, or round in a circle, would otherwise
+    // loop forever; the file is only as good as what last wrote it.
+    while let Some(node) = at.and_then(|id| self.node(id)) {
+      chain.push(node);
+      if matches!(node.kind, NodeKind::Checkpoint { .. }) || chain.len() > self.nodes.len() {
+        break;
+      }
+      at = node.parent.as_deref();
+    }
+    chain.reverse();
+    chain
+  }
+
+  /// The ids from the root down to `leaf`, oldest first.
+  pub fn lineage(&self, leaf: Option<&str>) -> Vec<&str> {
+    self.ancestry(leaf).iter().map(|node| node.id.as_str()).collect()
+  }
+
+  /// The conversation ending at `leaf`, as the model is given it.
+  pub fn branch(&self, leaf: Option<&str>) -> Vec<Message> {
+    self
+      .ancestry(leaf)
+      .into_iter()
+      .map(|node| match &node.kind {
+        NodeKind::Message(message) => message.clone(),
+        NodeKind::Checkpoint { summary } => compaction::summary_message(summary),
+      })
+      .collect()
+  }
+
+  /// How long that conversation is, without building it.
+  pub fn branch_len(&self, leaf: Option<&str>) -> usize {
+    self.ancestry(leaf).len()
+  }
+
+  /// A fresh id, past anything the file already holds.
+  fn mint(&mut self) -> String {
+    self.ids += 1;
+    self.ids.to_string()
+  }
+
+  /// Keep `mint` clear of an id read from the file.
+  fn remember(&mut self, id: &str) {
+    if let Ok(n) = id.parse::<u64>() {
+      self.ids = self.ids.max(n);
+    }
   }
 
   /// Stop writing to disk (used for `--session` combined with `--no-session`).
@@ -301,37 +478,100 @@ impl Session {
     self.file.as_ref().map(|(p, _)| p.as_path())
   }
 
-  /// Extend the history and persist the new messages.
+  /// Extend the conversation, each message a child of the one before it.
   pub fn append(&mut self, messages: Vec<Message>) -> Result<()> {
-    let records: Vec<Record> = messages
-      .iter()
-      .cloned()
-      .map(|message| Record::Message { message })
-      .collect();
-    self.history.extend(messages);
+    let mut records = Vec::with_capacity(messages.len());
+    for message in messages {
+      let id = self.mint();
+      records.push(Record::Message {
+        id: id.clone(),
+        parent: self.leaf.clone(),
+        message: message.clone(),
+      });
+      self.history.push(message.clone());
+      self.nodes.push(Node {
+        id: id.clone(),
+        parent: self.leaf.take(),
+        kind: NodeKind::Message(message),
+      });
+      self.leaf = Some(id);
+    }
     self.write_all(&records)
   }
 
   /// Replace the history after compaction and persist the checkpoint.
+  ///
+  /// The checkpoint is one entry standing for everything above it; the turns
+  /// the compaction kept verbatim are written after it as entries of their
+  /// own, so each stays a place the conversation can go back to.
   pub fn compacted(&mut self, history: Vec<Message>, summary: &str) -> Result<()> {
-    self.history = history.clone();
-    self.write_all(&[Record::Compaction {
+    let id = self.mint();
+    let record = Record::Compaction {
+      id: id.clone(),
+      parent: self.leaf.clone(),
       summary: summary.to_string(),
-      history,
-    }])
+    };
+    self.nodes.push(Node {
+      id: id.clone(),
+      parent: self.leaf.take(),
+      kind: NodeKind::Checkpoint {
+        summary: summary.to_string(),
+      },
+    });
+    self.leaf = Some(id);
+    self.history = vec![compaction::summary_message(summary)];
+    self.write_all(&[record])?;
+    // The summary the checkpoint already stands for is not written twice.
+    let kept = history.into_iter().skip_while(is_summary).collect();
+    self.append(kept)
   }
 
-  /// Cut the history back to its first `len` messages and record the cut.
+  /// Move the end of the conversation to `leaf`, and record the move.
   ///
-  /// The file stays append-only: what was written before is still there, and
-  /// replay drops it again on the way past. Nothing is written when the cut
-  /// would change nothing, so an accidental rewind to the end leaves no trace.
-  pub fn rewind(&mut self, len: usize) -> Result<()> {
-    if len >= self.history.len() {
+  /// Nothing is deleted: what was said down the path being left stays in the
+  /// file as a branch of its own, and this can walk back into it later. What
+  /// follows becomes a child of `leaf`, which is where the branching happens.
+  pub fn go_to(&mut self, leaf: Option<String>) -> Result<()> {
+    if leaf == self.leaf {
       return Ok(());
     }
-    self.history.truncate(len);
-    self.write_all(&[Record::Rewind { len }])
+    self.leaf = leaf.clone();
+    self.history = self.branch(leaf.as_deref());
+    self.write_all(&[Record::Leaf { id: leaf }])
+  }
+
+  /// A new session carrying the conversation that ends at `leaf`.
+  ///
+  /// Where `go_to` branches inside this file, this starts another one: this
+  /// session is left exactly as it is, and the new one names it as its parent.
+  /// The messages are copied rather than referenced, so the fork stands on its
+  /// own if the original is deleted.
+  ///
+  /// What is copied is the one path down to `leaf`, not the tree around it:
+  /// the branches beside it belong to the conversation being left behind, and
+  /// the fork starts as a straight line with nowhere of its own to go back to.
+  pub fn fork(&self, leaf: Option<&str>) -> Result<Self> {
+    let mut forked = Self {
+      id: uuid::Uuid::new_v4().to_string(),
+      name: None,
+      cwd: self.cwd.clone(),
+      model: self.model.clone(),
+      created: Local::now(),
+      history: Vec::new(),
+      nodes: Vec::new(),
+      leaf: None,
+      ids: 0,
+      parent: self.path().map(|path| path.display().to_string()),
+      dir: self.dir.clone(),
+      file: None,
+    };
+    // Forking from the very start leaves an empty session, which — like any
+    // other empty session — gets its file once it has something to say.
+    let history = self.branch(leaf);
+    if !history.is_empty() {
+      forked.append(history)?;
+    }
+    Ok(forked)
   }
 
   pub fn rename(&mut self, name: &str) -> Result<()> {
@@ -361,6 +601,7 @@ impl Session {
         created: self.created,
         cwd: self.cwd.clone(),
         model: self.model.clone(),
+        parent: self.parent.clone(),
       };
       serde_json::to_writer(&mut file, &header)?;
       file.write_all(b"\n")?;
@@ -379,6 +620,11 @@ impl Session {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// The ids of the branch the session is on, oldest first.
+  fn ids(session: &Session) -> Vec<String> {
+    session.lineage(session.leaf()).iter().map(|s| s.to_string()).collect()
+  }
 
   fn temp_store(name: &str) -> Store {
     let dir = std::env::temp_dir().join(format!("fa-sessions-{}-{name}", std::process::id()));
@@ -423,7 +669,8 @@ mod tests {
     let info = &infos[0];
     assert_eq!(info.title(), "my session");
     assert_eq!(info.first_message, "first question");
-    assert_eq!(info.message_count, 3);
+    // The conversation is the checkpoint, the two turns it kept, and "third".
+    assert_eq!(info.message_count, 4);
     assert_eq!(info.age(), "now");
     assert_eq!(store.find(&session.id[..8]).as_deref(), Some(path.as_path()));
     assert_eq!(store.find(path.to_str().unwrap()).as_deref(), Some(path.as_path()));
@@ -437,36 +684,130 @@ mod tests {
   }
 
   #[test]
-  fn rewind_cuts_the_history_and_survives_a_reload() {
-    let store = temp_store("rewind");
+  fn going_back_branches_rather_than_deletes_and_the_old_path_stays_reachable() {
+    let store = temp_store("tree");
     let mut session = Session::new(Some(&store), Path::new("/work"), "mock");
     session
-      .append(vec![
-        Message::user("first"),
-        Message::assistant("answer"),
-        Message::user("second"),
-        Message::assistant("reply"),
-      ])
+      .append(vec![Message::user("first"), Message::assistant("one")])
       .unwrap();
     let path = session.path().unwrap().to_path_buf();
+    let prompt = ids(&session)[0].clone();
+    let answered = session.leaf().unwrap().to_string();
 
-    // Back to just before "second", which the caller puts back in the input.
-    session.rewind(2).unwrap();
-    assert_eq!(session.history, [Message::user("first"), Message::assistant("answer")]);
-    // The file is still append-only: replay drops the cut messages again.
-    assert_eq!(Session::load(&path).unwrap().history, session.history);
+    // Back to just after the prompt, then a different answer under it.
+    session.go_to(Some(prompt)).unwrap();
+    assert_eq!(session.history, [Message::user("first")]);
+    session.append(vec![Message::assistant("two")]).unwrap();
+    assert_eq!(session.history, [Message::user("first"), Message::assistant("two")]);
 
-    // The same file keeps taking new messages after the cut.
-    session.append(vec![Message::user("instead")]).unwrap();
-    let reloaded = Session::load(&path).unwrap();
-    assert_eq!(reloaded.history.len(), 3);
-    assert_eq!(reloaded.history[2], Message::user("instead"));
+    // The answer we walked away from was not deleted, and is still a place
+    // the conversation can go — which is the whole point of a tree.
+    session.go_to(Some(answered.clone())).unwrap();
+    assert_eq!(session.history, [Message::user("first"), Message::assistant("one")]);
+    assert_eq!(session.nodes().len(), 3, "both answers, and the prompt they share");
 
-    // A rewind that would change nothing writes nothing.
+    // All of which survives a reload, leaf and branches alike.
+    let loaded = Session::load(&path).unwrap();
+    assert_eq!(loaded.leaf(), Some(answered.as_str()));
+    assert_eq!(loaded.history, session.history);
+    assert_eq!(loaded.nodes().len(), 3);
+
+    // Going where the session already is writes nothing.
     let before = std::fs::read_to_string(&path).unwrap();
-    session.rewind(3).unwrap();
-    session.rewind(9).unwrap();
+    session.go_to(Some(answered)).unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+    // And going back before the first entry empties the conversation
+    // without losing it.
+    session.go_to(None).unwrap();
+    assert!(session.history.is_empty());
+    assert_eq!(Session::load(&path).unwrap().nodes().len(), 3);
+    std::fs::remove_dir_all(&store.dir).unwrap();
+  }
+
+  #[test]
+  fn a_compaction_keeps_what_it_kept_addressable() {
+    let store = temp_store("compaction-tree");
+    let mut session = Session::new(Some(&store), Path::new("/work"), "mock");
+    session
+      .append(vec![Message::user("old"), Message::assistant("older")])
+      .unwrap();
+    let compacted = vec![
+      compaction::summary_message("summary"),
+      Message::user("second"),
+      Message::assistant("reply"),
+    ];
+    session.compacted(compacted.clone(), "summary").unwrap();
+    assert_eq!(session.history, compacted);
+
+    // The checkpoint stands for what came before it, and the turns it kept
+    // are entries of their own rather than a lump inside it.
+    let branch = ids(&session);
+    assert_eq!(branch.len(), 3);
+    session.go_to(Some(branch[1].clone())).unwrap();
+    assert_eq!(session.history, compacted[..2]);
+
+    let path = session.path().unwrap().to_path_buf();
+    assert_eq!(Session::load(&path).unwrap().history, compacted[..2]);
+    std::fs::remove_dir_all(&store.dir).unwrap();
+  }
+
+  #[test]
+  fn a_fork_takes_the_one_path_and_not_the_branches_beside_it() {
+    let store = temp_store("fork-path");
+    let mut session = Session::new(Some(&store), Path::new("/work"), "mock");
+    session
+      .append(vec![Message::user("first"), Message::assistant("one")])
+      .unwrap();
+    let prompt = ids(&session)[0].clone();
+    // A second answer under the same prompt, so the tree forks in two.
+    session.go_to(Some(prompt)).unwrap();
+    session.append(vec![Message::assistant("two")]).unwrap();
+    assert_eq!(session.nodes().len(), 3);
+
+    // The fork is the conversation as it reads from here — one path down the
+    // tree. The answer on the branch beside it is not part of that
+    // conversation, so it does not come along.
+    let forked = session.fork(session.leaf()).unwrap();
+    assert_eq!(forked.history, [Message::user("first"), Message::assistant("two")]);
+    assert_eq!(forked.nodes().len(), 2, "the path, and nothing beside it");
+    // And it starts life as a straight line, with no branch to go back to.
+    assert_eq!(forked.lineage(forked.leaf()).len(), 2);
+    std::fs::remove_dir_all(&store.dir).unwrap();
+  }
+
+  #[test]
+  fn a_fork_carries_the_front_of_the_history_and_leaves_the_original_alone() {
+    let store = temp_store("fork");
+    let mut session = Session::new(Some(&store), Path::new("/work"), "mock");
+    let history = vec![
+      Message::user("first"),
+      Message::assistant("answer"),
+      Message::user("second"),
+      Message::assistant("reply"),
+    ];
+    session.append(history.clone()).unwrap();
+    let path = session.path().unwrap().to_path_buf();
+    let before = std::fs::read_to_string(&path).unwrap();
+
+    let forked = session.fork(Some(&ids(&session)[1])).unwrap();
+    assert_eq!(forked.history, history[..2]);
+    assert_ne!(forked.id, session.id);
+    // The branch it came from is untouched, and still says everything it did.
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    assert_eq!(session.history, history);
+
+    // The fork stands on its own, and names where it came from.
+    let forked_path = forked.path().unwrap();
+    assert_ne!(forked_path, path);
+    assert_eq!(Session::load(forked_path).unwrap().history, history[..2]);
+    assert_eq!(forked.parent.as_deref(), Some(path.to_str().unwrap()));
+    assert_eq!(Session::load(forked_path).unwrap().parent, forked.parent);
+
+    // Forking from the very start is an empty session, with no file yet.
+    let empty = session.fork(None).unwrap();
+    assert!(empty.history.is_empty());
+    assert!(empty.path().is_none());
     std::fs::remove_dir_all(&store.dir).unwrap();
   }
 

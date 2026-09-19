@@ -1,7 +1,7 @@
 //! Ratatui front-end: a scrolling transcript, a multi-line input box and a
 //! one-line footer.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -21,7 +21,7 @@ use tokio::task::JoinHandle;
 
 use crate::agent::{AgentEvent, Agents, start_compaction, start_run};
 use crate::compaction::{self, SUMMARY_PREFIX, SUMMARY_SUFFIX, Settings};
-use crate::session::{Session, SessionInfo, Store};
+use crate::session::{Node, NodeKind, Session, SessionInfo, Store};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
@@ -40,6 +40,8 @@ const WHEEL_LINES: usize = 3;
 const SCROLLBAR_HIDE_DELAY: Duration = Duration::from_millis(1000);
 /// How close together two `Esc` presses count as one double press, as in pi.
 const DOUBLE_ESC: Duration = Duration::from_millis(500);
+/// Rows an overlay list moves per `PageUp`/`PageDown`.
+const OVERLAY_PAGE: usize = 10;
 
 /// Transcript scrollbar behaviour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -77,11 +79,12 @@ pub struct Options {
 const COMMANDS: &[(&str, &str, bool)] = &[
   ("compact", "Manually compact the session context", false),
   ("continue", "Resume the loop without a new message", false),
+  ("fork", "Start a new session from an earlier message", false),
   ("name", "Set session display name", true),
   ("new", "Start a new session", false),
   ("resume", "Resume a different session", false),
-  ("rewind", "Go back to an earlier message (or press Esc twice)", false),
   ("session", "Show session info and stats", false),
+  ("tree", "Go back to an earlier point (or press Esc twice)", false),
   ("quit", "Quit fa", false),
 ];
 /// Rows shown in the command popup.
@@ -121,31 +124,50 @@ struct Overlay {
 enum OverlayList {
   /// `/resume`: every saved session, most recent first.
   Sessions(Vec<SessionInfo>),
-  /// `/rewind`: this session's own prompts, oldest first.
-  Rewind(Vec<Point>),
+  /// `/tree`: every point this session can go back to, oldest first.
+  Tree(Vec<Point>),
+  /// `/fork`: the prompts, to start a new session from one of them.
+  Fork(Vec<Point>),
 }
 
-/// A point the session can be rewound to: something the user typed.
+/// A point the conversation can be moved to.
 struct Point {
-  /// Where the message sits in `session.history`.
-  index: usize,
-  text: String,
-  /// History messages the rewind would drop, this one included.
-  drops: usize,
+  /// Where the conversation would end after going there; `None` is before the
+  /// first message.
+  leaf: Option<String>,
+  /// A prompt that going there takes back out of the history and returns to
+  /// the input box; `None` for a point kept as the conversation's new end.
+  text: Option<String>,
+  /// How the row reads in the list.
+  label: String,
+  /// Branch points crossed to reach it, which is how far the row is indented.
+  depth: usize,
+  /// Messages the conversation would hold after going there.
+  len: usize,
+  /// This is where the session already is.
+  here: bool,
 }
 
 impl Overlay {
+  fn points(&self) -> &[Point] {
+    match &self.list {
+      OverlayList::Tree(points) | OverlayList::Fork(points) => points,
+      OverlayList::Sessions(_) => &[],
+    }
+  }
+
   fn len(&self) -> usize {
     match &self.list {
       OverlayList::Sessions(sessions) => sessions.len(),
-      OverlayList::Rewind(points) => points.len(),
+      _ => self.points().len(),
     }
   }
 
   fn title(&self) -> &'static str {
     match &self.list {
       OverlayList::Sessions(_) => " Resume session — ↑↓ select · Enter resume · Esc cancel ",
-      OverlayList::Rewind(_) => " Rewind — ↑↓ select · Enter go back · Esc cancel ",
+      OverlayList::Tree(_) => " Tree — ↑↓ PgUp/PgDn select · Enter go there · Esc cancel ",
+      OverlayList::Fork(_) => " Fork — ↑↓ PgUp/PgDn select · Enter fork · Esc cancel ",
     }
   }
 }
@@ -368,14 +390,15 @@ impl App {
       }
       (KeyCode::Esc, _) if self.run.is_some() => self.abort(),
       // Esc on its own has nothing to do once there is no run to stop, so a
-      // second one within the window opens the rewind list — pi's shortcut.
-      // Only from an empty box, where Esc cannot be meant for the text.
+      // second one within the window opens the tree — pi's shortcut, and its
+      // default action. Only from an empty box, where Esc cannot be meant for
+      // the text.
       (KeyCode::Esc, _) if self.input_is_blank() => {
         let now = Instant::now();
         let again = self.last_escape.is_some_and(|last| now - last < DOUBLE_ESC);
         self.last_escape = (!again).then_some(now);
         if again {
-          self.open_rewind();
+          self.open_points(false);
         }
       }
       (KeyCode::PageUp, _) => self.scroll_by(10),
@@ -477,6 +500,27 @@ impl App {
           o.selected = (o.selected + 1).min(len.saturating_sub(1));
         }
       }
+      // A tree of every tool result is long enough to need more than one row
+      // at a time.
+      KeyCode::PageUp | KeyCode::Home => {
+        if let Some(o) = &mut self.overlay {
+          o.selected = if code == KeyCode::Home {
+            0
+          } else {
+            o.selected.saturating_sub(OVERLAY_PAGE)
+          };
+        }
+      }
+      KeyCode::PageDown | KeyCode::End => {
+        if let Some(o) = &mut self.overlay {
+          let last = len.saturating_sub(1);
+          o.selected = if code == KeyCode::End {
+            last
+          } else {
+            (o.selected + OVERLAY_PAGE).min(last)
+          };
+        }
+      }
       KeyCode::Enter => {
         let Some(Overlay { list, selected }) = self.overlay.take() else {
           return;
@@ -487,11 +531,9 @@ impl App {
               self.load_session(&info.path.clone());
             }
           }
-          OverlayList::Rewind(points) => {
-            if let Some(point) = points.get(selected) {
-              self.rewind_to(point.index, point.text.clone());
-            }
-          }
+          OverlayList::Tree(mut points) if selected < points.len() => self.go_to(points.remove(selected)),
+          OverlayList::Fork(mut points) if selected < points.len() => self.fork_to(points.remove(selected)),
+          _ => {}
         }
       }
       _ => {}
@@ -559,13 +601,13 @@ impl App {
           self.open_picker();
         }
       }
-      "/rewind" => {
+      "/tree" | "/fork" => {
         if self.run.is_some() {
           self
             .entries
-            .push(Entry::Info("Finish or abort the current run before rewinding.".into()));
+            .push(Entry::Info(format!("Finish or abort the current run before {text}.")));
         } else {
-          self.open_rewind();
+          self.open_points(text == "/fork");
         }
       }
       "/session" => self.session_info(),
@@ -650,38 +692,70 @@ impl App {
     });
   }
 
-  /// List the prompts this session can be rewound to, newest selected.
-  fn open_rewind(&mut self) {
-    let points = rewind_points(&self.session.history);
+  /// List where the conversation can go, with where it is now selected.
+  ///
+  /// `/tree` offers every point; `/fork` only the prompts, since a fork is
+  /// something you re-ask rather than a place you stand.
+  fn open_points(&mut self, fork: bool) {
+    let mut points = points(&self.session);
+    if fork {
+      points.retain(|point| point.text.is_some());
+    }
     if points.is_empty() {
-      self.entries.push(Entry::Info("Nothing to rewind to.".into()));
+      self.entries.push(Entry::Info(match fork {
+        true => "Nothing to fork from.".into(),
+        false => "Nothing to go back to.".into(),
+      }));
       return;
     }
-    self.overlay = Some(Overlay {
-      selected: points.len() - 1,
-      list: OverlayList::Rewind(points),
-    });
+    // Start where the session already is, so the way back is one step up.
+    let selected = points.iter().rposition(|point| point.here).unwrap_or(points.len() - 1);
+    let list = match fork {
+      true => OverlayList::Fork(points),
+      false => OverlayList::Tree(points),
+    };
+    self.overlay = Some(Overlay { list, selected });
   }
 
-  /// Cut the conversation back to just before the message at `index`, and put
-  /// that message back in the input box to be edited and asked again.
+  /// Move this session's end to `point`.
   ///
-  /// The transcript is rebuilt from the history rather than truncated
-  /// alongside it, so the two cannot drift: what is on screen is what the
-  /// model will be sent.
-  fn rewind_to(&mut self, index: usize, text: String) {
-    let dropped = self.session.history.len() - index;
-    let result = self.session.rewind(index);
+  /// Nothing is dropped — what the conversation said down the path being left
+  /// stays a branch of its own, and this list can walk back into it. The
+  /// transcript is rebuilt from the history rather than edited alongside it,
+  /// so the two cannot drift: what is on screen is what the model will be sent.
+  fn go_to(&mut self, point: Point) {
+    if point.here && point.text.is_none() {
+      self.entries.push(Entry::Info("Already there.".into()));
+      return;
+    }
+    let result = self.session.go_to(point.leaf.clone());
     self.report(result);
+    self.show_point(&point, format!("Moved to {}.", messages(point.len)));
+  }
+
+  /// Start a new session holding the conversation up to `point`, leaving this
+  /// one as it is — the branch you came from stays on disk, whole.
+  fn fork_to(&mut self, point: Point) {
+    match self.session.fork(point.leaf.as_deref()) {
+      Ok(session) => {
+        self.session = session;
+        self.show_point(&point, format!("Forked, {} kept.", messages(point.len)));
+      }
+      Err(err) => self.entries.push(Entry::Error(format!("Could not fork: {err:#}"))),
+    }
+  }
+
+  /// Redraw the transcript around a session that has just moved, and hand the
+  /// user back the prompt they landed on.
+  fn show_point(&mut self, point: &Point, note: String) {
     self.entries = entries_from_history(&self.session.history);
-    self.entries.push(Entry::Info(match dropped {
-      1 => "Rewound, 1 message dropped.".into(),
-      n => format!("Rewound, {n} messages dropped."),
-    }));
-    // The token counts and the queue belonged to a conversation that no
-    // longer exists.
+    self.entries.push(Entry::Info(note));
+    // The token counts and the queue belonged to a conversation that is no
+    // longer the one we are in.
     self.reset_view();
-    self.set_input(&text);
+    if let Some(text) = &point.text {
+      self.set_input(&text.clone());
+    }
   }
 
   fn session_info(&mut self) {
@@ -1103,15 +1177,22 @@ impl App {
           (s.title().to_string(), note)
         })
         .collect(),
-      OverlayList::Rewind(points) => points
+      // The tree is indented at its branch points, so a conversation that
+      // went two ways reads as two ways. Both lists say how long the
+      // conversation would be once you got there.
+      OverlayList::Tree(points) => points
         .iter()
         .map(|p| {
-          let note = match p.drops {
-            1 => "drops 1 message".to_string(),
-            n => format!("drops {n} messages"),
+          let note = match p.here {
+            true => "here".to_string(),
+            false => messages(p.len),
           };
-          (first_line(&p.text), note)
+          (format!("{}{}", "  ".repeat(p.depth), p.label), note)
         })
+        .collect(),
+      OverlayList::Fork(points) => points
+        .iter()
+        .map(|p| (p.label.clone(), format!("keeps {}", messages(p.len))))
         .collect(),
     };
     let dim = Style::default().add_modifier(Modifier::DIM);
@@ -1477,22 +1558,137 @@ fn format_duration(d: Duration) -> String {
   }
 }
 
-/// The points a history can be rewound to, oldest first.
+/// What a history message is to the tree: where a cut at it lands, and how its
+/// row reads. The marks match the ones the transcript puts on the same thing.
+enum Kind {
+  /// Something the user typed. Going back here takes it out of the history
+  /// and returns it to the input box, to be edited and asked again.
+  Prompt(String),
+  /// An assistant turn that called tools, which is not a place the
+  /// conversation can stop: a call with no result behind it is a transcript
+  /// no provider will accept. The tool results that answer it are the point
+  /// just after, and the message before it the point just before.
+  ToolCalls,
+  /// An answer, a tool result, a checkpoint — a step a cut keeps as the
+  /// conversation's new end.
+  Step(String),
+}
+
+fn classify(message: &Message) -> Kind {
+  match message {
+    Message::User { content } => {
+      if let Some(text) = crate::session::user_text(message) {
+        return Kind::Prompt(text);
+      }
+      let tools: Vec<&str> = content
+        .iter()
+        .filter_map(|c| match c {
+          UserContent::ToolResult(r) => Some(r.name.as_str()),
+          _ => None,
+        })
+        .collect();
+      match tools.is_empty() {
+        false => Kind::Step(format!("⚙ {}", tools.join(", "))),
+        // What is left is the compaction checkpoint, which travels as a user
+        // message but is not one.
+        true => Kind::Step("▤ Context summary".into()),
+      }
+    }
+    Message::Assistant { content, .. } => {
+      if content.iter().any(|c| matches!(c, AssistantContent::ToolCall(_))) {
+        return Kind::ToolCalls;
+      }
+      let text = content.iter().find_map(|c| match c {
+        AssistantContent::Text(t) => Some(first_line(&t.text)),
+        AssistantContent::Reasoning(r) => Some(format!("· {}", first_line(&r.display_text()))),
+        _ => None,
+      });
+      Kind::Step(text.unwrap_or_else(|| "(no text)".into()))
+    }
+    Message::System { .. } => Kind::Step("(system)".into()),
+  }
+}
+
+/// Every point the conversation can be moved to.
 ///
-/// Only the user's own messages: a tool result or a compaction summary is
-/// something the loop put in the history, not a place the user was ever at.
-fn rewind_points(history: &[Message]) -> Vec<Point> {
-  history
-    .iter()
-    .enumerate()
-    .filter_map(|(index, message)| {
-      crate::session::user_text(message).map(|text| Point {
-        index,
-        text,
-        drops: history.len() - index,
-      })
-    })
-    .collect()
+/// Depth-first from the roots, and at each branch point the path the session
+/// is on comes first — so the conversation you are in reads top to bottom and
+/// the ones you left hang off it, where you can walk back into them.
+fn points(session: &Session) -> Vec<Point> {
+  let mut children: HashMap<Option<&str>, Vec<&Node>> = HashMap::new();
+  for node in session.nodes() {
+    children.entry(node.parent.as_deref()).or_default().push(node);
+  }
+  let here: HashSet<&str> = session.lineage(session.leaf()).into_iter().collect();
+  let mut out = Vec::new();
+  walk(session, &children, &here, None, 0, &mut out);
+  out
+}
+
+fn walk<'a>(
+  session: &'a Session,
+  children: &HashMap<Option<&'a str>, Vec<&'a Node>>,
+  here: &HashSet<&'a str>,
+  parent: Option<&'a str>,
+  depth: usize,
+  out: &mut Vec<Point>,
+) {
+  let Some(kids) = children.get(&parent) else {
+    return;
+  };
+  // One child is the conversation carrying on, and reads at the same level.
+  // More than one is somewhere it went two ways, which is what the indent is
+  // for — and where the path still in use is listed first.
+  let branching = kids.len() > 1;
+  let mut kids = kids.clone();
+  if branching {
+    kids.sort_by_key(|node| !here.contains(node.id.as_str()));
+  }
+  let depth = depth + usize::from(branching);
+  for node in kids {
+    if let Some(point) = point(session, node, depth) {
+      out.push(point);
+    }
+    // A step that is no place to stop still has children that are.
+    walk(session, children, here, Some(&node.id), depth, out);
+  }
+}
+
+fn point(session: &Session, node: &Node, depth: usize) -> Option<Point> {
+  let kind = match &node.kind {
+    NodeKind::Message(message) => classify(message),
+    NodeKind::Checkpoint { .. } => Kind::Step("▤ Context summary".into()),
+  };
+  // A prompt is taken back out of the history and handed to the input box, so
+  // the conversation ends where it did before. Anything else is kept.
+  let (leaf, text, label) = match kind {
+    Kind::Prompt(text) => (
+      session.parent_of(&node.id).map(str::to_string),
+      Some(text.clone()),
+      format!("❯ {}", first_line(&text)),
+    ),
+    Kind::Step(label) => (Some(node.id.clone()), None, label),
+    Kind::ToolCalls => return None,
+  };
+  Some(Point {
+    // Where the session already stands, and selecting it would do nothing.
+    // The prompt that was answered here ends the conversation in the same
+    // place, but hands itself back to be asked again, which is not nothing.
+    here: leaf.as_deref() == session.leaf() && text.is_none(),
+    len: session.branch_len(leaf.as_deref()),
+    leaf,
+    text,
+    label,
+    depth,
+  })
+}
+
+/// `1 message` or `4 messages`.
+fn messages(n: usize) -> String {
+  match n {
+    1 => "1 message".into(),
+    n => format!("{n} messages"),
+  }
 }
 
 fn first_line(text: &str) -> String {
@@ -1561,30 +1757,126 @@ mod tests {
     assert_eq!(m.highlights, [0, 2]);
   }
 
-  #[test]
-  fn rewind_points_are_the_user_own_messages() {
-    let history = vec![
-      Message::user("first"),
-      Message::assistant("answer"),
-      compaction::summary_message("a summary"),
-      Message::user("second"),
-      Message::assistant("reply"),
-    ];
-    let points = rewind_points(&history);
-    let texts: Vec<&str> = points.iter().map(|p| p.text.as_str()).collect();
-    // The checkpoint reads as a user message on the wire, but the user was
-    // never at it, so it is not somewhere they can go back to.
-    assert_eq!(texts, ["first", "second"]);
-    assert_eq!(points[0].index, 0);
-    assert_eq!(points[1].index, 3);
-    // Rewinding to "second" drops it and everything after it.
-    assert_eq!(points[1].drops, 2);
-    assert_eq!(points[0].drops, 5);
+  /// A history of one prompt, a tool call answered, and a final answer.
+  fn tool_history() -> Vec<Message> {
+    let call = AssistantContent::tool_call("1", "read", serde_json::json!({ "path": "a.rs" }));
+    let result = UserContent::tool_result("1", "read", vec![ToolResultContent::text("fn main() {}")]);
+    vec![
+      Message::user("look at a.rs"),
+      Message::Assistant {
+        id: None,
+        content: vec![AssistantContent::text("Let me read it."), call],
+      },
+      Message::User { content: vec![result] },
+      Message::assistant("It is a hello world."),
+    ]
+  }
+
+  /// An unsaved session holding `history`.
+  fn session_of(history: Vec<Message>) -> Session {
+    let mut session = Session::new(None, Path::new("/work"), "mock");
+    session.append(history).unwrap();
+    session
+  }
+
+  /// Every row as it reads: indented label, resulting length, prompt handed
+  /// back, and whether it is where the session is.
+  fn rows(session: &Session) -> Vec<(String, usize, Option<String>, bool)> {
+    points(session)
+      .into_iter()
+      .map(|p| (format!("{}{}", "  ".repeat(p.depth), p.label), p.len, p.text, p.here))
+      .collect()
   }
 
   #[test]
-  fn a_history_with_nothing_of_the_user_in_it_has_no_rewind_points() {
-    assert!(rewind_points(&[]).is_empty());
-    assert!(rewind_points(&[Message::assistant("hello")]).is_empty());
+  fn a_prompt_is_taken_back_and_anything_else_is_kept() {
+    let session = session_of(vec![
+      Message::user("first"),
+      Message::assistant("answer"),
+      Message::user("second"),
+      Message::assistant("reply"),
+    ]);
+    assert_eq!(
+      rows(&session),
+      [
+        // A prompt is taken back out of the history and handed to the input
+        // box, so going there ends the conversation before it.
+        ("❯ first".into(), 0, Some("first".into()), false),
+        // Everything else is kept as the new end.
+        ("answer".into(), 2, None, false),
+        ("❯ second".into(), 2, Some("second".into()), false),
+        ("reply".into(), 4, None, true),
+      ]
+    );
+  }
+
+  #[test]
+  fn a_tool_call_is_not_a_point_but_its_result_is() {
+    // Stopping straight after the call would leave it unanswered, which is a
+    // transcript no provider will take. The result right after it is the
+    // point "between the tool calls".
+    let session = session_of(tool_history());
+    let labels: Vec<String> = rows(&session).into_iter().map(|r| r.0).collect();
+    assert_eq!(labels, ["❯ look at a.rs", "⚙ read", "It is a hello world."]);
+  }
+
+  #[test]
+  fn forking_offers_only_the_prompts() {
+    let session = session_of(tool_history());
+    let mut points = points(&session);
+    points.retain(|point| point.text.is_some());
+    assert_eq!(points.len(), 1);
+    assert_eq!(points[0].text.as_deref(), Some("look at a.rs"));
+  }
+
+  #[test]
+  fn a_branch_is_indented_under_the_point_it_left_and_the_live_one_comes_first() {
+    let mut session = session_of(vec![Message::user("first"), Message::assistant("one")]);
+    let prompt = session.lineage(session.leaf())[0].to_string();
+    // Go back under the prompt and answer differently, which forks the tree.
+    session.go_to(Some(prompt)).unwrap();
+    session.append(vec![Message::assistant("two")]).unwrap();
+
+    assert_eq!(
+      rows(&session),
+      [
+        ("❯ first".into(), 0, Some("first".into()), false),
+        // Both answers hang off the prompt, the one in use listed first, and
+        // the one walked away from still there to walk back into.
+        ("  two".into(), 2, None, true),
+        ("  one".into(), 2, None, false),
+      ]
+    );
+  }
+
+  #[test]
+  fn an_empty_session_has_nowhere_to_go() {
+    assert!(points(&session_of(vec![])).is_empty());
+  }
+
+  #[test]
+  fn going_back_leaves_what_came_after_on_the_list_to_go_forward_to() {
+    let mut session = session_of(vec![
+      Message::user("first"),
+      Message::assistant("one"),
+      Message::user("second"),
+      Message::assistant("two"),
+    ]);
+    let answered = session.lineage(session.leaf())[1].to_string();
+    session.go_to(Some(answered)).unwrap();
+
+    // The rest of the conversation is still listed, and still somewhere to
+    // go — forward is the same move as back, in the other direction.
+    assert_eq!(
+      rows(&session),
+      [
+        ("❯ first".into(), 0, Some("first".into()), false),
+        ("one".into(), 2, None, true),
+        // Only one row is where we stand: this prompt ends the conversation
+        // in the same place, but hands itself back, which is not nothing.
+        ("❯ second".into(), 2, Some("second".into()), false),
+        ("two".into(), 4, None, false),
+      ]
+    );
   }
 }

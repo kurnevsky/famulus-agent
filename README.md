@@ -78,8 +78,9 @@ resumed later. Unlike pi, all sessions live in one global directory
 so the picker shows each session's working directory. The file is created on
 the first message, so empty sessions leave nothing behind. Records are the
 header, each transcript message, compaction checkpoints (summary plus the kept
-tail), rewind cuts, and renames. Aborted turns keep the prompt and any partial
-answer.
+tail), the moves `/tree` makes, and renames. Aborted turns keep the prompt and
+any partial answer. Because entries name their parent, one file holds every
+branch the conversation took, not only the one it is on.
 
 - `src/session.rs` – store, session file, listing, and replay.
 
@@ -93,18 +94,53 @@ unanswered user message gets answered, and a half-written answer is continued
 from where it stopped. Nothing is written to the session twice: the resumed
 message is dropped from the turn's result.
 
-## Rewinding
+## Going back
 
-`/rewind` — or `Esc` twice on an empty input box, as in pi — lists the prompts
-of this session and goes back to the one you pick: the history is cut to just
-before it, the transcript is rebuilt from what is left, and the message itself
-goes back in the input box to be edited and asked again. Only your own messages
-are offered; a tool result or a compaction summary is somewhere the loop went,
-not somewhere you were. There is no branching and no branch summary — it is a
-plain step backwards, and the answer you rewound past is gone.
+`/tree` — or `Esc` twice on an empty input box, which is pi's shortcut and its
+default action — lists every point the conversation can move to and takes you
+to the one you pick. Not just your own prompts: an answer, or a tool result
+in the middle of a turn, so you can go back to between two tool calls and carry
+on from there with `/continue`. Following pi:
 
-The session file stays append-only: a rewind writes the length the history was
-cut to, and replaying the file cuts it again at the same point.
+- Pick a **prompt** and it is taken back out of the history and returned to the
+  input box, to be edited and asked again.
+- Pick **anything else** and it is kept as the conversation's new end; the
+  input box is left alone.
+
+The one thing that is never a point is an assistant turn that called tools.
+Stopping there would leave a call with no result behind it, which is a
+transcript no provider will accept — the tool results that answer it are the
+point just after, and the message before it the point just before.
+
+Nothing is deleted. Going back moves where the conversation ends; what it said
+down the path you left stays as a branch of its own, and the list shows it —
+indented under the point the two ways part, with the path you are on first. So
+you can go back, try something else, and later walk into the answer you
+abandoned:
+
+```
+╭ Tree — ↑↓ PgUp/PgDn select · Enter go there · Esc cancel ──────────────────╮
+│  ❯ what does main.rs do?                                       0 messages  │
+│  ⚙ read                                                        3 messages  │
+│›   Actually it prints hi and exits 0.                                here  │
+│    It prints hi.                                               4 messages  │
+```
+
+`/fork` is the same list narrowed to your prompts, and it branches into a file
+instead of within one: the conversation up to that point is carried into a
+**new session**, the prompt goes back in the input box, and the session you
+came from is left on disk exactly as it was, still its own thing to resume. The
+fork's header names its parent. Only the one path is copied — the branches
+beside it stay with the session being left, and the fork starts as a straight
+line. Use `/tree` to take this conversation a different way, `/fork` to start
+another one beside it.
+
+There is no branch summary — going back is a plain move, with nothing
+summarized and nothing lost.
+
+The session file stays append-only and is a tree rather than a list: every
+message record names itself and its parent, going back writes the entry the
+conversation moved to, and replaying the file rebuilds the same branches.
 
 ## Compaction
 
@@ -114,9 +150,10 @@ on `/compact`), the older part of the history is rendered as a transcript and
 summarized by the same model into pi's structured checkpoint format (goal,
 progress, decisions, next steps, critical context). The summary replaces those
 messages as a single user message; the most recent turns, about
-`keep_recent_tokens` worth, stay verbatim, and tool call/result pairs are never
-split. A later compaction updates the existing summary instead of nesting it.
-The footer shows the current context usage as `ctx N%`.
+`keep_recent_tokens` worth, stay verbatim as entries of their own, so `/tree`
+can still go back to any of them; tool call/result pairs are never split. A
+later compaction updates the existing summary instead of nesting it. The footer
+shows the current context usage as `ctx N%`.
 
 ## Keys
 
@@ -126,7 +163,7 @@ The footer shows the current context usage as `ctx N%`.
 | `/` | Command popup: type to fuzzy-filter, `↑`/`↓` move, `Tab`/`Enter` complete, `Esc` dismiss |
 | `Alt+Enter`, `Ctrl+J`, `Shift+Enter`* | Newline |
 | `Esc` | Abort the current run |
-| `Esc` `Esc` | Rewind to an earlier message (empty input, within half a second) |
+| `Esc` `Esc` | Open `/tree` (empty input, within half a second) |
 | `PageUp` / `PageDown`, mouse wheel | Scroll transcript |
 | `Ctrl+C` | Abort if running, otherwise quit |
 | `Ctrl+D` | Quit (empty input) |
@@ -134,7 +171,8 @@ The footer shows the current context usage as `ctx N%`.
 | `/continue` | Run the model again with no new message |
 | `/new` | Start a new session |
 | `/resume` | Pick a saved session to resume |
-| `/rewind` | Go back to an earlier message |
+| `/tree` | Move to another point in this session, on any branch |
+| `/fork` | Branch a new session from an earlier prompt |
 | `/name <name>` | Name the current session |
 | `/session` | Show session id, file, and stats |
 | `/quit` | Quit |
