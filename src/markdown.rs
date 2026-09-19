@@ -123,6 +123,17 @@ pub fn render(md: &str, width: u16, streaming: bool) -> Vec<Line<'static>> {
   out
 }
 
+/// Word-wraps plain text to `width` columns, for prose that is shown as
+/// written rather than parsed — the reasoning block, which is the model
+/// thinking aloud and not markdown it meant for us to render.
+pub fn wrap_text(text: &str, width: u16, style: Style) -> Vec<Line<'static>> {
+  let width = (width as usize).max(1);
+  text
+    .lines()
+    .flat_map(|line| wrap(vec![Span::styled(line.to_string(), style)], width))
+    .collect()
+}
+
 fn children(node: &Node) -> &[Node] {
   node.children().map(Vec::as_slice).unwrap_or_default()
 }
@@ -832,6 +843,21 @@ mod tests {
   fn wide_characters_count_two_columns() {
     let lines = render("日本語テスト", 6, false);
     assert_eq!(plain(&lines), ["日本語", "テスト"]);
+  }
+
+  #[test]
+  fn plain_text_wraps_without_being_parsed() {
+    // The reasoning block is prose, not markdown: `# ` and `**` stay as the
+    // model wrote them, and the count of lines is the count as drawn.
+    let lines = wrap_text("# not a heading **not bold**", 12, Style::default());
+    assert_eq!(plain(&lines), ["# not a", "heading", "**not bold**"]);
+    // A paragraph with no newlines still counts as the rows it occupies,
+    // which is what makes a collapsed block consistent across providers.
+    let paragraph = "one two three four five six";
+    assert_eq!(paragraph.lines().count(), 1);
+    let wide = wrap_text(paragraph, 20, Style::default()).len();
+    let narrow = wrap_text(paragraph, 9, Style::default()).len();
+    assert!(wide > 1 && narrow > wide, "wide {wide}, narrow {narrow}");
   }
 
   #[test]

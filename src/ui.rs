@@ -29,6 +29,11 @@ const MAX_INPUT_LINES: usize = 8;
 const TOOL_OUTPUT_LINES: usize = 10;
 const DIFF_LINES: usize = 30;
 const REASONING_LINES: usize = 6;
+/// Reasoning text is indented under its `· thinking…` header.
+const REASONING_INDENT: &str = "  ";
+/// Cache tags, so two entry kinds holding the same text stay apart.
+const ASSISTANT_KIND: u8 = 0;
+const REASONING_KIND: u8 = 1;
 /// Transcript lines moved per mouse wheel notch.
 const WHEEL_LINES: usize = 3;
 /// How long the `auto` scrollbar stays visible after the last scroll (pi: 1s).
@@ -152,6 +157,8 @@ pub struct App {
   anchor: Option<usize>,
   /// Offset and maximum offset used by the last draw, for relative scrolling.
   view: (usize, usize),
+  /// Ctrl+T shows reasoning blocks in full instead of their last few lines.
+  expand_thinking: bool,
   /// Rendered markdown, keyed by message text and width rather than by entry,
   /// so reloading a session or compacting cannot serve another entry's lines.
   /// Rebuilt each draw by moving live entries across, which evicts the rest.
@@ -205,6 +212,7 @@ impl App {
       queued: VecDeque::new(),
       anchor: None,
       view: (0, 0),
+      expand_thinking: false,
       markdown: HashMap::new(),
       usage: Usage::new(),
       context_tokens: None,
@@ -300,6 +308,12 @@ impl App {
         }
       }
       (KeyCode::Char('d'), true) if self.input.is_empty() => self.quit = true,
+      (KeyCode::Char('t'), true) => {
+        self.expand_thinking = !self.expand_thinking;
+        // Expanding moves everything below the block, so keep the view
+        // pinned rather than leaving the reader mid-paragraph.
+        self.reset_view();
+      }
       (KeyCode::Esc, _) if self.run.is_some() => self.abort(),
       (KeyCode::PageUp, _) => self.scroll_by(10),
       (KeyCode::PageDown, _) => self.scroll_by(-10),
@@ -1010,7 +1024,7 @@ impl App {
           // of the key so the completed text is not served its mid-stream
           // rendering, which closes tokens this one should leave literal.
           let streaming = streaming == Some(i);
-          let key = (hash(text), width, streaming);
+          let key = (hash(ASSISTANT_KIND, text), width, streaming);
           let rendered = match cached.remove(&key) {
             Some(rendered) => rendered,
             None => crate::markdown::render(text, width, streaming),
@@ -1020,19 +1034,31 @@ impl App {
         }
         Entry::Reasoning(text) => {
           lines.push(Line::default());
-          let all: Vec<&str> = text.lines().collect();
-          let skip = all.len().saturating_sub(REASONING_LINES);
-          if skip > 0 {
-            lines.push(Line::styled(
-              format!("· thinking… ({skip} earlier lines hidden)"),
-              dim.italic(),
-            ));
+          // Counted in lines as drawn, not as the provider happened to break
+          // them: a reasoning summary arrives as one long paragraph, which
+          // would otherwise count as a single line and never collapse.
+          let body = width.saturating_sub(REASONING_INDENT.len() as u16);
+          let key = (hash(REASONING_KIND, text), body, false);
+          let wrapped = match cached.remove(&key) {
+            Some(wrapped) => wrapped,
+            None => crate::markdown::wrap_text(text, body, dim.italic()),
+          };
+          let shown = if self.expand_thinking {
+            wrapped.len()
           } else {
-            lines.push(Line::styled("· thinking…", dim.italic()));
+            wrapped.len().min(REASONING_LINES)
+          };
+          let hidden = wrapped.len() - shown;
+          let header = match hidden {
+            0 => "· thinking…".to_string(),
+            1 => "· thinking… (1 earlier line hidden)".to_string(),
+            n => format!("· thinking… ({n} earlier lines hidden)"),
+          };
+          lines.push(Line::styled(header, dim.italic()));
+          for line in &wrapped[hidden..] {
+            lines.push(prefix(REASONING_INDENT, line.clone()));
           }
-          for l in &all[skip..] {
-            lines.push(Line::styled(format!("  {l}"), dim.italic()));
-          }
+          live.insert(key, wrapped);
         }
         Entry::ToolCall { name, summary, .. } => {
           lines.push(Line::default());
@@ -1133,11 +1159,21 @@ impl App {
   }
 }
 
-/// Identifies a message by content, for the rendered-markdown cache.
-fn hash(text: &str) -> u64 {
+/// Identifies a message by content, for the rendered-text cache. `kind` keeps
+/// an assistant message and a reasoning block apart when they read the same.
+fn hash(kind: u8, text: &str) -> u64 {
   let mut hasher = DefaultHasher::new();
+  kind.hash(&mut hasher);
   text.hash(&mut hasher);
   hasher.finish()
+}
+
+/// Puts `lead` in front of a rendered line, keeping the rest of its spans.
+fn prefix(lead: &'static str, line: Line<'static>) -> Line<'static> {
+  let mut spans = Vec::with_capacity(line.spans.len() + 1);
+  spans.push(Span::raw(lead));
+  spans.extend(line.spans);
+  Line::from(spans)
 }
 
 /// Alt+Enter and Shift+Enter (where the terminal reports it) insert a newline.
