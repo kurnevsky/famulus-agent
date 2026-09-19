@@ -74,6 +74,7 @@ pub struct Options {
 /// Slash commands offered by the `/` popup: name, description, takes an argument.
 const COMMANDS: &[(&str, &str, bool)] = &[
   ("compact", "Manually compact the session context", false),
+  ("continue", "Resume the loop without a new message", false),
   ("name", "Set session display name", true),
   ("new", "Start a new session", false),
   ("resume", "Resume a different session", false),
@@ -93,6 +94,18 @@ struct Match {
 struct Completion {
   items: Vec<Match>,
   selected: usize,
+}
+
+/// The run in flight, kept so an abort can still record what the user saw.
+struct InFlight {
+  /// Trailing history messages this run re-sent as its prompt (`/continue`).
+  /// They come back in `Done`, where they are dropped rather than stored
+  /// twice; an abort leaves them where they already are.
+  resumed: usize,
+  /// The new user message, absent for `/continue`.
+  prompt: Option<Message>,
+  /// Assistant text streamed so far.
+  partial: String,
 }
 
 /// The `/resume` list.
@@ -149,8 +162,8 @@ pub struct App {
   run: Option<JoinHandle<()>>,
   /// The background task in `run` is a compaction rather than a model turn.
   compacting: bool,
-  /// Prompt and streamed text of the run in flight, kept for abort recovery.
-  in_flight: Option<(String, String)>,
+  /// The run in flight, kept for abort recovery.
+  in_flight: Option<InFlight>,
   queued: VecDeque<String>,
   /// Transcript position. `None` follows new output at the bottom; `Some`
   /// is a fixed offset from the top, so appended text does not move the view.
@@ -471,6 +484,7 @@ impl App {
       "/quit" | "/exit" => self.quit = true,
       "/clear" | "/new" => self.new_session(),
       "/compact" => self.compact(),
+      "/continue" => self.continue_run(),
       "/resume" => {
         if self.run.is_some() {
           self.entries.push(Entry::Info(
@@ -604,6 +618,7 @@ impl App {
 
   fn start(&mut self, prompt: String) {
     self.entries.push(Entry::User(prompt.clone()));
+    let prompt = Message::user(prompt);
     let handle = start_run(
       self.agents.agent.clone(),
       self.session.history.clone(),
@@ -611,7 +626,32 @@ impl App {
       self.tx.clone(),
     );
     self.run = Some(handle);
-    self.in_flight = Some((prompt, String::new()));
+    self.in_flight = Some(InFlight {
+      resumed: 0,
+      prompt: Some(prompt),
+      partial: String::new(),
+    });
+  }
+
+  /// Run the model again with no new user message, to pick the loop back up
+  /// where an abort or a compaction left it. The last history message becomes
+  /// the prompt of the request, so the model sees exactly the conversation it
+  /// already had: an unanswered user message is answered, and a half-written
+  /// answer is continued.
+  fn continue_run(&mut self) {
+    let mut history = self.session.history.clone();
+    let Some(prompt) = history.pop() else {
+      self.entries.push(Entry::Info("Nothing to continue.".into()));
+      self.next_queued();
+      return;
+    };
+    let handle = start_run(self.agents.agent.clone(), history, prompt, self.tx.clone());
+    self.run = Some(handle);
+    self.in_flight = Some(InFlight {
+      resumed: 1,
+      prompt: None,
+      partial: String::new(),
+    });
   }
 
   fn abort(&mut self) {
@@ -642,16 +682,21 @@ impl App {
   }
 
   /// The run never reached its final response, so rig did not hand back the
-  /// updated transcript. Keep what the user saw.
+  /// updated transcript. Keep what the user saw. The messages a `/continue`
+  /// resumed from are already in the history and stay there.
   fn recover_in_flight(&mut self) {
-    if let Some((prompt, partial)) = self.in_flight.take() {
-      let mut messages = vec![Message::user(prompt)];
-      if !partial.trim().is_empty() {
-        messages.push(Message::assistant(partial));
-      }
-      let result = self.session.append(messages);
-      self.report(result);
+    let Some(InFlight { prompt, partial, .. }) = self.in_flight.take() else {
+      return;
+    };
+    let mut messages: Vec<Message> = prompt.into_iter().collect();
+    if !partial.trim().is_empty() {
+      messages.push(Message::assistant(partial));
     }
+    if messages.is_empty() {
+      return;
+    }
+    let result = self.session.append(messages);
+    self.report(result);
   }
 
   // ------------------------------------------------------------ agent events
@@ -662,8 +707,8 @@ impl App {
     }
     match ev {
       AgentEvent::Text(delta) => {
-        if let Some((_, partial)) = &mut self.in_flight {
-          partial.push_str(&delta);
+        if let Some(in_flight) = &mut self.in_flight {
+          in_flight.partial.push_str(&delta);
         }
         match self.entries.last_mut() {
           Some(Entry::Assistant(text)) => text.push_str(&delta),
@@ -732,8 +777,10 @@ impl App {
         context_tokens,
       } => {
         self.run = None;
-        self.in_flight = None;
-        let result = self.session.append(messages);
+        // A `/continue` run echoes back the messages it resumed from; they
+        // are already in the history.
+        let resumed = self.in_flight.take().map_or(0, |f| f.resumed);
+        let result = self.session.append(messages.into_iter().skip(resumed).collect());
         self.report(result);
         self.usage.input_tokens += usage.input_tokens;
         self.usage.output_tokens += usage.output_tokens;

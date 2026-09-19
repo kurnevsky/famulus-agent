@@ -305,11 +305,13 @@ fn default_system_prompt(cwd: &Path) -> String {
 }
 
 /// Start one agent run in the background. Dropping/aborting the handle cancels
-/// the HTTP stream and any running tool process.
+/// the HTTP stream and any running tool process. `prompt` is the last message
+/// of the request: usually a new user message, but `/continue` re-sends the
+/// last message of the history to resume the loop without one.
 pub fn start_run(
   agent: Arc<Agent>,
   history: Vec<Message>,
-  prompt: String,
+  prompt: Message,
   tx: mpsc::UnboundedSender<AgentEvent>,
 ) -> JoinHandle<()> {
   tokio::spawn(async move {
@@ -394,7 +396,7 @@ mod tests {
     rx: &mut mpsc::UnboundedReceiver<AgentEvent>,
     tx: &mpsc::UnboundedSender<AgentEvent>,
   ) -> Vec<AgentEvent> {
-    let handle = start_run(agent.clone(), history, prompt.to_string(), tx.clone());
+    let handle = start_run(agent.clone(), history, Message::user(prompt), tx.clone());
     let mut events = Vec::new();
     loop {
       let ev = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())

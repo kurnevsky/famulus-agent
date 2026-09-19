@@ -57,6 +57,16 @@ tail), and renames. Aborted turns keep the prompt and any partial answer.
 
 - `src/session.rs` – store, session file, listing, and replay.
 
+## Continuing
+
+`/continue` runs the model again without adding a user message: the last
+message of the history is re-sent as the prompt of the request, so the model
+sees exactly the conversation it already had. Use it to pick the loop back up
+after `Esc`, after a `/compact`, or on a session resumed with `-c`. An
+unanswered user message gets answered, and a half-written answer is continued
+from where it stopped. Nothing is written to the session twice: the resumed
+message is dropped from the turn's result.
+
 ## Compaction
 
 After each turn the agent compares the provider-reported context size of the
@@ -81,6 +91,7 @@ The footer shows the current context usage as `ctx N%`.
 | `Ctrl+C` | Abort if running, otherwise quit |
 | `Ctrl+D` | Quit (empty input) |
 | `/compact` | Summarize older history now |
+| `/continue` | Run the model again with no new message |
 | `/new`, `/clear` | Start a new session |
 | `/resume` | Pick a saved session to resume |
 | `/name <name>` | Name the current session |
