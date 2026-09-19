@@ -1,6 +1,7 @@
 //! Agent construction and the streaming run loop. The TUI never touches rig
 //! directly; it receives `AgentEvent`s over a channel and can abort a run.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -19,7 +20,7 @@ use rig_core::completion::{
 };
 use rig_core::message::{ToolResultContent, UserContent};
 use rig_core::providers::{gemini, openai};
-use rig_core::streaming::{StreamedAssistantContent, StreamingCompletionResponse};
+use rig_core::streaming::{StreamedAssistantContent, StreamingCompletionResponse, ToolCallDeltaContent};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -34,6 +35,16 @@ pub enum AgentEvent {
   ToolCall {
     name: String,
     args: serde_json::Value,
+  },
+  /// A tool call being written, before it is run. `args` is the JSON as far
+  /// as it has arrived, which is usually not yet parseable; `name` is empty
+  /// until the provider has said it.
+  ToolCallDelta {
+    /// Correlates the fragments of one call, so two calls in the same turn
+    /// do not run into each other.
+    id: String,
+    name: String,
+    args: String,
   },
   /// Live output of the running tool (bash), replacing earlier snapshots.
   ToolOutput(String),
@@ -318,6 +329,10 @@ pub fn start_run(
     let mut stream = agent.stream_prompt(prompt).history(history).await;
     let mut sent_done = false;
     let mut had_error = false;
+    // Arguments arrive a few characters at a time and each fragment carries
+    // only what is new, so the run holds what has arrived per call and sends
+    // the whole of it. The UI then has nothing to reassemble.
+    let mut writing: HashMap<String, (String, String)> = HashMap::new();
     while let Some(item) = stream.next().await {
       let event = match item {
         Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => match content {
@@ -327,7 +342,32 @@ pub fn start_run(
             let text = reasoning.display_text();
             (!text.is_empty()).then_some(AgentEvent::Reasoning(text))
           }
-          // Tool calls are reported by `UiHook`; deltas are noise here.
+          StreamedAssistantContent::ToolCallDelta {
+            internal_call_id,
+            content,
+          } => {
+            let (name, args) = writing.entry(internal_call_id.clone()).or_default();
+            match content {
+              ToolCallDeltaContent::Name(part) => name.push_str(&part),
+              ToolCallDeltaContent::Delta(part) => args.push_str(&part),
+            }
+            Some(AgentEvent::ToolCallDelta {
+              id: internal_call_id,
+              name: name.clone(),
+              args: args.clone(),
+            })
+          }
+          // The call is written but not yet run — `UiHook` reports it when it
+          // starts. Showing it whole in the meantime is what the finished
+          // line will say, so nothing jumps when the two swap over.
+          StreamedAssistantContent::ToolCall {
+            tool_call,
+            internal_call_id,
+          } => Some(AgentEvent::ToolCallDelta {
+            id: internal_call_id,
+            name: tool_call.function.name,
+            args: tool_call.function.arguments.to_string(),
+          }),
           _ => None,
         },
         // Tool calls and results are reported by `UiHook`.
@@ -469,6 +509,7 @@ mod tests {
         AgentEvent::Text(_) => "text".into(),
         AgentEvent::Reasoning(_) => "reasoning".into(),
         AgentEvent::ToolCall { name, .. } => format!("call:{name}"),
+        AgentEvent::ToolCallDelta { .. } => "writing".into(),
         AgentEvent::ToolOutput(_) => "output".into(),
         AgentEvent::ToolResult { is_error, .. } => {
           format!("result:{}", if *is_error { "err" } else { "ok" })

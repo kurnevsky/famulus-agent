@@ -142,6 +142,24 @@ The session file stays append-only and is a tree rather than a list: every
 message record names itself and its parent, going back writes the entry the
 conversation moved to, and replaying the file rebuilds the same branches.
 
+## Watching a tool call being written
+
+A tool call appears as the model writes it, rather than all at once when it is
+run: the arguments stream in a few characters at a time, and the line grows
+with them under a cursor.
+
+```
+⚙ bash cargo te▌
+⚙ bash cargo test --all --r▌
+⚙ bash cargo test --all --release -- --nocapture
+```
+
+Only the part the finished line leads with is shown — the command, or the path
+— so the live line and the entry it becomes read the same and nothing moves
+when the call starts running. Until the arguments parse they are read straight
+out of the half-written JSON; after that the ordinary summary takes over. A
+call the model never finished writing leaves nothing behind.
+
 ## Compaction
 
 After each turn the agent compares the provider-reported context size of the
@@ -187,7 +205,9 @@ mouse usually requires holding `Shift`.
 - `src/main.rs` – CLI flags, terminal setup.
 - `src/agent.rs` – builds the rig agent (OpenAI completions client, tools,
   system prompt) and runs one streaming turn per user message, forwarding
-  `AgentEvent`s to the UI over a channel. Tool calls and results are reported
+  `AgentEvent`s to the UI over a channel. Tool-call argument fragments are
+  accumulated per call and sent whole, so the UI has nothing to reassemble.
+  Tool calls and results are reported
   through an `AgentHook` so they stay ordered and carry an error flag. On the
   OpenAI path a `CompletionModel` wrapper moves images out of tool results into
   a follow-up user message, since the chat completions API only accepts text

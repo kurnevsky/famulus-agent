@@ -172,6 +172,18 @@ impl Overlay {
   }
 }
 
+/// A tool call whose arguments are still arriving, shown at the end of the
+/// transcript so the command can be read as the model writes it.
+///
+/// It is replaced by a real entry when the call starts running, which is when
+/// `UiHook` reports it — not when the last of its text arrives.
+struct Writing {
+  id: String,
+  name: String,
+  /// The JSON so far, usually not yet parseable.
+  args: String,
+}
+
 enum Entry {
   User(String),
   Assistant(String),
@@ -224,6 +236,8 @@ pub struct App {
   compacting: bool,
   /// The run in flight, kept for abort recovery.
   in_flight: Option<InFlight>,
+  /// Tool calls the model is still writing, oldest first.
+  writing: Vec<Writing>,
   queued: VecDeque<String>,
   /// Transcript position. `None` follows new output at the bottom; `Some`
   /// is a fixed offset from the top, so appended text does not move the view.
@@ -283,6 +297,7 @@ impl App {
       run: None,
       compacting: false,
       in_flight: None,
+      writing: Vec::new(),
       queued: VecDeque::new(),
       anchor: None,
       view: (0, 0),
@@ -844,6 +859,8 @@ impl App {
       return;
     };
     handle.abort();
+    // A call the model had not finished writing was never run.
+    self.writing.clear();
     if self.compacting {
       self.compacting = false;
       self.entries.push(Entry::Info("Compaction aborted.".into()));
@@ -904,7 +921,17 @@ impl App {
         Some(Entry::Reasoning(text)) => text.push_str(&delta),
         _ => self.entries.push(Entry::Reasoning(delta)),
       },
+      AgentEvent::ToolCallDelta { id, name, args } => match self.writing.iter_mut().find(|w| w.id == id) {
+        Some(writing) => (writing.name, writing.args) = (name, args),
+        None => self.writing.push(Writing { id, name, args }),
+      },
       AgentEvent::ToolCall { name, args } => {
+        // The oldest call still being written is this one: calls are run in
+        // the order they were written, so it stops being a line the model is
+        // typing and becomes one the transcript keeps.
+        if !self.writing.is_empty() {
+          self.writing.remove(0);
+        }
         let summary = summarize_args(&name, &args);
         self.entries.push(Entry::ToolCall {
           name,
@@ -962,6 +989,7 @@ impl App {
         context_tokens,
       } => {
         self.run = None;
+        self.writing.clear();
         // A `/continue` run echoes back the messages it resumed from; they
         // are already in the history.
         let resumed = self.in_flight.take().map_or(0, |f| f.resumed);
@@ -986,6 +1014,7 @@ impl App {
       }
       AgentEvent::Ended => {
         self.run = None;
+        self.writing.clear();
         if self.compacting {
           self.compacting = false;
         } else {
@@ -1419,6 +1448,18 @@ impl App {
         }
       }
     }
+    // Calls the model is still writing, drawn like the entry each will
+    // become so that nothing moves when it does.
+    for writing in &self.writing {
+      lines.push(Line::default());
+      lines.push(Line::from(vec![
+        Span::styled("⚙ ", Style::default().fg(Color::Yellow)),
+        Span::styled(writing.name.clone(), Style::default().fg(Color::Yellow).bold()),
+        Span::raw(" "),
+        Span::styled(writing_summary(&writing.name, &writing.args), dim),
+        Span::styled("▌", Style::default().fg(Color::Yellow)),
+      ]));
+    }
     self.markdown = live;
     lines
   }
@@ -1726,6 +1767,58 @@ fn summarize_args(name: &str, args: &serde_json::Value) -> String {
   summary.unwrap_or_else(|| first_line(&args.to_string()))
 }
 
+/// What to show of a call the model is still writing.
+///
+/// Once the arguments parse, the finished summary is exact and is used as-is.
+/// Until then only the field that summary would lead with is worth showing —
+/// the command, or the path — which is the part being typed anyway.
+fn writing_summary(name: &str, args: &str) -> String {
+  if let Ok(value) = serde_json::from_str::<serde_json::Value>(args) {
+    return summarize_args(name, &value);
+  }
+  let key = match name {
+    "bash" => "command",
+    "read" | "write" | "edit" => "path",
+    _ => return String::new(),
+  };
+  partial_str(args, key).map(|text| first_line(&text)).unwrap_or_default()
+}
+
+/// The value of a string field in a JSON object that is still being written,
+/// including one whose closing quote has not arrived yet.
+///
+/// The key is found by text rather than by parsing, since there is nothing
+/// parseable yet. A tool argument that itself contained `"command":` would
+/// fool it, which costs a wrong half-drawn line and nothing else.
+fn partial_str(json: &str, key: &str) -> Option<String> {
+  let at = json.find(&format!("\"{key}\""))? + key.len() + 2;
+  let rest = json[at..].trim_start().strip_prefix(':')?.trim_start();
+  let mut chars = rest.strip_prefix('"')?.chars();
+  let mut out = String::new();
+  while let Some(c) = chars.next() {
+    match c {
+      '"' => break,
+      '\\' => match chars.next() {
+        Some('n') => out.push('\n'),
+        Some('t') => out.push('\t'),
+        Some('r') => {}
+        Some('u') => {
+          // Four hex digits, which may not all have arrived.
+          let hex: String = chars.by_ref().take(4).collect();
+          if let Some(c) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+            out.push(c);
+          }
+        }
+        Some(escaped) => out.push(escaped),
+        // The escape itself is only half here; the rest is on its way.
+        None => break,
+      },
+      c => out.push(c),
+    }
+  }
+  Some(out)
+}
+
 fn shorten_home(path: &std::path::Path) -> String {
   let s = path.display().to_string();
   match std::env::var("HOME") {
@@ -1847,6 +1940,54 @@ mod tests {
         ("  one".into(), 2, None, false),
       ]
     );
+  }
+
+  #[test]
+  fn a_command_reads_back_as_it_is_written() {
+    // What the model sends, a few characters at a time. Every prefix of it
+    // has to render as the command so far and nothing else.
+    let whole = r#"{"command":"cargo test --all"}"#;
+    let seen: Vec<String> = (0..=whole.len())
+      .map(|n| writing_summary("bash", &whole[..n]))
+      .collect();
+    assert_eq!(seen.first().unwrap(), "");
+    assert_eq!(seen.last().unwrap(), "cargo test --all");
+    // It only ever grows, and never shows the JSON around it.
+    for pair in seen.windows(2) {
+      assert!(pair[1].starts_with(&pair[0]), "{pair:?}");
+      assert!(!pair[1].contains('{') && !pair[1].contains('"'), "{pair:?}");
+    }
+    assert!(seen.contains(&"cargo te".to_string()), "{seen:?}");
+  }
+
+  #[test]
+  fn a_half_written_command_keeps_its_escapes_whole() {
+    let quote = |args: &str| writing_summary("bash", args);
+    assert_eq!(quote(r#"{"command":"echo \"hi"#), "echo \"hi");
+    // An escape that is itself half here waits rather than showing a stray
+    // backslash.
+    assert_eq!(quote(r#"{"command":"echo \"#), "echo ");
+    // Only the first line, marked as having more, exactly as the finished
+    // summary shows the same command.
+    assert_eq!(quote(r#"{"command":"one\ntwo"#), "one …");
+    assert_eq!(
+      quote(r#"{"command":"one\ntwo"}"#),
+      summarize_args("bash", &serde_json::json!({ "command": "one\ntwo" }))
+    );
+  }
+
+  #[test]
+  fn a_written_call_reads_the_same_as_the_finished_one() {
+    // The live line and the entry it becomes must agree, or the transcript
+    // jumps when the call starts running.
+    let args = serde_json::json!({ "path": "src/main.rs", "offset": 10, "limit": 5 });
+    assert_eq!(
+      writing_summary("read", &args.to_string()),
+      summarize_args("read", &args)
+    );
+    // A tool with nothing worth showing early says nothing, rather than
+    // guessing.
+    assert_eq!(writing_summary("mystery", r#"{"a":"b"#), "");
   }
 
   #[test]
