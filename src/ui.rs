@@ -1,5 +1,5 @@
 //! Ratatui front-end: a scrolling transcript, a multi-line input box and a
-//! one-line footer, in the spirit of pi's minimal interface.
+//! one-line footer.
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -36,10 +36,10 @@ const ASSISTANT_KIND: u8 = 0;
 const REASONING_KIND: u8 = 1;
 /// Transcript lines moved per mouse wheel notch.
 const WHEEL_LINES: usize = 3;
-/// How long the `auto` scrollbar stays visible after the last scroll (pi: 1s).
+/// How long the `auto` scrollbar stays visible after the last scroll.
 const SCROLLBAR_HIDE_DELAY: Duration = Duration::from_millis(1000);
 
-/// Transcript scrollbar behaviour, mirroring pi's `fullscreenScrollbar` setting.
+/// Transcript scrollbar behaviour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum ScrollbarMode {
   /// Shown while scrolling an overflowing transcript, hidden a second later
@@ -80,7 +80,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
   ("session", "Show session info and stats", false),
   ("quit", "Quit fa", false),
 ];
-/// Rows shown in the command popup (pi's default).
+/// Rows shown in the command popup.
 const COMPLETION_ROWS: usize = 5;
 
 /// One popup row: index into `COMMANDS` plus the matched character positions.
@@ -116,7 +116,7 @@ enum Entry {
     is_error: bool,
     /// Still streaming; `output` is a live snapshot.
     running: bool,
-    /// pi-style diff for `edit`, rendered instead of `output`.
+    /// Numbered diff for `edit`, rendered instead of `output`.
     diff: Option<String>,
     started: Instant,
     took: Option<Duration>,
@@ -165,8 +165,8 @@ pub struct App {
   markdown: HashMap<(u64, u16, bool), Vec<Line<'static>>>,
   usage: Usage,
   /// Size of the last completion request, for the footer and compaction.
-  /// `None` until the provider reports usage for a request (pi hides the
-  /// figure after compaction rather than showing an estimate).
+  /// `None` until the provider reports usage for a request: the figure is
+  /// hidden after compaction rather than shown as an estimate.
   context_tokens: Option<u64>,
   tick: usize,
   quit: bool,
@@ -739,7 +739,7 @@ impl App {
         self.usage.output_tokens += usage.output_tokens;
         self.usage.total_tokens += usage.total_tokens;
         // Fall back to a chars/4 estimate only when the provider reports
-        // no usage at all, as pi does.
+        // no usage at all.
         let context_tokens = if context_tokens > 0 {
           context_tokens
         } else {
@@ -825,7 +825,7 @@ impl App {
 
   fn draw_transcript(&mut self, f: &mut Frame, transcript_area: Rect) {
     // Pinned to the bottom unless the user scrolled up. In `always` mode
-    // the scrollbar gets its own column, like pi; in `auto` mode it is
+    // the scrollbar gets its own column; in `auto` mode it is
     // overlaid on the transcript's last column while visible.
     let mut content_area = transcript_area;
     if self.scrollbar == ScrollbarMode::Always && content_area.width > 1 {
@@ -999,6 +999,10 @@ impl App {
   fn transcript_lines(&mut self, width: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let dim = Style::default().add_modifier(Modifier::DIM);
+    // Thinking is grey and italic rather than dimmed: grey on top of dim
+    // reads as noise on terminals that render faint text very faint. Bright
+    // black is the palette's own grey, so it tracks the terminal's theme.
+    let thinking = Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
     let mut cached = std::mem::take(&mut self.markdown);
     let mut live = HashMap::with_capacity(cached.len());
     // Only the last entry can still be growing, and only while a turn is in
@@ -1041,7 +1045,7 @@ impl App {
           let key = (hash(REASONING_KIND, text), body, false);
           let wrapped = match cached.remove(&key) {
             Some(wrapped) => wrapped,
-            None => crate::markdown::wrap_text(text, body, dim.italic()),
+            None => crate::markdown::wrap_text(text, body, thinking),
           };
           let shown = if self.expand_thinking {
             wrapped.len()
@@ -1054,7 +1058,7 @@ impl App {
             1 => "· thinking… (1 earlier line hidden)".to_string(),
             n => format!("· thinking… ({n} earlier lines hidden)"),
           };
-          lines.push(Line::styled(header, dim.italic()));
+          lines.push(Line::styled(header, thinking));
           for line in &wrapped[hidden..] {
             lines.push(prefix(REASONING_INDENT, line.clone()));
           }
@@ -1079,8 +1083,8 @@ impl App {
           took,
         } => {
           if let Some(diff) = diff {
-            // pi shows the edit as a diff: removed red, added green,
-            // context dim, capped like other tool output.
+            // An edit is shown as a diff: removed red, added green, context
+            // dim, capped like other tool output.
             let all: Vec<&str> = diff.lines().collect();
             let shown = all.len().min(DIFF_LINES);
             for l in &all[..shown] {
@@ -1104,8 +1108,8 @@ impl App {
           let all: Vec<&str> = output.lines().collect();
           let shown = all.len().min(TOOL_OUTPUT_LINES);
           let hidden = all.len() - shown;
-          // Command output is most useful at its end, like pi's
-          // bash preview; file contents at the start.
+          // Command output is most useful at its end; file contents at the
+          // start.
           if name == "bash" {
             if hidden > 0 {
               lines.push(Line::styled(format!("  │ … {hidden} earlier lines"), dim));
@@ -1278,7 +1282,7 @@ fn entries_from_history(history: &[Message]) -> Vec<Entry> {
   entries
 }
 
-/// pi's duration format: `1.2s`, `3m 4s`, `1h 2m 3s`.
+/// Duration format: `1.2s`, `3m 4s`, `1h 2m 3s`.
 fn format_duration(d: Duration) -> String {
   let secs = d.as_secs_f64();
   if secs < 60.0 {

@@ -41,7 +41,7 @@ pub enum AgentEvent {
     name: String,
     output: String,
     is_error: bool,
-    /// pi-style diff for `edit`, shown in place of the output text.
+    /// Numbered diff for `edit`, shown in place of the output text.
     diff: Option<String>,
   },
   /// The run finished. `messages` holds only this run's new transcript
@@ -192,9 +192,9 @@ fn render_output(output: &ToolOutput) -> String {
     .join("\n")
 }
 
-/// The OpenAI chat completions API only accepts text in tool messages. Like
-/// pi's provider, this wrapper strips images out of tool results and re-sends
-/// them in a user message right after, so `read` can return screenshots.
+/// The OpenAI chat completions API only accepts text in tool messages, so this
+/// wrapper strips images out of tool results and re-sends them in a user
+/// message right after, so `read` can return screenshots.
 struct ToolImageRelay<M> {
   inner: M,
 }

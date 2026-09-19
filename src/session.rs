@@ -1,7 +1,6 @@
-//! Session persistence, following pi's idea: every conversation is an
+//! Session persistence: every conversation is an
 //! append-only JSONL file in one global directory, created lazily on the first
-//! persisted message, and resumable later. The record format is this agent's
-//! own, not pi's.
+//! persisted message, and resumable later.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -53,7 +52,7 @@ pub struct SessionInfo {
 }
 
 impl SessionInfo {
-  /// Name if set, otherwise the first user message, like pi's picker.
+  /// Name if set, otherwise the first user message.
   pub fn title(&self) -> &str {
     match &self.name {
       Some(name) => name,
@@ -62,7 +61,7 @@ impl SessionInfo {
     }
   }
 
-  /// pi's compact relative age: `now`, `5m`, `3h`, `2d`, `1w`, `4mo`, `1y`.
+  /// Compact relative age: `now`, `5m`, `3h`, `2d`, `1w`, `4mo`, `1y`.
   pub fn age(&self) -> String {
     let secs = (Local::now() - self.modified).num_seconds().max(0);
     let (mins, hours, days) = (secs / 60, secs / 3600, secs / 86400);

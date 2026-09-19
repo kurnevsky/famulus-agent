@@ -1,4 +1,4 @@
-//! Built-in tools: read, write, edit, bash. Modelled after pi's core tool set.
+//! Built-in tools: read, write, edit, bash.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -57,7 +57,7 @@ fn schema<T: JsonSchema>() -> serde_json::Value {
   value
 }
 
-/// pi's path normalization: Unicode spaces folded, a leading `@` (chat file
+/// Path normalization: Unicode spaces folded, a leading `@` (chat file
 /// reference) stripped, `~` expanded, `file://` URLs accepted, then resolved
 /// against the working directory.
 fn resolve(cwd: &Path, path: &str) -> PathBuf {
@@ -86,7 +86,7 @@ fn resolve(cwd: &Path, path: &str) -> PathBuf {
   if p.is_absolute() { p.to_path_buf() } else { cwd.join(p) }
 }
 
-/// For reads, pi also tries name variants when the file is missing: NFD
+/// For reads, name variants are also tried when the file is missing: NFD
 /// normalization and curly apostrophes, as produced by macOS.
 async fn resolve_read_path(cwd: &Path, path: &str) -> PathBuf {
   use unicode_normalization::UnicodeNormalization;
@@ -112,7 +112,7 @@ async fn resolve_read_path(cwd: &Path, path: &str) -> PathBuf {
 pub struct ReadTool {
   pub cwd: PathBuf,
   /// Whether the model accepts images. When false, `read` describes the
-  /// image but omits its data, with pi's note.
+  /// image but omits its data, with a note in its place.
   pub vision: bool,
 }
 
@@ -160,8 +160,8 @@ impl Tool for ReadTool {
       return Ok(read_image(&bytes, format, self.vision));
     }
 
-    // Like pi, decode leniently and count lines with a plain split, so a
-    // trailing newline yields one final empty line.
+    // Decode leniently and count lines with a plain split, so a trailing
+    // newline yields one final empty line.
     let text = String::from_utf8_lossy(&bytes);
     let all_lines: Vec<&str> = text.split('\n').collect();
     let total_lines = all_lines.len();
@@ -228,7 +228,7 @@ struct HeadTruncation {
   first_line_exceeds_limit: bool,
 }
 
-/// pi's `truncateHead`: keep the first `MAX_LINES` lines within `MAX_BYTES`.
+/// Keep the first `MAX_LINES` lines within `MAX_BYTES`.
 fn truncate_head(content: &str) -> HeadTruncation {
   let mut lines: Vec<&str> = content.split('\n').collect();
   if content.ends_with('\n') {
@@ -276,7 +276,7 @@ fn truncate_head(content: &str) -> HeadTruncation {
   }
 }
 
-/// Image files come back as a note plus the image itself, like pi. Images the
+/// Image files come back as a note plus the image itself. Images the
 /// pipeline cannot deliver are replaced by the reason.
 const NON_VISION_NOTE: &str = "[Current model does not support images. The image will be omitted from this request.]";
 
@@ -345,7 +345,7 @@ mod read_tests {
     std::fs::write(dir.join("big.txt"), &big).unwrap();
     let out = read(&dir, "big.txt", None, None).await.unwrap();
     assert!(out.starts_with("line 1\n"));
-    // 3000 lines plus the empty line after the trailing newline, as pi counts.
+    // 3000 lines plus the empty line after the trailing newline.
     assert!(
       out.ends_with("line 2000\n\n[Showing lines 1-2000 of 3001. Use offset=2001 to continue.]"),
       "{}",
@@ -406,7 +406,7 @@ mod read_tests {
     let dir = dir("paths");
     std::fs::write(dir.join("bin.dat"), [0xff, 0xfe, b'o', b'k']).unwrap();
     assert_eq!(read(&dir, "@bin.dat", None, None).await.unwrap(), "\u{FFFD}\u{FFFD}ok");
-    // Curly apostrophe fallback, as pi does for macOS-named files.
+    // Curly apostrophe fallback, for macOS-named files.
     std::fs::write(dir.join("it\u{2019}s.txt"), "curly").unwrap();
     assert_eq!(read(&dir, "it's.txt", None, None).await.unwrap(), "curly");
     assert_eq!(resolve(Path::new("/w"), &format!("file://{}", dir.display())), dir);
@@ -462,15 +462,14 @@ impl Tool for WriteTool {
 
 // ---------------------------------------------------------------- edit
 
-/// Host-only detail attached to a successful edit: pi's numbered diff for the
+/// Host-only detail attached to a successful edit: the numbered diff for the
 /// UI. It is never sent to the model.
 #[derive(Clone, Debug)]
 pub struct EditDiff {
   pub diff: String,
 }
 
-/// Per-file locks so concurrent edits/writes to one path are serialized, as
-/// pi's file mutation queue does.
+/// Per-file locks so concurrent edits/writes to one path are serialized.
 static FILE_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> = LazyLock::new(Default::default);
 
 async fn lock_file(path: &Path) -> tokio::sync::OwnedMutexGuard<()> {
@@ -685,7 +684,7 @@ mod edit_tests {
 /// Receives throttled snapshots of a running command's output for live display.
 pub type OutputSink = Arc<dyn Fn(String) + Send + Sync>;
 
-/// Minimum interval between live output snapshots (pi: 100ms).
+/// Minimum interval between live output snapshots.
 const UPDATE_THROTTLE: Duration = Duration::from_millis(100);
 /// After the process exits, how long to keep draining pipes held open by
 /// lingering background children before giving up on them.
@@ -1054,7 +1053,7 @@ impl OutputAccumulator {
   }
 }
 
-/// Keep the last `MAX_LINES` lines within `MAX_BYTES`, like pi's `truncateTail`.
+/// Keep the last `MAX_LINES` lines within `MAX_BYTES`.
 /// Returns (content, truncated_by, output_lines, output_bytes, last_line_partial).
 fn truncate_tail(content: &str) -> (String, Option<TruncatedBy>, usize, usize, bool) {
   let mut lines: Vec<&str> = content.split('\n').collect();
@@ -1113,8 +1112,8 @@ fn format_size(bytes: usize) -> String {
   }
 }
 
-/// pi's model-facing rendering: the tail, then a note on what was cut and
-/// where the full output lives.
+/// Model-facing rendering: the tail, then a note on what was cut and where
+/// the full output lives.
 fn format_output(snapshot: &Snapshot, output: &OutputAccumulator, empty_text: &str) -> String {
   let t = &snapshot.truncation;
   let mut text = if snapshot.content.is_empty() {

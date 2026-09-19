@@ -1,5 +1,4 @@
-//! Image preparation for the `read` tool, following pi's rules: detect by
-//! magic bytes, convert anything but PNG/JPEG to PNG, and shrink until the
+//! Image preparation for the `read` tool: detect by magic bytes, convert anything but PNG/JPEG to PNG, and shrink until the
 //! image fits within 2000x2000 pixels and 4.5 MB of base64.
 
 use std::io::Cursor;
@@ -13,7 +12,7 @@ use rig_core::message::ImageMediaType;
 
 const MAX_WIDTH: u32 = 2000;
 const MAX_HEIGHT: u32 = 2000;
-/// Limit on the base64-encoded size, as pi measures it.
+/// Limit on the base64-encoded size.
 const MAX_BASE64_BYTES: usize = (4.5 * 1024.0 * 1024.0) as usize;
 const JPEG_QUALITIES: [u8; 5] = [80, 85, 70, 55, 40];
 
@@ -24,7 +23,7 @@ pub struct ProcessedImage {
   pub hints: Vec<String>,
 }
 
-/// The image formats the `read` tool accepts (pi's list: jpg, png, gif, webp, bmp).
+/// The image formats the `read` tool accepts: jpg, png, gif, webp, bmp.
 pub fn detect(bytes: &[u8]) -> Option<ImageFormat> {
   match image::guess_format(bytes).ok()? {
     f @ (ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif | ImageFormat::WebP | ImageFormat::Bmp) => Some(f),
@@ -47,7 +46,7 @@ fn base64_len(bytes: usize) -> usize {
   bytes.div_ceil(3) * 4
 }
 
-/// Prepare an image for the model. `Err` carries the note pi shows in place of
+/// Prepare an image for the model. `Err` carries the note shown in place of
 /// the image when it cannot be delivered.
 pub fn process(bytes: &[u8], format: ImageFormat) -> Result<ProcessedImage, String> {
   let decoded = image::load_from_memory_with_format(bytes, format)
@@ -88,8 +87,8 @@ pub fn process(bytes: &[u8], format: ImageFormat) -> Result<ProcessedImage, Stri
   })
 }
 
-/// pi's strategy: fit within the max dimensions, try PNG then JPEG at
-/// decreasing quality, and keep shrinking by 25% until something fits.
+/// Fit within the max dimensions, try PNG then JPEG at decreasing quality,
+/// and keep shrinking by 25% until something fits.
 fn shrink(image: &DynamicImage) -> Option<(Vec<u8>, ImageMediaType, u32, u32)> {
   let (ow, oh) = image.dimensions();
   let ratio = f64::min(MAX_WIDTH as f64 / ow as f64, MAX_HEIGHT as f64 / oh as f64).min(1.0);

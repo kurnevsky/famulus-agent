@@ -1,4 +1,4 @@
-//! Context compaction, modelled after pi: when the context grows past
+//! Context compaction: when the context grows past
 //! `context_window - reserve_tokens`, the older part of the conversation is
 //! summarized by the model and replaced with a structured checkpoint, while the
 //! most recent ~`keep_recent_tokens` stay verbatim.
@@ -201,7 +201,7 @@ fn previous_summary_present(message: &Message) -> bool {
   previous_summary(message).is_some()
 }
 
-/// Render messages in pi's summarization transcript format.
+/// Render messages in the summarization transcript format.
 pub fn serialize(messages: &[Message]) -> String {
   let mut parts: Vec<String> = Vec::new();
   for message in messages {
@@ -301,7 +301,7 @@ pub async fn compact(
   let start = usize::from(previous.is_some());
   let conversation = serialize(&history[start..cut]);
 
-  // Same block order as pi: conversation, previous summary, instructions.
+  // Block order: conversation, previous summary, instructions.
   let mut prompt = format!("<conversation>\n{conversation}\n</conversation>\n\n");
   if let Some(previous) = &previous {
     prompt.push_str(&format!("<previous-summary>\n{previous}\n</previous-summary>\n\n"));

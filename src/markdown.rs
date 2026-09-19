@@ -1,4 +1,4 @@
-//! Markdown to ratatui lines, ported from pi's `Markdown` component.
+//! Markdown to ratatui lines.
 //!
 //! Every block is wrapped to the width it is handed, and nested structures
 //! recurse with the width their prefix leaves over: a list item gets
@@ -18,17 +18,17 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
-/// Indent for the body of a fenced code block (pi: `codeBlockIndent`).
+/// Indent for the body of a fenced code block.
 const CODE_INDENT: &str = "  ";
 /// Prefix on every line of a blockquote.
 const QUOTE_PREFIX: &str = "│ ";
-/// pi caps the rule rather than letting it span a wide terminal.
+/// A rule is capped rather than left to span a wide terminal.
 const HR_MAX: usize = 80;
 /// Nested lists step in by this much per level.
 const LIST_INDENT: usize = 4;
 
-/// Colours follow pi's dark markdown theme, via the terminal's own palette so
-/// they keep working against a light background.
+/// Colours come from the terminal's own palette, so they keep working
+/// against a light background.
 mod style {
   use super::*;
 
@@ -98,9 +98,8 @@ mod style {
 pub fn render(md: &str, width: u16, streaming: bool) -> Vec<Line<'static>> {
   let width = (width as usize).max(1);
   // Mid-stream, `**bold` would render its asterisks until the closing pair
-  // arrives. pi trims partial fences for the same reason; mdstitch closes
-  // emphasis, code, links and math too, and borrows rather than allocates
-  // when there is nothing open.
+  // arrives. mdstitch closes emphasis, code, links and math, and borrows
+  // rather than allocates when there is nothing open.
   let stitched = if streaming {
     stitch(md, &StitchOptions::default())
   } else {
@@ -245,7 +244,7 @@ fn blocks(nodes: &[Node], width: usize, refs: &Refs, out: &mut Vec<Line<'static>
     .collect();
   for (i, node) in nodes.iter().enumerate() {
     block(node, width, refs, out);
-    // pi keeps a list tight against the paragraph that introduces it.
+    // A list stays tight against the paragraph that introduces it.
     let next_is_list = matches!(nodes.get(i + 1), Some(Node::List(_)));
     let intro = matches!(node, Node::Paragraph(_)) && next_is_list;
     if i + 1 < nodes.len() && !intro {
@@ -259,7 +258,7 @@ fn block(node: &Node, width: usize, refs: &Refs, out: &mut Vec<Line<'static>>) {
     Node::Heading(heading) => {
       let style = style::heading(heading.depth);
       let mut spans = Vec::new();
-      // pi marks the level with `###` from depth 3 down, where bold alone
+      // The level is marked with `###` from depth 3 down, where bold alone
       // stops being enough to tell the levels apart.
       if heading.depth >= 3 {
         spans.push(Span::styled("#".repeat(heading.depth as usize) + " ", style));
@@ -366,7 +365,7 @@ fn list_block(list: &List, depth: usize, width: usize, refs: &Refs, out: &mut Ve
 
     let mut inner: Vec<Line<'static>> = Vec::new();
     // Only the item's first line carries the marker; everything after it —
-    // later paragraphs included — hangs under the text (pi: `renderedAnyLine`).
+    // later paragraphs included — hangs under the text.
     let mut marked = false;
     let flush = |inner: &mut Vec<Line<'static>>, marked: &mut bool, out: &mut Vec<Line<'static>>| {
       while inner.last().is_some_and(|l| l.width() == 0) {
@@ -518,8 +517,7 @@ fn fit(natural: &[usize], budget: usize) -> Vec<usize> {
 
 /// Link text, followed by its target when the text does not already say it.
 ///
-/// An autolink shows its own URL, so repeating it would only add noise (pi
-/// does the same, minus OSC 8 hyperlink support).
+/// An autolink shows its own URL, so repeating it would only add noise.
 fn link_spans(children: &[Node], url: &str, base: Style, refs: &Refs, out: &mut Vec<Span<'static>>) {
   let start = out.len();
   inline(children, base.patch(style::link()), refs, out);

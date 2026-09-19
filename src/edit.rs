@@ -1,6 +1,6 @@
-//! Text-replacement engine for the `edit` tool, ported from pi's edit-diff.ts:
-//! BOM and line-ending handling, exact-then-fuzzy matching, overlap checks,
-//! and pi's numbered diff rendering for the UI.
+//! Text-replacement engine for the `edit` tool: BOM and line-ending
+//! handling, exact-then-fuzzy matching, overlap checks, and the numbered
+//! diff rendering for the UI.
 
 use unicode_normalization::UnicodeNormalization;
 
@@ -18,8 +18,8 @@ pub struct Applied {
 
 pub struct DiffOutput {
   pub text: String,
-  /// 1-based line of the first change in the new content (pi exposes it for
-  /// editor navigation; kept for parity and tests).
+  /// 1-based line of the first change in the new content, for editor
+  /// navigation; kept for tests.
   #[cfg_attr(not(test), allow(dead_code))]
   pub first_changed_line: Option<usize>,
 }
@@ -50,8 +50,8 @@ pub fn restore_line_endings(text: &str, ending: &str) -> String {
   }
 }
 
-/// pi's progressive normalization: NFKC, trailing whitespace stripped per
-/// line, typographic quotes/dashes/spaces folded to ASCII.
+/// Progressive normalization: NFKC, trailing whitespace stripped per line,
+/// typographic quotes/dashes/spaces folded to ASCII.
 pub fn normalize_for_fuzzy_match(text: &str) -> String {
   let nfkc: String = text.nfkc().collect();
   let trimmed = nfkc.split('\n').map(str::trim_end).collect::<Vec<_>>().join("\n");
@@ -106,8 +106,8 @@ struct Replacement {
   new_text: String,
 }
 
-/// Apply `edits` to LF-normalized content, with pi's matching rules and error
-/// messages. Returns the base and new content for diffing.
+/// Apply `edits` to LF-normalized content. Returns the base and new content
+/// for diffing.
 pub fn apply_edits(normalized: &str, edits: &[Edit], path: &str) -> Result<Applied, String> {
   let total = edits.len();
   let edits: Vec<Edit> = edits
@@ -292,11 +292,11 @@ enum Kind {
   Added,
 }
 
-/// pi's compact diff: `+N line` / `-N line` for changes, ` N line` for up to
+/// Compact diff: `+N line` / `-N line` for changes, ` N line` for up to
 /// `context` lines around them, and `...` where context was skipped.
 pub fn generate_diff_string(old: &str, new: &str, context: usize) -> DiffOutput {
   let diff = similar::TextDiff::from_lines(old, new);
-  // Collapse the change stream into pi-style parts: runs of equal/removed/added lines.
+  // Collapse the change stream into runs of equal/removed/added lines.
   let mut parts: Vec<(Kind, Vec<String>)> = Vec::new();
   for change in diff.iter_all_changes() {
     let kind = match change.tag() {
