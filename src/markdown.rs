@@ -274,10 +274,14 @@ fn block(node: &Node, width: usize, refs: &Refs, out: &mut Vec<Line<'static>>) {
     Node::Code(code) => {
       let lang = code.lang.clone().unwrap_or_default();
       out.push(Line::styled(format!("```{lang}"), style::code_border()));
+      // A language we have a grammar for is coloured token by token; anything
+      // else — no info string, a language not built in — keeps the one colour
+      // the whole block used to have.
+      let highlighted = crate::highlight::highlight(&lang, &code.value);
       // Long code wraps rather than being clipped: a transcript has no
       // horizontal scroll, so a clipped line silently loses the end of a
       // command.
-      for line in code.value.lines() {
+      for (i, line) in code.value.lines().enumerate() {
         // In code the leading whitespace is content, not the wrapping debris
         // `wrap` drops, so it is held aside and re-applied — which also gives
         // a wrapped line a hanging indent at its own nesting level. Tabs are
@@ -286,7 +290,13 @@ fn block(node: &Node, width: usize, refs: &Refs, out: &mut Vec<Line<'static>>) {
         let code = line.trim_start();
         let indent = format!("{CODE_INDENT}{}", &line[..line.len() - code.len()]);
         let body = width.saturating_sub(indent.width()).max(1);
-        for wrapped in wrap(vec![Span::styled(code.to_string(), style::code_block())], body) {
+        // The highlighter indexes by the source's own line numbers, so a run
+        // it could not finish leaves later lines plain rather than shifted.
+        let spans = match highlighted.as_ref().and_then(|lines| lines.get(i)) {
+          Some(spans) => trim_indent(spans.clone()),
+          None => vec![Span::styled(code.to_string(), style::code_block())],
+        };
+        for wrapped in wrap(spans, body) {
           out.push(prefix(Span::raw(indent.clone()), wrapped));
         }
       }
@@ -570,6 +580,29 @@ fn inline(nodes: &[Node], base: Style, refs: &Refs, out: &mut Vec<Span<'static>>
   }
 }
 
+/// Drops the leading whitespace of a highlighted code line, which the caller
+/// re-applies as a literal indent.
+///
+/// `wrap` would drop it anyway — it treats leading space as wrapping debris —
+/// but it has to go before the first word is measured, or a deeply indented
+/// line would be wrapped as if the indent cost nothing.
+fn trim_indent(spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
+  let mut out = Vec::with_capacity(spans.len());
+  for span in spans {
+    // Once any content is through, the rest of the line is kept verbatim:
+    // whitespace inside it is the code's own spacing.
+    if !out.is_empty() {
+      out.push(span);
+      continue;
+    }
+    let trimmed = span.content.trim_start();
+    if !trimmed.is_empty() {
+      out.push(Span::styled(trimmed.to_string(), span.style));
+    }
+  }
+  out
+}
+
 /// Puts `lead` in front of `line`, keeping the rest of its spans.
 fn prefix(lead: Span<'static>, line: Line<'static>) -> Line<'static> {
   let mut spans = Vec::with_capacity(line.spans.len() + 1);
@@ -740,6 +773,31 @@ mod tests {
   fn code_blocks_keep_their_fence_and_indent() {
     let lines = render("```rust\nfn main() {}\n```", 20, false);
     assert_eq!(plain(&lines), ["```rust", "  fn main() {}", "```"]);
+  }
+
+  #[test]
+  #[cfg(feature = "lang-rust")]
+  fn a_known_language_is_highlighted_token_by_token() {
+    let lines = render("```rust\n    let x = 1; // note\n```", 40, false);
+    // The indent is still the block's own, carried around the highlighting.
+    assert_eq!(plain(&lines), ["```rust", "      let x = 1; // note", "```"]);
+    let span = |needle: &str| lines[1].spans.iter().find(|s| s.content == needle).unwrap();
+    assert_eq!(span("let").style.fg, Some(Color::Magenta));
+    assert_eq!(span("1").style.fg, Some(Color::Cyan));
+    // Wrapping splits a span at each space, so the comment arrives in pieces.
+    assert_eq!(span("//").style.fg, Some(Color::DarkGray));
+    assert_eq!(span("note").style.fg, Some(Color::DarkGray));
+  }
+
+  #[test]
+  fn a_language_we_cannot_parse_keeps_the_one_colour() {
+    // No info string, or one no grammar answers to: the block is green, as
+    // every block was before there were grammars.
+    for md in ["```\nx = 1\n```", "```brainfuck\n+++\n```"] {
+      let lines = render(md, 40, false);
+      let body: Vec<&Span<'static>> = lines[1].spans.iter().skip(1).collect();
+      assert!(body.iter().all(|s| s.style.fg == Some(Color::Green)), "{md}: {body:?}");
+    }
   }
 
   #[test]

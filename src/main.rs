@@ -1,6 +1,7 @@
 mod agent;
 mod compaction;
 mod edit;
+mod highlight;
 mod images;
 mod markdown;
 mod session;

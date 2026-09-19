@@ -45,6 +45,31 @@ GEMINI_API_KEY=... ./target/release/fa --provider gemini -m gemini-2.5-pro
 The agent works in the current directory. If `AGENTS.md` (or `CLAUDE.md`)
 exists there, it is appended to the system prompt.
 
+## Syntax highlighting
+
+Fenced code blocks are highlighted with [tree-sitter](https://tree-sitter.github.io).
+The fence's info string picks the grammar, by name or by the extension people
+write instead (`rs`, `py`, `yml`, `c++`, `sh`, …), and a language with no
+grammar — or a fence with no info string at all — keeps the single colour code
+blocks had before. Injections are followed too, so the `<script>` in an HTML
+block is highlighted as JavaScript.
+
+Every grammar is a C parser compiled into the binary, so each language is its
+own cargo feature. The default build has all of them:
+
+```sh
+# Just the ones you care about
+cargo build --release --no-default-features --features lang-rust,lang-python
+
+# No tree-sitter at all
+cargo build --release --no-default-features
+```
+
+`lang-bash`, `lang-c`, `lang-cpp`, `lang-css`, `lang-go`, `lang-haskell`,
+`lang-html`, `lang-java`, `lang-javascript`, `lang-json`, `lang-python`,
+`lang-rust`, `lang-scala`, `lang-toml`, `lang-typescript` (TypeScript and TSX),
+`lang-yaml`.
+
 ## Sessions
 
 Like pi, every conversation is saved as an append-only JSONL file and can be
@@ -131,6 +156,11 @@ mouse usually requires holding `Shift`.
 - `src/images.rs` – image preparation for `read`, following pi: magic-byte
   detection, conversion of gif/webp/bmp to PNG, and resizing to fit 2000x2000
   pixels and 4.5 MB of base64 (PNG first, then JPEG at decreasing quality).
+- `src/highlight.rs` – tree-sitter syntax highlighting for code blocks: the
+  grammar registry (one cargo feature per language), the capture-name theme,
+  and the per-line spans the markdown renderer draws. Grammars ship their own
+  highlight queries and are used as they come, except Haskell, whose query is
+  written for neovim's pattern precedence and needs one of our own.
 - `src/ui.rs` – ratatui app: transcript, input, footer.
 
 ## Testing
