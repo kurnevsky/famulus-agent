@@ -38,6 +38,8 @@ const REASONING_KIND: u8 = 1;
 const WHEEL_LINES: usize = 3;
 /// How long the `auto` scrollbar stays visible after the last scroll.
 const SCROLLBAR_HIDE_DELAY: Duration = Duration::from_millis(1000);
+/// How close together two `Esc` presses count as one double press, as in pi.
+const DOUBLE_ESC: Duration = Duration::from_millis(500);
 
 /// Transcript scrollbar behaviour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
@@ -78,6 +80,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
   ("name", "Set session display name", true),
   ("new", "Start a new session", false),
   ("resume", "Resume a different session", false),
+  ("rewind", "Go back to an earlier message (or press Esc twice)", false),
   ("session", "Show session info and stats", false),
   ("quit", "Quit fa", false),
 ];
@@ -108,10 +111,43 @@ struct InFlight {
   partial: String,
 }
 
-/// The `/resume` list.
-struct Picker {
-  sessions: Vec<SessionInfo>,
+/// A list drawn over the transcript. Moving through one and dismissing it are
+/// the same whichever list it is; only the rows and what `Enter` does differ.
+struct Overlay {
+  list: OverlayList,
   selected: usize,
+}
+
+enum OverlayList {
+  /// `/resume`: every saved session, most recent first.
+  Sessions(Vec<SessionInfo>),
+  /// `/rewind`: this session's own prompts, oldest first.
+  Rewind(Vec<Point>),
+}
+
+/// A point the session can be rewound to: something the user typed.
+struct Point {
+  /// Where the message sits in `session.history`.
+  index: usize,
+  text: String,
+  /// History messages the rewind would drop, this one included.
+  drops: usize,
+}
+
+impl Overlay {
+  fn len(&self) -> usize {
+    match &self.list {
+      OverlayList::Sessions(sessions) => sessions.len(),
+      OverlayList::Rewind(points) => points.len(),
+    }
+  }
+
+  fn title(&self) -> &'static str {
+    match &self.list {
+      OverlayList::Sessions(_) => " Resume session — ↑↓ select · Enter resume · Esc cancel ",
+      OverlayList::Rewind(_) => " Rewind — ↑↓ select · Enter go back · Esc cancel ",
+    }
+  }
 }
 
 enum Entry {
@@ -151,11 +187,13 @@ pub struct App {
   store: Option<Store>,
   /// The conversation: history plus its on-disk file.
   session: Session,
-  picker: Option<Picker>,
+  overlay: Option<Overlay>,
   matcher: Matcher,
   completion: Option<Completion>,
   /// Esc closed the popup; stay closed until the input changes.
   completion_dismissed: bool,
+  /// The last bare `Esc`, for spotting the second of a double press.
+  last_escape: Option<Instant>,
   entries: Vec<Entry>,
   input: TextArea<'static>,
   tx: mpsc::UnboundedSender<AgentEvent>,
@@ -212,10 +250,11 @@ impl App {
       cwd,
       store,
       session,
-      picker: None,
+      overlay: None,
       matcher: Matcher::new(Config::DEFAULT),
       completion: None,
       completion_dismissed: false,
+      last_escape: None,
       entries: Vec::new(),
       input,
       tx,
@@ -305,8 +344,8 @@ impl App {
       return;
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    if self.picker.is_some() {
-      self.handle_picker_key(key.code, ctrl);
+    if self.overlay.is_some() {
+      self.handle_overlay_key(key.code, ctrl);
       return;
     }
     if self.completion.is_some() && self.handle_completion_key(key.code, ctrl) {
@@ -328,6 +367,17 @@ impl App {
         self.reset_view();
       }
       (KeyCode::Esc, _) if self.run.is_some() => self.abort(),
+      // Esc on its own has nothing to do once there is no run to stop, so a
+      // second one within the window opens the rewind list — pi's shortcut.
+      // Only from an empty box, where Esc cannot be meant for the text.
+      (KeyCode::Esc, _) if self.input_is_blank() => {
+        let now = Instant::now();
+        let again = self.last_escape.is_some_and(|last| now - last < DOUBLE_ESC);
+        self.last_escape = (!again).then_some(now);
+        if again {
+          self.open_rewind();
+        }
+      }
       (KeyCode::PageUp, _) => self.scroll_by(10),
       (KeyCode::PageDown, _) => self.scroll_by(-10),
       (KeyCode::Enter, _) if is_newline(&key) => {
@@ -368,12 +418,7 @@ impl App {
           return false;
         };
         let (name, _, takes_arg) = COMMANDS[index];
-        self.input.select_all();
-        self.input.cut();
-        self.input.set_yank_text("");
-        self
-          .input
-          .insert_str(format!("/{name}{}", if takes_arg { " " } else { "" }));
+        self.set_input(&format!("/{name}{}", if takes_arg { " " } else { "" }));
         // The completed command is exact; keep the popup closed until
         // the user edits the text again.
         self.completion_dismissed = true;
@@ -417,28 +462,36 @@ impl App {
     self.completion = Some(Completion { items, selected });
   }
 
-  fn handle_picker_key(&mut self, code: KeyCode, ctrl: bool) {
-    let len = self.picker.as_ref().map_or(0, |p| p.sessions.len());
+  fn handle_overlay_key(&mut self, code: KeyCode, ctrl: bool) {
+    let len = self.overlay.as_ref().map_or(0, Overlay::len);
     match code {
-      KeyCode::Esc | KeyCode::Char('q') => self.picker = None,
+      KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
       KeyCode::Char('c') if ctrl => self.quit = true,
       KeyCode::Up | KeyCode::Char('k') => {
-        if let Some(p) = &mut self.picker {
-          p.selected = p.selected.saturating_sub(1);
+        if let Some(o) = &mut self.overlay {
+          o.selected = o.selected.saturating_sub(1);
         }
       }
       KeyCode::Down | KeyCode::Char('j') => {
-        if let Some(p) = &mut self.picker {
-          p.selected = (p.selected + 1).min(len.saturating_sub(1));
+        if let Some(o) = &mut self.overlay {
+          o.selected = (o.selected + 1).min(len.saturating_sub(1));
         }
       }
       KeyCode::Enter => {
-        let path = self
-          .picker
-          .take()
-          .and_then(|p| p.sessions.get(p.selected).map(|s| s.path.clone()));
-        if let Some(path) = path {
-          self.load_session(&path);
+        let Some(Overlay { list, selected }) = self.overlay.take() else {
+          return;
+        };
+        match list {
+          OverlayList::Sessions(sessions) => {
+            if let Some(info) = sessions.get(selected) {
+              self.load_session(&info.path.clone());
+            }
+          }
+          OverlayList::Rewind(points) => {
+            if let Some(point) = points.get(selected) {
+              self.rewind_to(point.index, point.text.clone());
+            }
+          }
         }
       }
       _ => {}
@@ -459,14 +512,26 @@ impl App {
     self.scrollbar == ScrollbarMode::Auto && self.last_scroll.is_some_and(|t| t.elapsed() < SCROLLBAR_HIDE_DELAY)
   }
 
+  /// Replace whatever is in the input box, without disturbing the yank buffer
+  /// — the user's own cut text is theirs, not ours to overwrite.
+  fn set_input(&mut self, text: &str) {
+    self.input.select_all();
+    self.input.cut();
+    self.input.set_yank_text("");
+    self.input.insert_str(text);
+  }
+
+  /// Nothing to send: empty, or only whitespace.
+  fn input_is_blank(&self) -> bool {
+    self.input.lines().iter().all(|line| line.trim().is_empty())
+  }
+
   fn submit(&mut self) {
     let text = self.input.lines().join("\n").trim().to_string();
     if text.is_empty() {
       return;
     }
-    self.input.select_all();
-    self.input.cut();
-    self.input.set_yank_text("");
+    self.set_input("");
     self.completion = None;
     self.anchor = None;
 
@@ -492,6 +557,15 @@ impl App {
           ));
         } else {
           self.open_picker();
+        }
+      }
+      "/rewind" => {
+        if self.run.is_some() {
+          self
+            .entries
+            .push(Entry::Info("Finish or abort the current run before rewinding.".into()));
+        } else {
+          self.open_rewind();
         }
       }
       "/session" => self.session_info(),
@@ -570,7 +644,44 @@ impl App {
       self.entries.push(Entry::Info("No saved sessions.".into()));
       return;
     }
-    self.picker = Some(Picker { sessions, selected: 0 });
+    self.overlay = Some(Overlay {
+      list: OverlayList::Sessions(sessions),
+      selected: 0,
+    });
+  }
+
+  /// List the prompts this session can be rewound to, newest selected.
+  fn open_rewind(&mut self) {
+    let points = rewind_points(&self.session.history);
+    if points.is_empty() {
+      self.entries.push(Entry::Info("Nothing to rewind to.".into()));
+      return;
+    }
+    self.overlay = Some(Overlay {
+      selected: points.len() - 1,
+      list: OverlayList::Rewind(points),
+    });
+  }
+
+  /// Cut the conversation back to just before the message at `index`, and put
+  /// that message back in the input box to be edited and asked again.
+  ///
+  /// The transcript is rebuilt from the history rather than truncated
+  /// alongside it, so the two cannot drift: what is on screen is what the
+  /// model will be sent.
+  fn rewind_to(&mut self, index: usize, text: String) {
+    let dropped = self.session.history.len() - index;
+    let result = self.session.rewind(index);
+    self.report(result);
+    self.entries = entries_from_history(&self.session.history);
+    self.entries.push(Entry::Info(match dropped {
+      1 => "Rewound, 1 message dropped.".into(),
+      n => format!("Rewound, {n} messages dropped."),
+    }));
+    // The token counts and the queue belonged to a conversation that no
+    // longer exists.
+    self.reset_view();
+    self.set_input(&text);
   }
 
   fn session_info(&mut self) {
@@ -848,8 +959,8 @@ impl App {
       self.draw_completion(f, popup_area);
     }
 
-    if self.picker.is_some() {
-      self.draw_picker(f, transcript_area);
+    if self.overlay.is_some() {
+      self.draw_overlay(f, transcript_area);
     } else {
       self.draw_transcript(f, transcript_area);
     }
@@ -963,31 +1074,53 @@ impl App {
     f.render_widget(Paragraph::new(lines), area);
   }
 
-  fn draw_picker(&self, f: &mut Frame, area: Rect) {
-    let Some(picker) = &self.picker else { return };
+  fn draw_overlay(&self, f: &mut Frame, area: Rect) {
+    let Some(overlay) = &self.overlay else { return };
     let block = Block::default()
       .borders(Borders::ALL)
       .border_type(BorderType::Rounded)
       .border_style(Style::default().fg(Color::Gray))
-      .title(" Resume session — ↑↓ select · Enter resume · Esc cancel ");
+      .title(overlay.title());
     let inner = block.inner(area);
     f.render_widget(block, area);
     let height = inner.height as usize;
     let width = inner.width as usize;
-    let first = picker.selected.saturating_sub(height.saturating_sub(1));
+    // The window ends at the selection, so moving down walks off the bottom
+    // rather than jumping the list around.
+    let first = overlay.selected.saturating_sub(height.saturating_sub(1));
+    // Each row is a title and a dim note about it, the title clipped so the
+    // note always fits.
+    let rows: Vec<(String, String)> = match &overlay.list {
+      OverlayList::Sessions(sessions) => sessions
+        .iter()
+        .map(|s| {
+          let note = format!(
+            "{}  {} msgs  {}",
+            shorten_home(Path::new(&s.cwd)),
+            s.message_count,
+            s.age()
+          );
+          (s.title().to_string(), note)
+        })
+        .collect(),
+      OverlayList::Rewind(points) => points
+        .iter()
+        .map(|p| {
+          let note = match p.drops {
+            1 => "drops 1 message".to_string(),
+            n => format!("drops {n} messages"),
+          };
+          (first_line(&p.text), note)
+        })
+        .collect(),
+    };
     let dim = Style::default().add_modifier(Modifier::DIM);
     let mut lines = Vec::new();
-    for (i, s) in picker.sessions.iter().enumerate().skip(first).take(height) {
-      let selected = i == picker.selected;
-      let right = format!(
-        "{}  {} msgs  {}",
-        shorten_home(Path::new(&s.cwd)),
-        s.message_count,
-        s.age()
-      );
-      let avail = width.saturating_sub(2 + right.chars().count() + 2);
-      let title: String = s.title().chars().take(avail).collect();
-      let pad = width.saturating_sub(2 + title.chars().count() + right.chars().count());
+    for (i, (title, note)) in rows.into_iter().enumerate().skip(first).take(height) {
+      let selected = i == overlay.selected;
+      let avail = width.saturating_sub(2 + note.chars().count() + 2);
+      let title: String = title.chars().take(avail).collect();
+      let pad = width.saturating_sub(2 + title.chars().count() + note.chars().count());
       lines.push(Line::from(vec![
         Span::styled(
           if selected { "› " } else { "  " },
@@ -1002,7 +1135,7 @@ impl App {
           },
         ),
         Span::raw(" ".repeat(pad)),
-        Span::styled(right, dim),
+        Span::styled(note, dim),
       ]));
     }
     f.render_widget(Paragraph::new(lines), inner);
@@ -1344,6 +1477,24 @@ fn format_duration(d: Duration) -> String {
   }
 }
 
+/// The points a history can be rewound to, oldest first.
+///
+/// Only the user's own messages: a tool result or a compaction summary is
+/// something the loop put in the history, not a place the user was ever at.
+fn rewind_points(history: &[Message]) -> Vec<Point> {
+  history
+    .iter()
+    .enumerate()
+    .filter_map(|(index, message)| {
+      crate::session::user_text(message).map(|text| Point {
+        index,
+        text,
+        drops: history.len() - index,
+      })
+    })
+    .collect()
+}
+
 fn first_line(text: &str) -> String {
   let mut it = text.lines();
   let first = it.next().unwrap_or_default().to_string();
@@ -1408,5 +1559,32 @@ mod tests {
     // Highlights point at the matched letters: n-a-m-e for "nm".
     let m = &filter_commands(&mut matcher, "nm")[0];
     assert_eq!(m.highlights, [0, 2]);
+  }
+
+  #[test]
+  fn rewind_points_are_the_user_own_messages() {
+    let history = vec![
+      Message::user("first"),
+      Message::assistant("answer"),
+      compaction::summary_message("a summary"),
+      Message::user("second"),
+      Message::assistant("reply"),
+    ];
+    let points = rewind_points(&history);
+    let texts: Vec<&str> = points.iter().map(|p| p.text.as_str()).collect();
+    // The checkpoint reads as a user message on the wire, but the user was
+    // never at it, so it is not somewhere they can go back to.
+    assert_eq!(texts, ["first", "second"]);
+    assert_eq!(points[0].index, 0);
+    assert_eq!(points[1].index, 3);
+    // Rewinding to "second" drops it and everything after it.
+    assert_eq!(points[1].drops, 2);
+    assert_eq!(points[0].drops, 5);
+  }
+
+  #[test]
+  fn a_history_with_nothing_of_the_user_in_it_has_no_rewind_points() {
+    assert!(rewind_points(&[]).is_empty());
+    assert!(rewind_points(&[Message::assistant("hello")]).is_empty());
   }
 }

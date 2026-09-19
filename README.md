@@ -78,7 +78,8 @@ resumed later. Unlike pi, all sessions live in one global directory
 so the picker shows each session's working directory. The file is created on
 the first message, so empty sessions leave nothing behind. Records are the
 header, each transcript message, compaction checkpoints (summary plus the kept
-tail), and renames. Aborted turns keep the prompt and any partial answer.
+tail), rewind cuts, and renames. Aborted turns keep the prompt and any partial
+answer.
 
 - `src/session.rs` – store, session file, listing, and replay.
 
@@ -91,6 +92,19 @@ after `Esc`, after a `/compact`, or on a session resumed with `-c`. An
 unanswered user message gets answered, and a half-written answer is continued
 from where it stopped. Nothing is written to the session twice: the resumed
 message is dropped from the turn's result.
+
+## Rewinding
+
+`/rewind` — or `Esc` twice on an empty input box, as in pi — lists the prompts
+of this session and goes back to the one you pick: the history is cut to just
+before it, the transcript is rebuilt from what is left, and the message itself
+goes back in the input box to be edited and asked again. Only your own messages
+are offered; a tool result or a compaction summary is somewhere the loop went,
+not somewhere you were. There is no branching and no branch summary — it is a
+plain step backwards, and the answer you rewound past is gone.
+
+The session file stays append-only: a rewind writes the length the history was
+cut to, and replaying the file cuts it again at the same point.
 
 ## Compaction
 
@@ -112,6 +126,7 @@ The footer shows the current context usage as `ctx N%`.
 | `/` | Command popup: type to fuzzy-filter, `↑`/`↓` move, `Tab`/`Enter` complete, `Esc` dismiss |
 | `Alt+Enter`, `Ctrl+J`, `Shift+Enter`* | Newline |
 | `Esc` | Abort the current run |
+| `Esc` `Esc` | Rewind to an earlier message (empty input, within half a second) |
 | `PageUp` / `PageDown`, mouse wheel | Scroll transcript |
 | `Ctrl+C` | Abort if running, otherwise quit |
 | `Ctrl+D` | Quit (empty input) |
@@ -119,6 +134,7 @@ The footer shows the current context usage as `ctx N%`.
 | `/continue` | Run the model again with no new message |
 | `/new` | Start a new session |
 | `/resume` | Pick a saved session to resume |
+| `/rewind` | Go back to an earlier message |
 | `/name <name>` | Name the current session |
 | `/session` | Show session id, file, and stats |
 | `/quit` | Quit |

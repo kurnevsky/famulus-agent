@@ -29,6 +29,11 @@ enum Record {
   Message { message: Message },
   /// Compaction replaced the history with a summary plus the kept tail.
   Compaction { summary: String, history: Vec<Message> },
+  /// The user rewound the session; the history is cut to `len` messages.
+  ///
+  /// A length rather than the messages themselves: replay rebuilds the same
+  /// history this counted, so the two always agree and the file stays small.
+  Rewind { len: usize },
   /// The user named the session.
   Name { name: String },
 }
@@ -165,7 +170,7 @@ fn read_info(path: &Path) -> Result<SessionInfo> {
           info.first_message = first_line(&text);
         }
       }
-      Record::Compaction { .. } => {}
+      Record::Compaction { .. } | Record::Rewind { .. } => {}
       Record::Name { name } => info.name = Some(name),
       Record::Header { .. } => {}
     }
@@ -174,7 +179,10 @@ fn read_info(path: &Path) -> Result<SessionInfo> {
 }
 
 /// Text of a plain user message (not a tool result or compaction summary).
-fn user_text(message: &Message) -> Option<String> {
+///
+/// Which is also what makes a message a point the session can be rewound to:
+/// the things the user typed, and nothing the loop put there itself.
+pub fn user_text(message: &Message) -> Option<String> {
   let Message::User { content } = message else {
     return None;
   };
@@ -268,6 +276,7 @@ impl Session {
       match record {
         Record::Message { message } => session.history.push(message),
         Record::Compaction { history, .. } => session.history = history,
+        Record::Rewind { len } => session.history.truncate(len),
         Record::Name { name } => session.name = Some(name),
         Record::Header { .. } => {}
       }
@@ -310,6 +319,19 @@ impl Session {
       summary: summary.to_string(),
       history,
     }])
+  }
+
+  /// Cut the history back to its first `len` messages and record the cut.
+  ///
+  /// The file stays append-only: what was written before is still there, and
+  /// replay drops it again on the way past. Nothing is written when the cut
+  /// would change nothing, so an accidental rewind to the end leaves no trace.
+  pub fn rewind(&mut self, len: usize) -> Result<()> {
+    if len >= self.history.len() {
+      return Ok(());
+    }
+    self.history.truncate(len);
+    self.write_all(&[Record::Rewind { len }])
   }
 
   pub fn rename(&mut self, name: &str) -> Result<()> {
@@ -411,6 +433,40 @@ mod tests {
     let mut loaded = loaded;
     loaded.append(vec![Message::assistant("more")]).unwrap();
     assert_eq!(Session::load(&path).unwrap().history.len(), 5);
+    std::fs::remove_dir_all(&store.dir).unwrap();
+  }
+
+  #[test]
+  fn rewind_cuts_the_history_and_survives_a_reload() {
+    let store = temp_store("rewind");
+    let mut session = Session::new(Some(&store), Path::new("/work"), "mock");
+    session
+      .append(vec![
+        Message::user("first"),
+        Message::assistant("answer"),
+        Message::user("second"),
+        Message::assistant("reply"),
+      ])
+      .unwrap();
+    let path = session.path().unwrap().to_path_buf();
+
+    // Back to just before "second", which the caller puts back in the input.
+    session.rewind(2).unwrap();
+    assert_eq!(session.history, [Message::user("first"), Message::assistant("answer")]);
+    // The file is still append-only: replay drops the cut messages again.
+    assert_eq!(Session::load(&path).unwrap().history, session.history);
+
+    // The same file keeps taking new messages after the cut.
+    session.append(vec![Message::user("instead")]).unwrap();
+    let reloaded = Session::load(&path).unwrap();
+    assert_eq!(reloaded.history.len(), 3);
+    assert_eq!(reloaded.history[2], Message::user("instead"));
+
+    // A rewind that would change nothing writes nothing.
+    let before = std::fs::read_to_string(&path).unwrap();
+    session.rewind(3).unwrap();
+    session.rewind(9).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     std::fs::remove_dir_all(&store.dir).unwrap();
   }
 
