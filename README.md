@@ -92,7 +92,7 @@ The footer shows the current context usage as `ctx N%`.
 | `Ctrl+D` | Quit (empty input) |
 | `/compact` | Summarize older history now |
 | `/continue` | Run the model again with no new message |
-| `/new`, `/clear` | Start a new session |
+| `/new` | Start a new session |
 | `/resume` | Pick a saved session to resume |
 | `/name <name>` | Name the current session |
 | `/session` | Show session id, file, and stats |

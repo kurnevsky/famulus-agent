@@ -470,7 +470,7 @@ impl App {
     self.completion = None;
     self.anchor = None;
 
-    if self.run.is_some() && !matches!(text.as_str(), "/quit" | "/exit" | "/clear" | "/new") {
+    if self.run.is_some() && !matches!(text.as_str(), "/quit" | "/new") {
       self.entries.push(Entry::Info(format!("Queued: {}", first_line(&text))));
       self.queued.push_back(text);
       return;
@@ -481,8 +481,8 @@ impl App {
   /// Run a prompt or slash command now.
   fn dispatch(&mut self, text: String) {
     match text.as_str() {
-      "/quit" | "/exit" => self.quit = true,
-      "/clear" | "/new" => self.new_session(),
+      "/quit" => self.quit = true,
+      "/new" => self.new_session(),
       "/compact" => self.compact(),
       "/continue" => self.continue_run(),
       "/resume" => {
