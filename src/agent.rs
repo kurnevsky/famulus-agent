@@ -52,6 +52,11 @@ pub enum AgentEvent {
     name: String,
     output: String,
     is_error: bool,
+    /// The call this answers, as the transcript will name it. Whether a tool
+    /// failed is not something a transcript records — a failed result looks
+    /// like any other on the wire — so a session that wants to redraw it
+    /// later has to keep the flag against this id itself.
+    call: Option<String>,
     /// Numbered diff for `edit`, shown in place of the output text.
     diff: Option<String>,
   },
@@ -118,6 +123,7 @@ impl AgentHook for UiHook {
   async fn on_tool_result(&self, _ctx: &HookContext, event: ToolResultEvent<'_>) -> ToolResultAction {
     let _ = self.tx.send(AgentEvent::ToolResult {
       name: event.tool_name.to_string(),
+      call: event.tool_call_id.map(str::to_string),
       diff: event.tool_context.result::<EditDiff>().map(|d| d.diff.clone()),
       output: render_output(event.presentation),
       is_error: event.raw_result.is_error() || event.raw_result.is_refused(),

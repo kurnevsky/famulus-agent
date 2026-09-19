@@ -82,7 +82,10 @@ tail), the moves `/tree` makes, and renames. Aborted turns keep the prompt and
 any partial answer. Because entries name their parent, one file holds every
 branch the conversation took, not only the one it is on.
 
-- `src/session.rs` – store, session file, listing, and replay.
+- `src/session.rs` – store, session file, listing, and replay. A message
+  record also notes which of the tool calls it answers came back an error:
+  nothing in a tool result says so, and without it a reopened session would
+  draw every command as though it had worked.
 
 ## Continuing
 
@@ -153,6 +156,10 @@ with them under a cursor.
 ⚙ bash cargo test --all --r▌
 ⚙ bash cargo test --all --release -- --nocapture
 ```
+
+A command's output is green when it succeeded and red when it did not, live
+and on a session reopened later alike. Other tools stay dim, since exit status
+is a thing commands have; a failed `read` or `edit` is still red.
 
 Only the part the finished line leads with is shown — the command, or the path
 — so the live line and the entry it becomes read the same and nothing moves

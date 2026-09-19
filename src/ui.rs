@@ -238,6 +238,10 @@ pub struct App {
   in_flight: Option<InFlight>,
   /// Tool calls the model is still writing, oldest first.
   writing: Vec<Writing>,
+  /// Calls in this run whose result was an error, by the id the transcript
+  /// will name them with. Handed to the session so a reload draws them red
+  /// again; the transcript itself does not record it.
+  failing: HashSet<String>,
   queued: VecDeque<String>,
   /// Transcript position. `None` follows new output at the bottom; `Some`
   /// is a fixed offset from the top, so appended text does not move the view.
@@ -298,6 +302,7 @@ impl App {
       compacting: false,
       in_flight: None,
       writing: Vec::new(),
+      failing: HashSet::new(),
       queued: VecDeque::new(),
       anchor: None,
       view: (0, 0),
@@ -674,7 +679,7 @@ impl App {
         if self.store.is_none() {
           session.disable_persistence();
         }
-        self.entries = entries_from_history(&session.history);
+        self.entries = entries_from_history(&session);
         let title = session.name.clone().unwrap_or_else(|| session.id.clone());
         self.entries.push(Entry::Info(format!(
           "Resumed session {title} ({} messages).",
@@ -763,7 +768,7 @@ impl App {
   /// Redraw the transcript around a session that has just moved, and hand the
   /// user back the prompt they landed on.
   fn show_point(&mut self, point: &Point, note: String) {
-    self.entries = entries_from_history(&self.session.history);
+    self.entries = entries_from_history(&self.session);
     self.entries.push(Entry::Info(note));
     // The token counts and the queue belonged to a conversation that is no
     // longer the one we are in.
@@ -859,8 +864,10 @@ impl App {
       return;
     };
     handle.abort();
-    // A call the model had not finished writing was never run.
+    // A call the model had not finished writing was never run, and the
+    // results of this turn are not the next turn's to record.
     self.writing.clear();
+    self.failing.clear();
     if self.compacting {
       self.compacting = false;
       self.entries.push(Entry::Info("Compaction aborted.".into()));
@@ -961,8 +968,12 @@ impl App {
         name,
         output,
         is_error,
+        call,
         diff,
       } => {
+        if is_error && let Some(call) = call {
+          self.failing.insert(call);
+        }
         if matches!(self.entries.last(), Some(Entry::ToolResult { running: true, .. })) {
           self.entries.pop();
         }
@@ -993,7 +1004,10 @@ impl App {
         // A `/continue` run echoes back the messages it resumed from; they
         // are already in the history.
         let resumed = self.in_flight.take().map_or(0, |f| f.resumed);
-        let result = self.session.append(messages.into_iter().skip(resumed).collect());
+        let failing = std::mem::take(&mut self.failing);
+        let result = self
+          .session
+          .append_failing(messages.into_iter().skip(resumed).collect(), &failing);
         self.report(result);
         self.usage.input_tokens += usage.input_tokens;
         self.usage.output_tokens += usage.output_tokens;
@@ -1015,6 +1029,7 @@ impl App {
       AgentEvent::Ended => {
         self.run = None;
         self.writing.clear();
+        self.failing.clear();
         if self.compacting {
           self.compacting = false;
         } else {
@@ -1390,8 +1405,15 @@ impl App {
             }
             continue;
           }
+          // A command is worth reading as pass or fail at a glance, so its
+          // output carries the verdict. Other tools stay dim: a file read
+          // back in green would be colour for its own sake, and the text of
+          // a file has its own reasons to be coloured.
           let style = if *is_error {
             Style::default().fg(Color::Red)
+          } else if name == "bash" && !*running {
+            // Still running is not yet a verdict.
+            Style::default().fg(Color::Green)
           } else {
             dim
           };
@@ -1516,7 +1538,8 @@ fn filter_commands(matcher: &mut Matcher, query: &str) -> Vec<Match> {
 }
 
 /// Rebuild the transcript view from a resumed session's history.
-fn entries_from_history(history: &[Message]) -> Vec<Entry> {
+fn entries_from_history(session: &Session) -> Vec<Entry> {
+  let history = &session.history;
   let now = Instant::now();
   let mut entries = Vec::new();
   for message in history {
@@ -1546,10 +1569,15 @@ fn entries_from_history(history: &[Message]) -> Vec<Entry> {
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
+              // A failed tool result reads like any other in the transcript,
+              // so whether it was one is something the session remembers —
+              // against this result's own call, not the message's, since one
+              // message can answer several calls with different luck.
+              let is_error = crate::session::result_ids(r).any(|id| session.failed(&id));
               entries.push(Entry::ToolResult {
                 name: r.name.clone(),
                 output,
-                is_error: false,
+                is_error,
                 running: false,
                 diff: None,
                 started: now,
