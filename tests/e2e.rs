@@ -31,7 +31,18 @@ enum Turn {
   },
   /// Say this and stop.
   Say(&'static str),
+  /// Answer with the question, so the two ways a conversation went can be
+  /// told apart on screen by what was asked down each.
+  Echo,
 }
+
+/// A phrase from the summarizer's own preamble, which is how a request for a
+/// summary is told from a turn of the conversation.
+const SUMMARIZING: &str = "context summarization assistant";
+
+/// What the mock always summarizes a conversation into. Distinctive enough to
+/// find again in a later request, and it says nothing the conversation said.
+const SUMMARY: &str = "## Goal\\nFruit was discussed.";
 
 /// A scripted OpenAI-compatible server.
 ///
@@ -103,8 +114,24 @@ fn serve(mut stream: TcpStream, script: &[Turn], seen: &Mutex<Vec<String>>) -> s
   seen.lock().expect("lock").push(body.clone());
 
   // The turn to play is the number of answers the conversation already holds.
+  // A request for a summary is not a turn of the conversation at all: it is
+  // the summarizer, asking with a preamble of its own.
   let done = body.matches("\"tool_call_id\"").count();
-  let turn = script.get(done).cloned().unwrap_or(Turn::Say("Nothing left to do."));
+  let turn = match body.contains(SUMMARIZING) {
+    true => Turn::Say(SUMMARY),
+    false => script.get(done).cloned().unwrap_or(Turn::Say("Nothing left to do.")),
+  };
+
+  // Only the conversation is streamed; the summarizer asks outright, and an
+  // event stream is not an answer to that.
+  if !body.contains("\"stream\":true") {
+    let text = match turn {
+      Turn::Say(text) => text.to_string(),
+      Turn::Echo => answer_to(&body),
+      Turn::Call { say, .. } => say.to_string(),
+    };
+    return answer_outright(&mut stream, &text);
+  }
 
   stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n")?;
   let mut chunk = |delta: serde_json::Value, finish: Option<&str>| -> std::io::Result<()> {
@@ -116,7 +143,11 @@ fn serve(mut stream: TcpStream, script: &[Turn], seen: &Mutex<Vec<String>>) -> s
     stream.flush()
   };
   match turn {
-    Turn::Say(text) => {
+    Turn::Say(_) | Turn::Echo => {
+      let text = match turn {
+        Turn::Say(text) => text.to_string(),
+        _ => answer_to(&body),
+      };
       chunk(serde_json::json!({ "role": "assistant", "content": text }), None)?;
       chunk(serde_json::json!({}), Some("stop"))?;
     }
@@ -148,6 +179,51 @@ fn serve(mut stream: TcpStream, script: &[Turn], seen: &Mutex<Vec<String>>) -> s
   }
   stream.write_all(b"data: [DONE]\n\n")?;
   stream.flush()
+}
+
+/// One whole completion, for the requests that are not streamed.
+fn answer_outright(stream: &mut TcpStream, text: &str) -> std::io::Result<()> {
+  let payload = serde_json::json!({
+    "id": "1", "object": "chat.completion", "created": 0, "model": "mock",
+    "choices": [{ "index": 0, "finish_reason": "stop",
+                  "message": { "role": "assistant", "content": text } }],
+    "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 },
+  })
+  .to_string();
+  stream.write_all(
+    format!(
+      "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{payload}",
+      payload.len()
+    )
+    .as_bytes(),
+  )?;
+  stream.flush()
+}
+
+/// The last thing the user said in a request, as an answer naming it.
+fn answer_to(body: &str) -> String {
+  let body: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+  let asked = body["messages"]
+    .as_array()
+    .into_iter()
+    .flatten()
+    .rfind(|message| message["role"] == "user")
+    .map(|message| match &message["content"] {
+      serde_json::Value::String(text) => text.clone(),
+      // Some providers take a user message as parts rather than a string.
+      content => content
+        .as_array()
+        .map(|parts| {
+          parts
+            .iter()
+            .filter_map(|part| part["text"].as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+        })
+        .unwrap_or_default(),
+    })
+    .unwrap_or_default();
+  format!("Answer to {asked}.")
 }
 
 // ------------------------------------------------------------ terminal
@@ -271,6 +347,75 @@ impl Term {
   /// is *not* there yet.
   fn settle(&self) {
     std::thread::sleep(Duration::from_millis(400));
+  }
+
+  /// The rows of the open overlay, in order, and which one the cursor is on.
+  fn overlay(&self) -> (Vec<String>, usize) {
+    let screen = self.screen();
+    let lines: Vec<&str> = screen.lines().collect();
+    // Every overlay says how to leave it, on its top border.
+    let top = lines
+      .iter()
+      .position(|line| line.contains("Esc cancel"))
+      .unwrap_or_else(|| panic!("an open overlay:\n{screen}"));
+    let bottom = lines[top..]
+      .iter()
+      .position(|line| line.contains('╰'))
+      .map_or(lines.len(), |at| top + at);
+    let rows: Vec<String> = lines[top + 1..bottom].iter().map(|l| l.to_string()).collect();
+    let on = rows
+      .iter()
+      .position(|row| row.contains('›'))
+      .unwrap_or_else(|| panic!("a selected row:\n{screen}"));
+    (rows, on)
+  }
+
+  /// Walk the overlay's cursor onto the row that says `needle` and take it.
+  fn choose(&self, needle: &str) {
+    for _ in 0..30 {
+      let (rows, on) = self.overlay();
+      let at = rows
+        .iter()
+        .position(|row| row.contains(needle))
+        .unwrap_or_else(|| panic!("a row saying {needle:?}: {rows:?}"));
+      if at == on {
+        self.type_in("Enter");
+        return;
+      }
+      self.type_in(if at < on { "Up" } else { "Down" });
+      std::thread::sleep(Duration::from_millis(60));
+    }
+    panic!("could not put the cursor on {needle:?}");
+  }
+
+  /// What is in the input box, or nothing when it is empty.
+  fn typed(&self) -> String {
+    let screen = self.screen();
+    let lines: Vec<&str> = screen.lines().collect();
+    let top = lines.iter().position(|line| line.contains('╭')).unwrap_or(0);
+    lines
+      .get(top + 1)
+      .map(|line| line.trim_matches(|c| c == '│' || c == ' ').to_string())
+      .unwrap_or_default()
+  }
+
+  /// Every session file this terminal has written, with what is in it.
+  fn session_files(&self) -> Vec<(PathBuf, String)> {
+    let dir = self.dir.join("sessions");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+      .unwrap_or_else(|_| panic!("a sessions directory at {}", dir.display()))
+      .flatten()
+      .map(|entry| entry.path())
+      .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+      .collect();
+    files.sort();
+    files
+      .into_iter()
+      .map(|path| {
+        let text = std::fs::read_to_string(&path).expect("a readable session");
+        (path, text)
+      })
+      .collect()
   }
 
   fn session_file(&self) -> String {
@@ -582,6 +727,172 @@ fn a_waiting_message_can_be_taken_back_and_fixed() {
   assert!(
     !provider.sent("second questionX"),
     "and the one it was taken back from did not"
+  );
+}
+
+/// Two prompts and their answers, each answer naming its question.
+fn asked_twice(test: &str, provider: &Provider, args: &[&str]) -> Term {
+  let term = Term::start(test, provider, args);
+  term.submit("apple");
+  term.wait_for("Answer to apple.");
+  term.submit("pear");
+  term.wait_for("Answer to pear.");
+  term
+}
+
+#[test]
+fn going_back_leaves_a_branch_that_can_be_walked_into_again() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![Turn::Echo]);
+  let term = asked_twice("tree", &provider, &[]);
+
+  // Going back to a prompt hands it to the input box and ends the
+  // conversation before it.
+  term.submit("/tree");
+  term.wait_for("Esc cancel");
+  term.choose("❯ pear");
+  term.wait_for("Moved to 2 messages.");
+  assert_eq!(term.typed(), "pear", "the prompt comes back to be asked again");
+  let screen = term.screen();
+  assert!(
+    !screen.contains("Answer to pear."),
+    "the conversation ends before it now:\n{screen}"
+  );
+
+  // Asked differently, what was there before is not gone — it is a branch,
+  // and the list says so: the way we are on first, the way we left indented
+  // under the point the two part.
+  for _ in 0..4 {
+    term.type_in("BSpace");
+  }
+  term.submit("plum");
+  term.wait_for("Answer to plum.");
+  term.submit("/tree");
+  term.wait_for("Esc cancel");
+  let (rows, _) = term.overlay();
+  let at = |needle: &str| {
+    rows
+      .iter()
+      .position(|row| row.contains(needle))
+      .unwrap_or_else(|| panic!("a row saying {needle:?}: {rows:?}"))
+  };
+  let indent = |needle: &str| {
+    let row = &rows[at(needle)];
+    row[..row.find(needle).expect("the row")].chars().count()
+  };
+  assert!(at("❯ plum") < at("❯ pear"), "the way we are on comes first: {rows:?}");
+  assert!(
+    indent("❯ plum") > indent("❯ apple") && indent("❯ pear") > indent("❯ apple"),
+    "both ways are indented under where they part: {rows:?}"
+  );
+
+  // And the answer that was left behind is a place to go back to.
+  term.choose("Answer to pear.");
+  term.wait_for("Moved to 4 messages.");
+  let screen = term.screen();
+  assert!(
+    screen.contains("Answer to pear."),
+    "walked into the branch that was left:\n{screen}"
+  );
+  assert!(
+    !screen.contains("Answer to plum."),
+    "which is now the one left behind:\n{screen}"
+  );
+  // One file held both ways the whole time.
+  let session = term.session_file();
+  for said in ["apple", "pear", "plum"] {
+    assert!(session.contains(said), "{said:?} kept in the one file");
+  }
+}
+
+#[test]
+fn forking_starts_a_session_of_its_own_and_leaves_the_first_alone() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![Turn::Echo]);
+  let term = asked_twice("fork", &provider, &[]);
+  let before = term.session_files();
+  let (original, was) = before.first().expect("a session file").clone();
+  assert_eq!(before.len(), 1, "one session so far");
+
+  term.submit("/fork");
+  term.wait_for("Esc cancel");
+  // Only prompts are offered, and this one keeps the turn before it.
+  let (rows, _) = term.overlay();
+  assert!(
+    !rows.iter().any(|row| row.contains("Answer to")),
+    "a fork starts from a question: {rows:?}"
+  );
+  term.choose("❯ pear");
+  term.wait_for("Forked, 2 messages kept.");
+  assert_eq!(term.typed(), "pear", "the prompt comes back to be asked again");
+  let screen = term.screen();
+  assert!(
+    screen.contains("Answer to apple.") && !screen.contains("Answer to pear."),
+    "the fork holds the conversation up to that point:\n{screen}"
+  );
+
+  let after = term.session_files();
+  assert_eq!(after.len(), 2, "the fork is a file of its own: {after:?}");
+  let (_, now) = after.iter().find(|(path, _)| path == &original).expect("the original");
+  assert_eq!(now, &was, "the session forked from is left exactly as it was");
+  let (_, forked) = after.iter().find(|(path, _)| path != &original).expect("the fork");
+  assert!(
+    forked.contains(&format!("\"parent\":\"{}\"", original.display())),
+    "the fork says where it came from: {forked}"
+  );
+  assert!(
+    !forked.contains("Answer to pear."),
+    "and carries only the path it was forked at: {forked}"
+  );
+
+  // What is said next belongs to the fork alone.
+  term.type_in("Enter");
+  term.wait_for("Answer to pear.");
+  let after = term.session_files();
+  let (_, now) = after.iter().find(|(path, _)| path == &original).expect("the original");
+  assert_eq!(now, &was, "still untouched once the fork is talked to");
+}
+
+#[test]
+fn a_compacted_conversation_reaches_the_model_as_its_summary() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![Turn::Echo]);
+  let term = Term::start("compact", &provider, &["--no-session"]);
+  term.submit("remember the kumquat");
+  term.wait_for("Answer to remember the kumquat.");
+  term.submit("and the pomelo");
+  term.wait_for("Answer to and the pomelo.");
+
+  term.submit("/compact");
+  term.wait_for("Compacted 2 messages into a summary; kept the last 2.");
+  let screen = term.screen();
+  assert!(
+    screen.contains("▤ Context summary") && screen.contains("Fruit was discussed."),
+    "the summary is shown as one:\n{screen}"
+  );
+
+  // What the model is given next is the summary in place of what it stands
+  // for — the point of compacting at all.
+  term.submit("what now");
+  term.wait_for("Answer to what now.");
+  let request = provider.request("what now");
+  assert!(
+    request.contains("Fruit was discussed."),
+    "the summary goes in the history: {request}"
+  );
+  assert!(
+    !request.contains("kumquat"),
+    "in place of the turns it summarized: {request}"
+  );
+  assert!(
+    request.contains("and the pomelo"),
+    "while the recent turn stays verbatim: {request}"
   );
 }
 
