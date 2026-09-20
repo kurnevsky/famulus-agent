@@ -226,6 +226,60 @@ fn answer_to(body: &str) -> String {
   format!("Answer to {asked}.")
 }
 
+// ------------------------------------------------------------ mcp server
+
+/// An MCP server over stdin and stdout, in as little as it takes: the three
+/// requests a client makes of one, answered by hand.
+const MCP_SERVER: &str = r#"
+import json, sys
+
+TOOLS = [{
+  "name": "weather",
+  "description": "What the weather is somewhere.",
+  "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+}]
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    message = json.loads(line)
+    if "id" not in message:
+        continue  # a notification: nothing to answer
+    method, params = message.get("method"), message.get("params") or {}
+    if method == "initialize":
+        result = {
+            "protocolVersion": params.get("protocolVersion", "2025-06-18"),
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "mock-weather", "version": "1"},
+        }
+    elif method == "tools/list":
+        result = {"tools": TOOLS}
+    elif method == "tools/call":
+        city = (params.get("arguments") or {}).get("city", "nowhere")
+        result = {"content": [{"type": "text", "text": "It rains in %s." % city}], "isError": False}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}) + "\n")
+    sys.stdout.flush()
+"#;
+
+/// A directory of this test's own, emptied first.
+fn scratch(test: &str) -> PathBuf {
+  let dir = std::env::temp_dir().join(format!("fa-e2e-{}-{test}-files", std::process::id()));
+  let _ = std::fs::remove_dir_all(&dir);
+  std::fs::create_dir_all(&dir).expect("a directory to put files in");
+  dir
+}
+
+fn have_python() -> bool {
+  let installed = Command::new("python3").arg("-V").output().is_ok();
+  if !installed {
+    eprintln!("python3 not installed; skipping");
+  }
+  installed
+}
+
 // ------------------------------------------------------------ terminal
 
 /// A running `fa`, in a terminal of its own.
@@ -894,6 +948,66 @@ fn a_compacted_conversation_reaches_the_model_as_its_summary() {
     request.contains("and the pomelo"),
     "while the recent turn stays verbatim: {request}"
   );
+}
+
+#[test]
+fn a_tool_from_an_mcp_server_is_offered_called_and_drawn_like_any_other() {
+  if !have_tmux() || !have_python() {
+    return;
+  }
+  let dir = scratch("mcp");
+  let server = dir.join("server.py");
+  std::fs::write(&server, MCP_SERVER).expect("a server to run");
+  let config = dir.join("mcp.toml");
+  std::fs::write(
+    &config,
+    // A line of shell, as it would be typed — the server is started by the
+    // command that starts it in a terminal.
+    format!(
+      "[weather]\ncommand = \"python3 '{}'\"\ntimeout = 10\n",
+      server.display()
+    ),
+  )
+  .expect("a config to read");
+
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "Let me look. ",
+      tool: "weather",
+      args: serde_json::json!({ "city": "Berlin" }),
+    },
+    Turn::Say("Take a coat."),
+  ]);
+  let term = Term::start("mcp", &provider, &["--no-session", "--mcp-config", &shell(&config)]);
+
+  // What came up is said before anything else, since there is nowhere else
+  // to say it: the terminal did not exist yet.
+  term.wait_for("MCP weather: 1 tool");
+  term.submit("what is the weather in Berlin");
+  term.wait_for("Take a coat.");
+
+  // The model was offered the tool by the name its server gave it.
+  assert!(
+    provider.sent(r#""name":"weather""#),
+    "the server's tool went to the model with the other four"
+  );
+  // And it reads in the transcript like any other tool: the call, then what
+  // came back under it.
+  let screen = term.screen();
+  let lines: Vec<&str> = screen.lines().map(str::trim_end).filter(|l| !l.is_empty()).collect();
+  let call = lines
+    .iter()
+    .position(|line| line.contains("⚙ weather"))
+    .unwrap_or_else(|| panic!("the call: {lines:?}"));
+  assert!(
+    lines[call].contains("Berlin"),
+    "its arguments are on its line: {lines:?}"
+  );
+  assert!(
+    lines[call + 1].contains("It rains in Berlin."),
+    "what the server answered, under the call: {lines:?}"
+  );
+  let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

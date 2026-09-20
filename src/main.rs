@@ -4,6 +4,7 @@ mod edit;
 mod highlight;
 mod images;
 mod markdown;
+mod mcp;
 mod session;
 mod tools;
 mod ui;
@@ -94,6 +95,14 @@ struct Cli {
   /// Transcript scrollbar: shown briefly while scrolling, always, or never
   #[arg(long, env = "FA_SCROLLBAR", value_enum, default_value_t = ui::ScrollbarMode::Auto)]
   scrollbar: ui::ScrollbarMode,
+
+  /// MCP servers to start, instead of the mcp.toml in $XDG_CONFIG_HOME/fa
+  #[arg(long, env = "FA_MCP_CONFIG")]
+  mcp_config: Option<PathBuf>,
+
+  /// Start no MCP servers this session
+  #[arg(long, conflicts_with = "mcp_config")]
+  no_mcp: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -159,8 +168,22 @@ async fn main() -> Result<()> {
     cfg.model
   );
 
+  // The servers come up before the terminal does, and stay up as long as this
+  // binding: a stdio server is a child process of ours, and closing the
+  // connection is what stops it.
+  let (servers, notes) = match cli.no_mcp {
+    true => (mcp::Servers::default(), Vec::new()),
+    false => {
+      let files = mcp::files(cli.mcp_config.as_deref());
+      let (config, mut notes) = mcp::load(&files, cli.mcp_config.is_some());
+      let servers = mcp::connect(config).await;
+      notes.extend(servers.notes().iter().cloned());
+      (servers, notes)
+    }
+  };
+
   let (tx, rx) = mpsc::unbounded_channel();
-  let agents = agent::build_agents(&cfg, &cwd, tx.clone())?;
+  let agents = agent::build_agents(&cfg, &cwd, tx.clone(), &servers)?;
   let app = ui::App::new(
     agents,
     tx,
@@ -171,6 +194,7 @@ async fn main() -> Result<()> {
       scrollbar: cli.scrollbar,
       store,
       start,
+      notes,
     },
   );
 

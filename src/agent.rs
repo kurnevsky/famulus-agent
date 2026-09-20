@@ -192,7 +192,12 @@ impl AgentHook for UiHook {
   }
 }
 
-pub fn build_agents(cfg: &Config, cwd: &Path, tx: mpsc::UnboundedSender<AgentEvent>) -> Result<Agents> {
+pub fn build_agents(
+  cfg: &Config,
+  cwd: &Path,
+  tx: mpsc::UnboundedSender<AgentEvent>,
+  servers: &crate::mcp::Servers,
+) -> Result<Agents> {
   let preamble = match &cfg.system_prompt {
     Some(p) => p.clone(),
     None => default_system_prompt(cwd),
@@ -247,8 +252,10 @@ pub fn build_agents(cfg: &Config, cwd: &Path, tx: mpsc::UnboundedSender<AgentEve
       on_output: Some(Arc::new(move |call, text| {
         let _ = output_tx.send(AgentEvent::ToolOutput { call, text });
       })),
-    })
-    .build();
+    });
+  // Whatever the session's MCP servers offer, alongside the four the agent
+  // brought: a tool is a tool, and the transcript draws them all the same.
+  let agent = crate::mcp::attach(agent, servers).build();
   let summarizer = summarizer
     .preamble(compaction::SYSTEM_PROMPT)
     .default_max_turns(1)
@@ -557,7 +564,9 @@ mod tests {
       vision: true,
     };
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let agent = build_agents(&cfg, Path::new("/tmp"), tx.clone()).unwrap().agent;
+    let agent = build_agents(&cfg, Path::new("/tmp"), tx.clone(), &Default::default())
+      .unwrap()
+      .agent;
 
     // 1. Plain streamed text.
     let events = collect(&agent, vec![], "hi", &mut rx, &tx).await;
@@ -692,7 +701,7 @@ mod tests {
       vision: true,
     };
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let agents = build_agents(&cfg, Path::new("/tmp"), tx.clone()).unwrap();
+    let agents = build_agents(&cfg, Path::new("/tmp"), tx.clone(), &Default::default()).unwrap();
     let history = vec![
       Message::user("first question"),
       Message::assistant("first answer"),
@@ -819,7 +828,9 @@ mod tests {
       vision: true,
     };
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let agent = build_agents(&cfg, Path::new("/tmp"), tx.clone()).unwrap().agent;
+    let agent = build_agents(&cfg, Path::new("/tmp"), tx.clone(), &Default::default())
+      .unwrap()
+      .agent;
     // The mock turns "image <path>" into a `read` tool call for that path,
     // then answers the follow-up request with plain text. If the relay did
     // not work, rig would reject the image in the tool message and the run
@@ -863,7 +874,9 @@ mod tests {
       vision: true,
     };
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let agent = build_agents(&cfg, Path::new("/tmp"), tx.clone()).unwrap().agent;
+    let agent = build_agents(&cfg, Path::new("/tmp"), tx.clone(), &Default::default())
+      .unwrap()
+      .agent;
     let events = collect(&agent, vec![], &format!("image {}", path.display()), &mut rx, &tx).await;
     assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error(_))), "{events:?}");
     let text: String = events

@@ -7,7 +7,11 @@ edition = "2024"
 # of its own: `--no-default-features` builds with no tree-sitter at all, and
 # code blocks fall back to the single colour they had before.
 [features]
-default = ["languages"]
+default = ["languages", "mcp"]
+# Tools from MCP servers, over stdio or streamable HTTP. Rig speaks the
+# protocol through `rmcp`; this only finds the servers and hands their tools to
+# the agent, so `--no-default-features` leaves the four built-in tools alone.
+mcp = ["dep:rmcp", "dep:http", "dep:toml", "rig-agent/rmcp"]
 languages = [
   "lang-bash",
   "lang-c",
@@ -53,6 +57,8 @@ base64 = "0.23.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 futures = "0.3.34"
+# Only to name the headers an MCP endpoint is called with; already in the tree.
+http = { version = "1", optional = true }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 libc = "0.2.189"
 markdown = "1"
@@ -62,6 +68,11 @@ ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 ratatui-textarea = "0.9"
 rig-agent = "0.42"
 rig-core = "0.42"
+rmcp = { version = "2", features = [
+  "client",
+  "transport-child-process",
+  "transport-streamable-http-client-reqwest",
+], optional = true }
 # `preserve_order` keeps a tool's arguments in the order its struct
 # declares them, rather than sorting them: the model tends to write them
 # in the order it is offered them, and the path wants to come first.
@@ -70,6 +81,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 similar = "3.2.0"
 thiserror = "2.0.20"
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"], optional = true }
 tokio = { version = "1.53.1", features = ["full"] }
 tree-sitter = { version = "0.27", optional = true }
 tree-sitter-bash = { version = "0.25", optional = true }

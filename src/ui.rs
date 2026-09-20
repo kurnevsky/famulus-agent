@@ -76,6 +76,10 @@ pub struct Options {
   pub scrollbar: ScrollbarMode,
   pub store: Option<Store>,
   pub start: SessionStart,
+  /// What happened before the terminal existed — which MCP servers came up,
+  /// and what went wrong with the rest — said in the transcript, since there
+  /// is nowhere else left to say it.
+  pub notes: Vec<String>,
 }
 
 /// Slash commands offered by the `/` popup: name, description, takes an argument.
@@ -372,6 +376,7 @@ impl App {
       scrollbar,
       store,
       start,
+      notes,
     } = options;
     let mut input = TextArea::default();
     input.set_cursor_line_style(Style::default());
@@ -425,6 +430,10 @@ impl App {
       SessionStart::Resume => app.open_picker(),
       SessionStart::Path(path) => app.load_session(&path),
     }
+    // What happened before the terminal existed, said after whatever opening
+    // the session itself had to say — and after it, because resuming one
+    // draws the transcript from the history and would draw over this.
+    app.entries.extend(notes.into_iter().map(Entry::Info));
     app
   }
 

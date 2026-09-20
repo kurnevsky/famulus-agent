@@ -41,9 +41,74 @@ GEMINI_API_KEY=... ./target/release/fa --provider gemini -m gemini-2.5-pro
 | `--no-session` | | | Do not save this session |
 | `--sessions-dir` | `FA_SESSIONS_DIR` | `~/.local/share/fa/sessions` | Where session files live (global) |
 | `--scrollbar` | `FA_SCROLLBAR` | `auto` | Transcript scrollbar: `auto` (while scrolling), `always`, `hidden` |
+| `--mcp-config` | `FA_MCP_CONFIG` | XDG search path | Read MCP servers from this file instead |
+| `--no-mcp` | | | Start no MCP servers this session |
 
 The agent works in the current directory. If `AGENTS.md` (or `CLAUDE.md`)
 exists there, it is appended to the system prompt.
+
+## MCP
+
+Tools from [MCP](https://modelcontextprotocol.io) servers sit beside the four
+built-in ones, and the transcript draws them the same way — rig speaks the
+protocol, through `rmcp`, so a server's tool is a tool like any other.
+
+Servers are declared in `mcp.toml`, a table each, under the name its tools will
+be called by:
+
+```toml
+# ~/.config/fa/mcp.toml
+
+[fetch]
+command = "uvx mcp-server-fetch"
+
+[files]
+command = "mcp-server-files --root ~/src"
+env.TOKEN = "…"
+
+[docs]
+url = "https://example.com/mcp"
+headers.Authorization = "Bearer …"
+timeout = 60
+```
+
+A server is a `command` to run, spoken to over its own stdin and stdout, or a
+`url` to call, spoken to over streamable HTTP.
+
+| Key | Meaning |
+|-----|---------|
+| `command` | A line of shell, run the way the `bash` tool runs one — quoting, `~` and `$HOME` all work |
+| `env` | Added to the environment that command inherits |
+| `url` | Endpoint of a server that speaks streamable HTTP |
+| `headers` | Sent with every request to it, which is where a token goes |
+| `timeout` | Seconds one of this server's tools may take, `0` to wait forever (default 300) |
+
+The file is fa's own, so it reads the way the rest of fa does — a command is
+the line you would type, not an argv — and a key it does not know is an error
+naming the line it is on, not something to read past: a misspelled `comand`
+that went quietly would be a server that never came up for no stated reason.
+There is no `disabled`; the file has comments.
+
+Where it lives is the XDG search path and nothing else — `$XDG_CONFIG_HOME/fa/mcp.toml`
+(`~/.config/fa/mcp.toml` by default), then each of `$XDG_CONFIG_DIRS`, with the
+nearer file winning the names two of them share. There is no dotfile in a home
+directory and none beside the project: a file in the working directory would be
+a file whose name depends on where fa was started from.
+
+Servers come up before the terminal does, and what happened is the first thing
+the transcript says: which server offered how many tools, and what went wrong
+with the rest. A server that fails, or takes more than 20 seconds to say what
+it offers, is a note rather than a failure — the session still has its own four
+tools, which beats refusing to start. A tool named like one of those four is
+left alone: the model is told about `read`, `write`, `edit` and `bash` in the
+system prompt, and cannot say which of two it meant.
+
+MCP is a feature, on by default:
+
+```sh
+# No MCP support at all
+cargo build --release --no-default-features --features languages
+```
 
 ## Syntax highlighting
 
@@ -330,11 +395,20 @@ mouse usually requires holding `Shift`.
   and the per-line spans the markdown renderer draws. Grammars ship their own
   highlight queries and are used as they come, except Haskell, whose query is
   written for neovim's pattern precedence and needs one of our own.
+- `src/mcp.rs` – finding MCP servers and starting them: the XDG search for
+  `mcp.toml`, the table-per-server file it reads, and handing each
+  server's tools to the agent. Rig speaks the protocol; this only decides who
+  to speak to. Holding the result is what keeps the servers running, so it
+  lives as long as the program does.
 - `src/ui.rs` – ratatui app: transcript, input, footer.
 - `tests/e2e.rs` – the binary driven through tmux against a mock provider: a
   call written token by token and its output landing under it, pass and fail
   as the stripe beside each, an aborted run keeping its work and carrying on
-  from it, and a reopened session reading exactly as it did before.
+  from it, a reopened session reading exactly as it did before, a message typed
+  mid-run waiting at the bottom and going at the next turn, going back into a
+  branch the conversation left, forking into a session of its own, a compacted
+  conversation reaching the model as its summary, and a tool from a real MCP
+  server being offered, called and drawn like any other.
 
 ## Testing
 
