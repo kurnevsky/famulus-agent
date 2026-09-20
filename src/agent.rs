@@ -4,14 +4,16 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use rig_agent::agent::{
-  Agent, AgentBuilder, AgentHook, HookContext, MultiTurnStreamItem, ToolCall, ToolCallAction, ToolResultAction,
-  ToolResultEvent,
+  Agent, AgentBuilder, AgentHook, CompletionCallAction, CompletionCallEvent, HookContext, MultiTurnStreamItem,
+  StreamingError, ToolCall, ToolCallAction, ToolResultAction, ToolResultEvent,
 };
 use rig_agent::client::AgentClientExt;
+use rig_agent::completion::PromptError;
 use rig_agent::streaming::StreamingPrompt;
 use rig_agent::tool::{Tool, ToolOutput};
 use rig_core::client::completion::CompletionClient;
@@ -89,7 +91,14 @@ pub struct Agents {
   pub agent: Arc<Agent>,
   /// Tool-less agent used to summarize history during compaction.
   pub summarizer: Arc<Agent>,
+  /// Raised while a message the user typed is waiting behind the run.
+  pub waiting: Waiting,
 }
+
+/// Whether something the user typed is waiting to be sent. The UI raises it,
+/// the run reads it at each turn boundary, so a message that arrives mid-run
+/// is taken at the next opportunity rather than after the whole answer.
+pub type Waiting = Arc<AtomicBool>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provider {
@@ -126,9 +135,31 @@ fn call_id(id: Option<&str>) -> String {
 /// transcript-level stream items do not.
 struct UiHook {
   tx: mpsc::UnboundedSender<AgentEvent>,
+  waiting: Waiting,
 }
 
 impl AgentHook for UiHook {
+  /// Stop before the next model call when the user has said something since
+  /// the run started, so their message is the next thing the model reads.
+  ///
+  /// Between turns is the only place a run can be cut without leaving a call
+  /// unanswered: every tool the turn just ended asked for has come back. The
+  /// run's work is kept the way an abort keeps it, and the waiting message is
+  /// sent as a fresh run over that history — which is what the model would
+  /// have seen had it been typed a moment earlier.
+  ///
+  /// Never before the first call, where the run has done nothing yet: the
+  /// message it stopped for would start a run that stops for the next one.
+  async fn on_completion_call(&self, _ctx: &HookContext, event: CompletionCallEvent<'_>) -> CompletionCallAction {
+    match event.turn > 1 && self.waiting.load(Ordering::Relaxed) {
+      // The reason is rig's to carry, not anything this program reads: the
+      // stop comes back as a `PromptCancelled` and `start_run` knows it by
+      // that, not by what it says. It is here for a stack trace to say.
+      true => CompletionCallAction::Stop("a message is waiting to be sent".into()),
+      false => CompletionCallAction::Continue,
+    }
+  }
+
   async fn on_tool_call(&self, _ctx: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
     let args = serde_json::from_str(event.args).unwrap_or_else(|_| serde_json::Value::String(event.args.to_string()));
     let _ = self.tx.send(AgentEvent::ToolCall {
@@ -197,10 +228,14 @@ pub fn build_agents(cfg: &Config, cwd: &Path, tx: mpsc::UnboundedSender<AgentEve
   };
 
   let output_tx = tx.clone();
+  let waiting = Waiting::default();
   let agent = agent
     .preamble(&preamble)
     .default_max_turns(cfg.max_turns)
-    .add_hook(UiHook { tx })
+    .add_hook(UiHook {
+      tx,
+      waiting: waiting.clone(),
+    })
     .tool(ReadTool {
       cwd: cwd.to_path_buf(),
       vision: cfg.vision,
@@ -221,6 +256,7 @@ pub fn build_agents(cfg: &Config, cwd: &Path, tx: mpsc::UnboundedSender<AgentEve
   Ok(Agents {
     agent: Arc::new(agent),
     summarizer: Arc::new(summarizer),
+    waiting,
   })
 }
 
@@ -363,7 +399,9 @@ pub fn start_run(
   tokio::spawn(async move {
     let mut stream = agent.stream_prompt(prompt).history(history).await;
     let mut sent_done = false;
-    let mut had_error = false;
+    // The stream stopped for a reason the UI has already been told, so there
+    // is nothing left to say about it when the loop falls out.
+    let mut explained = false;
     // Arguments arrive a few characters at a time and each fragment carries
     // only what is new, so the run holds what has arrived per call and sends
     // the whole of it. The UI then has nothing to reassemble.
@@ -419,8 +457,15 @@ pub fn start_run(
           })
         }
         Ok(_) => None,
+        // A cancelled run is this app cutting in with the message the user
+        // typed while it ran, not something that went wrong, so it ends the
+        // way an abort does — quietly, keeping what it got through.
+        Err(StreamingError::Prompt(err)) if matches!(*err, PromptError::PromptCancelled { .. }) => {
+          explained = true;
+          None
+        }
         Err(err) => {
-          had_error = true;
+          explained = true;
           Some(AgentEvent::Error(err.to_string()))
         }
       };
@@ -431,7 +476,7 @@ pub fn start_run(
       }
     }
     if !sent_done {
-      if !had_error {
+      if !explained {
         let _ = tx.send(AgentEvent::Error("stream ended without a final response".into()));
       }
       let _ = tx.send(AgentEvent::Ended);

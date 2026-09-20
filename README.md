@@ -107,6 +107,21 @@ unanswered user message gets answered, and a half-written answer is continued
 from where it stopped. Nothing is written to the session twice: the resumed
 message is dropped from the turn's result.
 
+## Typing while it works
+
+`Enter` during a run queues the message rather than dropping it, and the run
+stops for it at its next turn: the tool calls it was in the middle of are
+answered, and everything it got through is kept, exactly as an abort keeps it
+— then the waiting message is sent over that history as a run of its own. So
+the model reads it at the first point it could have, not after it has finished
+answering a question you have already moved past. A run is never cut before
+its first model call, where it has done nothing yet.
+
+A message waiting its turn is drawn at the bottom of the transcript, under
+whatever the run is still saying, because the bottom is where it will be sent
+from. `Esc` stops the run and what was waiting behind it — it stays in the
+transcript as `Not sent`, since it was typed.
+
 ## Going back
 
 `/tree` — or `Esc` twice on an empty input box, which is pi's shortcut and its

@@ -72,6 +72,17 @@ impl Provider {
   fn sent(&self, needle: &str) -> bool {
     self.seen.lock().expect("lock").iter().any(|body| body.contains(needle))
   }
+
+  /// The first request that carried `needle`, for asking what else was in it
+  /// — which is how "when was this sent" is answered.
+  fn request(&self, needle: &str) -> String {
+    let seen = self.seen.lock().expect("lock");
+    seen
+      .iter()
+      .find(|body| body.contains(needle))
+      .unwrap_or_else(|| panic!("no request carried {needle:?}; {} were sent", seen.len()))
+      .clone()
+  }
 }
 
 fn serve(mut stream: TcpStream, script: &[Turn], seen: &Mutex<Vec<String>>) -> std::io::Result<()> {
@@ -417,8 +428,13 @@ fn an_aborted_run_keeps_its_work_and_can_carry_on() {
   let term = Term::start("abort", &provider, &[]);
   term.submit("do three things");
   term.wait_for("⚙ bash sleep 60");
+  // Something waiting behind a run that is killed is not sent afterwards —
+  // Esc stops everything — but it was typed, so it is still on the screen.
+  term.submit("and this later");
+  term.settle();
   term.type_in("Escape");
   term.wait_for("Aborted.");
+  term.wait_for("Not sent: and this later");
 
   // A run only hands back its transcript when it finishes, so this is the
   // work that would otherwise be lost with it.
@@ -440,6 +456,88 @@ fn an_aborted_run_keeps_its_work_and_can_carry_on() {
     provider.sent("Aborted by the user."),
     "the interrupted call went back with its answer"
   );
+  assert!(
+    !provider.sent("and this later"),
+    "what Esc stopped stays stopped, including what was waiting"
+  );
+}
+
+#[test]
+fn a_message_typed_mid_run_waits_at_the_bottom_and_goes_at_the_next_turn() {
+  if !have_tmux() {
+    return;
+  }
+  // A file long enough that it is still arriving, line by line, while the
+  // test types at it — which is the run at its most in-progress.
+  let file = (1..=400).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "Working. ",
+      tool: "write",
+      args: serde_json::json!({ "path": "notes.txt", "content": file }),
+    },
+    Turn::Say("Answered them both."),
+  ]);
+  let term = Term::start("queue", &provider, &["--no-session"]);
+  term.submit("start something slow");
+  term.wait_for("⚙ write notes.txt");
+  term.submit("and this too");
+  term.settle();
+
+  // Where it waits is where it will be sent from: under the call still being
+  // written, not above the file arriving under it.
+  let screen = term.screen();
+  let lines: Vec<&str> = screen.lines().map(str::trim_end).filter(|l| !l.is_empty()).collect();
+  let call = lines.iter().position(|l| l.contains("⚙ write")).expect("the call");
+  let writing = lines
+    .iter()
+    .rposition(|l| l.contains('▌'))
+    .unwrap_or_else(|| panic!("the file still arriving: {lines:?}"));
+  let queued = lines
+    .iter()
+    .position(|l| l.contains("Queued: and this too"))
+    .unwrap_or_else(|| panic!("the message waiting its turn: {lines:?}"));
+  assert!(queued > call, "a waiting message sits under the run: {lines:?}");
+  assert!(
+    queued > writing,
+    "under what is still being written, not above it: {lines:?}"
+  );
+
+  // Ctrl+O says how much of a tool's output to show. What is waiting to be
+  // sent is not the run's output, and is not the run's to take away.
+  term.type_in("C-o");
+  term.settle();
+  let screen = term.screen();
+  assert!(
+    screen.contains('▌') && screen.contains("Queued: and this too"),
+    "still waiting after the view changed under it:\n{screen}"
+  );
+  term.type_in("C-o");
+
+  // And it goes at the next turn, not after the whole answer: the request
+  // carrying it holds the command's result and nothing the model said after.
+  term.wait_for("Answered them both.");
+  let request = provider.request("and this too");
+  assert!(
+    request.contains("tool_call_id"),
+    "sent once the running call was answered, keeping its work: {request}"
+  );
+  assert!(
+    !request.contains("Answered them both."),
+    "sent before the model answered the first message, not after: {request}"
+  );
+  let screen = term.screen();
+  let lines: Vec<&str> = screen.lines().map(str::trim_end).filter(|l| !l.is_empty()).collect();
+  assert!(
+    !lines.iter().any(|l| l.contains("Queued:")),
+    "nothing is left waiting once it is sent: {lines:?}"
+  );
+  let call = lines.iter().position(|l| l.contains("⚙ write")).expect("the call");
+  let prompt = lines
+    .iter()
+    .position(|l| l.contains("❯ and this too"))
+    .expect("the prompt it became");
+  assert!(prompt > call, "it becomes a prompt where it waited: {lines:?}");
 }
 
 #[test]

@@ -505,13 +505,15 @@ impl App {
       (KeyCode::Char('d'), true) if self.input.is_empty() => self.quit = true,
       (KeyCode::Char('t'), true) => {
         self.expand_thinking = !self.expand_thinking;
-        // Expanding moves everything below the block, so keep the view
-        // pinned rather than leaving the reader mid-paragraph.
-        self.reset_view();
+        // Expanding moves everything below the block, so go back to following
+        // the bottom rather than leaving the reader mid-paragraph. Only the
+        // view changes: the conversation is the same one, and so is anything
+        // waiting to be said to it.
+        self.anchor = None;
       }
       (KeyCode::Char('o'), true) => {
         self.expand_tools = !self.expand_tools;
-        self.reset_view();
+        self.anchor = None;
       }
       (KeyCode::Esc, _) if self.run.is_some() => self.abort(),
       // Esc on its own has nothing to do once there is no run to stop, so a
@@ -703,8 +705,8 @@ impl App {
     self.anchor = None;
 
     if self.run.is_some() && !matches!(text.as_str(), "/quit" | "/new") {
-      self.entries.push(Entry::Info(format!("Queued: {}", first_line(&text))));
       self.queued.push_back(text);
+      self.waiting();
       return;
     }
     self.dispatch(text);
@@ -763,8 +765,12 @@ impl App {
     }
   }
 
-  fn reset_view(&mut self) {
+  /// Leave behind everything that belonged to the conversation being left:
+  /// what it cost, where it was scrolled to, and anything typed at it that
+  /// has not been sent.
+  fn reset_conversation(&mut self) {
     self.queued.clear();
+    self.waiting();
     self.usage = Usage::new();
     self.context_tokens = None;
     self.anchor = None;
@@ -774,7 +780,7 @@ impl App {
     self.abort();
     self.session = Session::new(self.store.as_ref(), &self.cwd, &self.model);
     self.entries.clear();
-    self.reset_view();
+    self.reset_conversation();
     self.entries.push(Entry::Info("New session.".into()));
   }
 
@@ -791,7 +797,7 @@ impl App {
           session.history.len()
         )));
         self.session = session;
-        self.reset_view();
+        self.reset_conversation();
       }
       Err(err) => self
         .entries
@@ -877,7 +883,7 @@ impl App {
     self.entries.push(Entry::Info(note));
     // The token counts and the queue belonged to a conversation that is no
     // longer the one we are in.
-    self.reset_view();
+    self.reset_conversation();
     if let Some(text) = &point.text {
       self.set_input(&text.clone());
     }
@@ -906,8 +912,19 @@ impl App {
 
   fn next_queued(&mut self) {
     if let Some(next) = self.queued.pop_front() {
+      self.waiting();
       self.dispatch(next);
     }
+  }
+
+  /// Tell a run in flight whether anything is waiting behind it, so it can
+  /// stop at its next turn rather than finish an answer to a question the
+  /// user has already moved past.
+  fn waiting(&self) {
+    self
+      .agents
+      .waiting
+      .store(!self.queued.is_empty(), std::sync::atomic::Ordering::Relaxed);
   }
 
   fn compact(&mut self) {
@@ -973,6 +990,15 @@ impl App {
       self.finish_running_tool();
       self.entries.push(Entry::Info("Aborted.".into()));
     }
+    // Esc stops everything, including what was waiting behind the run — but
+    // it was typed, so it is kept in the transcript rather than dropped out
+    // of sight.
+    for text in std::mem::take(&mut self.queued) {
+      self
+        .entries
+        .push(Entry::Info(format!("Not sent: {}", first_line(&text))));
+    }
+    self.waiting();
   }
 
   /// Freeze every live tool output when the run was killed.
@@ -1595,6 +1621,15 @@ impl App {
         cursor: true,
       }
       .draw(&mut lines);
+    }
+    // What the user typed while the run was going, at the end because that is
+    // where it will be sent from — under everything the run is still saying,
+    // not above it.
+    if !self.queued.is_empty() {
+      lines.push(Line::default());
+      for text in &self.queued {
+        lines.push(Line::styled(format!("Queued: {}", first_line(text)), dim.italic()));
+      }
     }
     self.markdown = live;
     lines
