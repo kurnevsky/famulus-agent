@@ -230,6 +230,7 @@ fn answer_to(body: &str) -> String {
 
 /// An MCP server over stdin and stdout, in as little as it takes: the three
 /// requests a client makes of one, answered by hand.
+#[cfg(feature = "mcp")]
 const MCP_SERVER: &str = r#"
 import json, sys
 
@@ -271,6 +272,7 @@ for line in sys.stdin:
 "#;
 
 /// A directory of this test's own, emptied first.
+#[cfg(feature = "mcp")]
 fn scratch(test: &str) -> PathBuf {
   let dir = std::env::temp_dir().join(format!("fa-e2e-{}-{test}-files", std::process::id()));
   let _ = std::fs::remove_dir_all(&dir);
@@ -278,6 +280,7 @@ fn scratch(test: &str) -> PathBuf {
   dir
 }
 
+#[cfg(feature = "mcp")]
 fn have_python() -> bool {
   let installed = Command::new("python3").arg("-V").output().is_ok();
   if !installed {
@@ -313,13 +316,23 @@ impl Term {
 
   fn open(dir: PathBuf, provider: &Provider, args: &[&str]) -> Self {
     std::fs::create_dir_all(dir.join("sessions")).expect("a working directory");
+    // An empty configuration directory, pointed at by both halves of the XDG
+    // search path: a developer with servers of their own in `mcp.toml` would
+    // otherwise have them started by every test, and what the transcript says
+    // is not supposed to depend on the machine the suite runs on. The test
+    // that wants a server names its own file with `--mcp-config`, which is
+    // not a search at all.
+    let config = dir.join("config");
+    std::fs::create_dir_all(&config).expect("a configuration directory");
     let name = format!("fa-e2e-{}", uuid_ish());
     let _ = Command::new("tmux").args(["kill-session", "-t", &name]).output();
 
     let command = format!(
-      "cd {} && FA_SESSIONS_DIR={} {} --base-url {} -m mock {}",
+      "cd {} && FA_SESSIONS_DIR={} XDG_CONFIG_HOME={} XDG_CONFIG_DIRS={} {} --base-url {} -m mock {}",
       shell(&dir),
       shell(&dir.join("sessions")),
+      shell(&config),
+      shell(&config),
       shell(Path::new(env!("CARGO_BIN_EXE_fa"))),
       provider.base_url(),
       args.join(" "),
@@ -1053,7 +1066,10 @@ fn a_compacted_conversation_reaches_the_model_as_its_summary() {
   );
 }
 
+/// MCP is a feature, and a build without it is a build with four tools and no
+/// servers to bring more — so this is a test of the feature, not of fa.
 #[test]
+#[cfg(feature = "mcp")]
 fn a_tool_from_an_mcp_server_is_offered_called_and_drawn_like_any_other() {
   if !have_tmux() || !have_python() {
     return;

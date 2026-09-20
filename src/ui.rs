@@ -449,10 +449,12 @@ impl App {
       SessionStart::Resume => app.open_picker(),
       SessionStart::Path(path) => app.load_session(&path),
     }
-    // What happened before the terminal existed, said after whatever opening
-    // the session itself had to say — and after it, because resuming one
-    // draws the transcript from the history and would draw over this.
-    app.entries.extend(notes.into_iter().map(Entry::Info));
+    // What happened before the terminal existed, said before whatever the
+    // session itself had to say, because that is the order it happened in.
+    // In front of the entries rather than after them: resuming a session
+    // draws its transcript from the history, which would otherwise leave the
+    // servers reported under a conversation that predates them.
+    app.entries.splice(0..0, notes.into_iter().map(Entry::Info));
     app
   }
 
