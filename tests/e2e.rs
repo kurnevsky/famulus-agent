@@ -659,6 +659,38 @@ fn a_command_is_written_then_run_and_its_output_lands_under_it() {
   );
 }
 
+#[test]
+fn a_script_of_several_lines_is_drawn_on_all_of_them() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "",
+      tool: "bash",
+      args: serde_json::json!({ "command": "for word in one two; do\n  echo $word\ndone\n" }),
+    },
+    Turn::Say("That is all."),
+  ]);
+  let term = Term::start("script", &provider, &["--no-session"]);
+  term.submit("do it");
+
+  let screen = term.wait_for("That is all.");
+  let lines: Vec<&str> = screen.lines().map(str::trim_end).filter(|l| !l.is_empty()).collect();
+  let call = lines.iter().position(|l| l.contains("⚙ bash")).expect("the call");
+  // Every line of the script, under the one before it and indented to where
+  // the first one starts — and the trailing newline is not a line of it.
+  assert!(
+    lines[call].ends_with("⚙ bash for word in one two; do"),
+    "the script starts on the call's line: {lines:?}"
+  );
+  assert_eq!(
+    lines[call + 1..call + 3],
+    ["         echo $word", "       done"],
+    "the rest of the script is under it: {lines:?}"
+  );
+}
+
 /// How the terminal's own green and red arrive as a background: indexed, so
 /// they follow whatever palette the terminal is wearing.
 const GREEN_BG: &str = "\u{1b}[48;5;2m";

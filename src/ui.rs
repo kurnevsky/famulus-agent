@@ -1831,20 +1831,7 @@ impl App {
         }
         Entry::ToolCall { name, summary, .. } => {
           lines.push(Line::default());
-          let mut spans = vec![
-            Span::styled("⚙ ", Style::default().fg(Color::Yellow)),
-            Span::styled(name.clone(), Style::default().fg(Color::Yellow).bold()),
-            Span::raw(" "),
-          ];
-          // A command is code, and reads as code. So is what a tool the agent
-          // did not bring is being asked for: nothing here knows what its
-          // arguments mean, so they are shown as the JSON they arrived as.
-          match name.as_str() {
-            "bash" => spans.extend(code_spans("bash", summary, dim)),
-            name if !crate::tools::BUILT_IN.contains(&name) => spans.extend(code_spans("json", summary, dim)),
-            _ => spans.push(Span::styled(summary.clone(), dim)),
-          }
-          lines.push(Line::from(spans));
+          lines.extend(call_lines(name, summary, dim));
         }
         Entry::ToolResult {
           name,
@@ -1991,24 +1978,17 @@ impl App {
           })
           .collect(),
       };
-      let mut header = vec![
-        Span::styled("⚙ ", Style::default().fg(Color::Yellow)),
-        Span::styled(writing.name.clone(), Style::default().fg(Color::Yellow).bold()),
-        Span::raw(" "),
-      ];
-      // Highlighted as it is typed, so the line does not recolour under the
-      // reader when the call is finally made.
-      match writing.name.as_str() {
-        "bash" => header.extend(code_spans("bash", &summary, dim)),
-        name if !crate::tools::BUILT_IN.contains(&name) => header.extend(code_spans("json", &summary, dim)),
-        _ => header.push(Span::styled(summary, dim)),
+      // Drawn and highlighted as it is typed, so nothing moves or recolours
+      // under the reader when the call is finally made.
+      let mut header = call_lines(&writing.name, &summary, dim);
+      // The cursor follows the model: at the end of the arguments until there
+      // is a body to write into, then at the end of what has arrived.
+      if body.is_empty()
+        && let Some(last) = header.last_mut()
+      {
+        last.spans.push(Span::styled("▌", Style::default().fg(Color::Yellow)));
       }
-      // The cursor follows the model: on the first line until there is a body
-      // to write into, then at the end of what has arrived.
-      if body.is_empty() {
-        header.push(Span::styled("▌", Style::default().fg(Color::Yellow)));
-      }
-      lines.push(Line::from(header));
+      lines.extend(header);
       Preview {
         body,
         // Nothing has gone right or wrong yet, so the plain gutter.
@@ -2308,22 +2288,68 @@ fn gutter(running: bool, is_error: bool) -> Span<'static> {
   }
 }
 
-/// One line of code, so a command reads as the command it is and a call's
-/// arguments as the JSON they are.
+/// Code as the lines it is written on, so a command reads as the command it is
+/// and a call's arguments as the JSON they are.
 ///
-/// Falls back to the plain line when the grammar was not built in, which is
-/// the same text either way.
-fn code_spans(language: &str, code: &str, style: Style) -> Vec<Span<'static>> {
-  crate::highlight::highlight(language, code)
-    .and_then(|lines| lines.into_iter().next())
-    .filter(|spans| !spans.is_empty())
-    .map(|spans| {
-      spans
-        .into_iter()
-        .map(|span| Span::styled(span.content, style.patch(span.style)))
-        .collect()
+/// Falls back to the plain line wherever the grammar was not built in or had
+/// nothing to say about it, which is the same text either way.
+fn code_spans(language: &str, code: &str, style: Style) -> Vec<Vec<Span<'static>>> {
+  let highlighted = crate::highlight::highlight(language, code);
+  code
+    .split('\n')
+    .enumerate()
+    .map(|(i, line)| {
+      match highlighted
+        .as_ref()
+        .and_then(|lines| lines.get(i))
+        .filter(|spans| !spans.is_empty())
+      {
+        Some(spans) => spans
+          .iter()
+          .map(|span| Span::styled(span.content.clone(), style.patch(span.style)))
+          .collect(),
+        None => vec![Span::styled(line.to_string(), style)],
+      }
     })
-    .unwrap_or_else(|| vec![Span::styled(code.to_string(), style)])
+    .collect()
+}
+
+/// A call as the transcript announces it: the tool's name, then the arguments
+/// `summary` made of them, over as many lines as they were written on.
+///
+/// A command is code, and reads as code. So is what a tool the agent did not
+/// bring is being asked for: nothing here knows what its arguments mean, so
+/// they are shown as the JSON they arrived as. A script written over several
+/// lines is shown over all of them, indented to where its first line starts so
+/// it reads as the one block it is — and so a line arriving only ever adds to
+/// what is on screen, rather than moving it.
+fn call_lines(name: &str, summary: &str, style: Style) -> Vec<Line<'static>> {
+  const MARK: &str = "⚙ ";
+  let body = match name {
+    "bash" => code_spans("bash", summary, style),
+    name if !crate::tools::BUILT_IN.contains(&name) => code_spans("json", summary, style),
+    _ => summary
+      .split('\n')
+      .map(|line| vec![Span::styled(line.to_string(), style)])
+      .collect(),
+  };
+  let indent = " ".repeat(MARK.chars().count() + name.chars().count() + 1);
+  body
+    .into_iter()
+    .enumerate()
+    .map(|(i, code)| {
+      let mut spans = match i {
+        0 => vec![
+          Span::styled(MARK, Style::default().fg(Color::Yellow)),
+          Span::styled(name.to_string(), Style::default().fg(Color::Yellow).bold()),
+          Span::raw(" "),
+        ],
+        _ => vec![Span::raw(indent.clone())],
+      };
+      spans.extend(code);
+      Line::from(spans)
+    })
+    .collect()
 }
 
 /// Where the call `call` was announced.
@@ -2752,7 +2778,10 @@ fn first_line(text: &str) -> String {
 fn summarize_args(name: &str, args: &serde_json::Value) -> String {
   let get = |k: &str| args.get(k).and_then(|v| v.as_str()).map(str::to_string);
   let summary = match name {
-    "bash" => get("command").map(|c| first_line(&c)),
+    // Whole, however many lines it runs to: what a call is about to do is the
+    // part worth reading in full. The trailing newline a heredoc ends on is
+    // not a line of it.
+    "bash" => get("command").map(|c| c.trim_end().to_string()),
     "read" => get("path").map(|p| {
       match (
         args.get("offset").and_then(|v| v.as_u64()),
@@ -2801,7 +2830,7 @@ fn writing_summary(name: &str, args: &str) -> String {
     "read" | "write" | "edit" => "path",
     _ => return String::new(),
   };
-  partial_str(args, key).map(|text| first_line(&text)).unwrap_or_default()
+  partial_str(args, key).unwrap_or_default()
 }
 
 /// The text a call is carrying in its arguments, as far as it has arrived,
@@ -3192,9 +3221,9 @@ mod tests {
     // An escape that is itself half here waits rather than showing a stray
     // backslash.
     assert_eq!(quote(r#"{"command":"echo \"#), "echo ");
-    // Only the first line, marked as having more, exactly as the finished
-    // summary shows the same command.
-    assert_eq!(quote(r#"{"command":"one\ntwo"#), "one …");
+    // Every line of it, exactly as the finished summary shows the same
+    // command.
+    assert_eq!(quote(r#"{"command":"one\ntwo"#), "one\ntwo");
     assert_eq!(
       quote(r#"{"command":"one\ntwo"}"#),
       summarize_args("bash", &serde_json::json!({ "command": "one\ntwo" }))
@@ -3268,9 +3297,42 @@ mod tests {
 
   #[test]
   fn a_command_has_nothing_to_show_below_its_line() {
-    // Everything bash has to say fits on the one line; the block is for the
-    // tools that carry a file in their arguments.
+    // A command is drawn on the call's own lines; the block under them is for
+    // the tools that carry a file in their arguments.
     assert_eq!(writing_body("bash", r#"{"command":"ls -la"#), []);
+  }
+
+  /// Drawn lines as their text, with the styling dropped.
+  fn drawn(lines: &[Line<'static>]) -> Vec<String> {
+    lines
+      .iter()
+      .map(|line| line.spans.iter().map(|span| span.content.as_ref()).collect())
+      .collect()
+  }
+
+  #[test]
+  fn a_script_is_announced_over_every_line_it_was_written_on() {
+    // A multi-line command is what the call will do, so all of it is on
+    // screen — later lines indented to where the first one starts.
+    let summary = summarize_args(
+      "bash",
+      &serde_json::json!({ "command": "for f in *; do\n  wc -l $f\ndone\n" }),
+    );
+    assert_eq!(summary, "for f in *; do\n  wc -l $f\ndone");
+    assert_eq!(
+      drawn(&call_lines("bash", &summary, Style::default())),
+      ["⚙ bash for f in *; do", "         wc -l $f", "       done"]
+    );
+    // And a command of one line is still the one line it was.
+    assert_eq!(
+      drawn(&call_lines("bash", "ls -la", Style::default())),
+      ["⚙ bash ls -la"]
+    );
+  }
+
+  #[test]
+  fn a_call_with_no_arguments_to_show_is_still_a_line() {
+    assert_eq!(drawn(&call_lines("mystery", "", Style::default())), ["⚙ mystery "]);
   }
 
   #[test]
