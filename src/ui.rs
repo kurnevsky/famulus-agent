@@ -1875,6 +1875,7 @@ impl App {
               gutter: stripe.clone(),
               cap,
               expanded: self.expand_tools,
+              width: width as usize,
               from_end,
               cursor: false,
             }
@@ -1905,6 +1906,7 @@ impl App {
               gutter: stripe.clone(),
               cap: IMAGE_LINES,
               expanded: self.expand_tools,
+              width: width as usize,
               from_end: false,
               cursor: false,
             }
@@ -1995,6 +1997,7 @@ impl App {
         gutter: gutter(true, false),
         cap: TOOL_OUTPUT_LINES,
         expanded: self.expand_tools,
+        width: width as usize,
         // The tail is what is being written; what came before is already said.
         from_end: true,
         cursor: true,
@@ -2224,6 +2227,8 @@ struct Preview {
   gutter: Span<'static>,
   cap: usize,
   expanded: bool,
+  /// The columns the transcript has, which is what a folded line is cut to.
+  width: usize,
   /// Keep the end rather than the start, for text whose point is its latest.
   from_end: bool,
   /// Mark the last line kept as where the model has got to.
@@ -2237,6 +2242,7 @@ impl Preview {
       gutter,
       cap,
       expanded,
+      width,
       from_end,
       cursor,
     } = self;
@@ -2246,7 +2252,15 @@ impl Preview {
     };
     let row = |line: Vec<Span<'static>>, tip: bool| {
       let mut spans = vec![Span::raw("  "), gutter.clone()];
-      spans.extend(line);
+      // Folded, a line is a row: one that wraps spends rows the fold was
+      // counting, so a block held to ten lines could still fill the screen.
+      // Unfolding shows the rest — of a long line as much as of a long block.
+      spans.extend(match expanded {
+        true => line,
+        // The two columns of indent, the gutter, and the cursor when there is
+        // one, are the room the text does not have.
+        false => clip(line, width.saturating_sub(3 + usize::from(tip))),
+      });
       if tip {
         spans.push(Span::styled("▌", Style::default().fg(Color::Yellow)));
       }
@@ -2271,6 +2285,51 @@ impl Preview {
       out.push(row(note(hidden, false), false));
     }
   }
+}
+
+/// A line's spans cut to `width` columns with an ellipsis where the rest of it
+/// was, or as they are when they fit.
+///
+/// Columns rather than characters, since what is being fitted is a terminal,
+/// and the styling of what is kept is kept with it: a clipped line is the same
+/// line, shorter.
+fn clip(line: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+  use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+  if line.iter().map(|span| span.content.width()).sum::<usize>() <= width {
+    return line;
+  }
+  // Nowhere to put even the ellipsis: the transcript is narrower than its own
+  // gutter, and there is nothing useful to say in what is left.
+  if width == 0 {
+    return Vec::new();
+  }
+  let mut out: Vec<Span<'static>> = Vec::with_capacity(line.len() + 1);
+  let mut used = 0;
+  for span in line {
+    let span_width = span.content.width();
+    // A column short of the width, since the ellipsis is going to want one.
+    if used + span_width < width {
+      used += span_width;
+      out.push(span);
+      continue;
+    }
+    // The span the line runs out in, kept as far as it goes.
+    let mut kept = String::new();
+    for c in span.content.chars() {
+      let w = c.width().unwrap_or(0);
+      if used + w + 1 > width {
+        break;
+      }
+      kept.push(c);
+      used += w;
+    }
+    if !kept.is_empty() {
+      out.push(Span::styled(kept, span.style));
+    }
+    break;
+  }
+  out.push(Span::styled("…", mark_style(None)));
+  out
 }
 
 /// The stripe down the side of a finished tool's output, saying how it went.
@@ -3333,6 +3392,57 @@ mod tests {
   #[test]
   fn a_call_with_no_arguments_to_show_is_still_a_line() {
     assert_eq!(drawn(&call_lines("mystery", "", Style::default())), ["⚙ mystery "]);
+  }
+
+  #[test]
+  fn a_line_too_long_for_the_width_is_cut_to_it() {
+    let plain = |line: &str| vec![Span::raw(line.to_string())];
+    // What fits is left alone, ellipsis and all.
+    assert_eq!(text(&[clip(plain("short"), 10)]), ["short"]);
+    // What does not is cut to the width, with the ellipsis inside it rather
+    // than one column past it.
+    assert_eq!(text(&[clip(plain("0123456789abc"), 10)]), ["012345678…"]);
+    // Columns, not characters: a wide one takes two of them.
+    assert_eq!(text(&[clip(plain("ありがとう"), 5)]), ["あり…"]);
+    // Narrower than the ellipsis itself, there is nothing to say.
+    assert_eq!(clip(plain("anything"), 0), []);
+    // A clipped line is the same line, shorter: what is kept keeps its colour.
+    let clipped = clip(
+      vec![
+        Span::styled("keep", Style::default().fg(Color::Green)),
+        Span::styled("cut", Style::default().fg(Color::Red)),
+      ],
+      6,
+    );
+    assert_eq!(text(std::slice::from_ref(&clipped)), ["keepc…"]);
+    assert_eq!(clipped[0].style.fg, Some(Color::Green));
+    assert_eq!(clipped[1].style.fg, Some(Color::Red));
+  }
+
+  #[test]
+  fn only_a_folded_block_cuts_its_lines() {
+    let long = "x".repeat(40);
+    let block = |expanded| {
+      let mut out = Vec::new();
+      Preview {
+        body: vec![vec![Span::raw(long.clone())]],
+        gutter: gutter(false, false),
+        cap: TOOL_OUTPUT_LINES,
+        expanded,
+        width: 20,
+        from_end: false,
+        cursor: false,
+      }
+      .draw(&mut out);
+      out
+    };
+    // Folded, the line is a row: cut to the width the transcript has, indent
+    // and gutter included.
+    let folded = drawn(&block(false));
+    assert_eq!(folded, ["   ".to_string() + &"x".repeat(16) + "…"]);
+    // Unfolded, it is whole, for the terminal to wrap as it likes.
+    assert_eq!(folded[0].chars().count(), 20);
+    assert_eq!(drawn(&block(true)), [format!("   {long}")]);
   }
 
   #[test]

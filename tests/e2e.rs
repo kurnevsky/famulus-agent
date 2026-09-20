@@ -815,6 +815,49 @@ fn a_tall_image_folds_like_any_other_output_and_ctrl_o_unfolds_it() {
   );
 }
 
+#[test]
+fn a_folded_line_is_cut_to_the_width_and_ctrl_o_gives_it_back() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "",
+      tool: "bash",
+      // Printed rather than written out, so the only long line on screen is
+      // the output and not the command that made it.
+      args: serde_json::json!({ "command": "printf 'x%.0s' $(seq 200); echo" }),
+    },
+    Turn::Say("That is all."),
+  ]);
+  let term = Term::start("long-line", &provider, &["--no-session"]);
+  term.submit("do it");
+  term.wait_for("That is all.");
+
+  // Folded, a line is a row: cut to the terminal, with the rest of it marked.
+  let screen = term.wait_for("xxxx");
+  let rows: Vec<&str> = screen
+    .lines()
+    .map(str::trim_end)
+    .filter(|l| l.contains("xxxx"))
+    .collect();
+  assert_eq!(rows.len(), 1, "a folded line takes one row:\n{screen}");
+  assert!(rows[0].ends_with('…'), "and says there is more:\n{screen}");
+
+  // Unfolded, it is whole again, wrapped over as many rows as it takes.
+  term.type_in("C-o");
+  let unfolded = poll(|| {
+    let screen = term.screen();
+    (screen.lines().filter(|line| line.contains("xxxx")).count() > 1).then_some(screen)
+  });
+  let shown: usize = unfolded
+    .lines()
+    .filter(|line| line.contains("xxxx"))
+    .map(|line| line.matches('x').count())
+    .sum();
+  assert_eq!(shown, 200, "ctrl+o gives back every column of it:\n{unfolded}");
+}
+
 /// Wait for the screen to say something the `wait_for` needle cannot — that
 /// a fold note has gone, say.
 fn poll(mut ready: impl FnMut() -> Option<String>) -> String {
