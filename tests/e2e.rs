@@ -31,6 +31,8 @@ enum Turn {
   },
   /// Say this and stop.
   Say(&'static str),
+  /// Think aloud first, then say this — what a local reasoning server sends.
+  Think { thought: &'static str, say: &'static str },
   /// Answer with the question, so the two ways a conversation went can be
   /// told apart on screen by what was asked down each.
   Echo,
@@ -84,6 +86,11 @@ impl Provider {
     self.seen.lock().expect("lock").iter().any(|body| body.contains(needle))
   }
 
+  /// Every request body, in the order they arrived.
+  fn bodies(&self) -> Vec<String> {
+    self.seen.lock().expect("lock").clone()
+  }
+
   /// The first request that carried `needle`, for asking what else was in it
   /// — which is how "when was this sent" is answered.
   fn request(&self, needle: &str) -> String {
@@ -127,6 +134,7 @@ fn serve(mut stream: TcpStream, script: &[Turn], seen: &Mutex<Vec<String>>) -> s
   if !body.contains("\"stream\":true") {
     let text = match turn {
       Turn::Say(text) => text.to_string(),
+      Turn::Think { say, .. } => say.to_string(),
       Turn::Echo => answer_to(&body),
       Turn::Call { say, .. } => say.to_string(),
     };
@@ -143,6 +151,14 @@ fn serve(mut stream: TcpStream, script: &[Turn], seen: &Mutex<Vec<String>>) -> s
     stream.flush()
   };
   match turn {
+    Turn::Think { thought, say } => {
+      chunk(
+        serde_json::json!({ "role": "assistant", "reasoning_content": thought }),
+        None,
+      )?;
+      chunk(serde_json::json!({ "content": say }), None)?;
+      chunk(serde_json::json!({}), Some("stop"))?;
+    }
     Turn::Say(_) | Turn::Echo => {
       let text = match turn {
         Turn::Say(text) => text.to_string(),
@@ -1537,5 +1553,117 @@ fn an_answer_of_ones_own_is_typed_into_the_row_that_offers_it() {
     provider.sent("\\\"Which cache?\\\"=\\\"redis\\\""),
     "what was typed went back: {}",
     provider.request("Which cache?")
+  );
+}
+
+/// Wait until the provider has taken `n` requests, and hand back every one.
+fn wait_bodies(provider: &Provider, n: usize) -> Vec<String> {
+  let deadline = Instant::now() + Duration::from_secs(15);
+  while Instant::now() < deadline {
+    let bodies = provider.bodies();
+    if bodies.len() >= n {
+      return bodies;
+    }
+    std::thread::sleep(Duration::from_millis(50));
+  }
+  panic!("waited for {n} requests, only {} arrived", provider.bodies().len());
+}
+
+/// A reopened session asks the model exactly what an unbroken one would.
+///
+/// Every server worth talking to keeps the prompt it has already read and
+/// starts again where the next one parts company with it. So a reload that
+/// changes any byte ahead of the new message — the system prompt, the tools,
+/// an id inside the transcript — is the whole conversation read again before
+/// a token comes back, however faithfully the screen was redrawn.
+///
+/// The check is the request itself, against the one the same conversation
+/// sends with nothing closed in the middle of it: same prompt, same tools,
+/// same transcript, byte for byte. What goes into it is everything a reload
+/// has to rebuild rather than remember — an image a tool read, a call and its
+/// answer, what the model thought, and a turn that was interrupted and kept.
+#[test]
+fn a_reopened_session_asks_for_byte_for_byte_what_it_would_have_asked_for() {
+  if !have_tmux() {
+    return;
+  }
+  let script = vec![
+    Turn::Call {
+      say: "",
+      tool: "read",
+      args: serde_json::json!({ "path": "red.png" }),
+    },
+    Turn::Call {
+      say: "Looking. ",
+      tool: "bash",
+      args: serde_json::json!({ "command": "sleep 60" }),
+    },
+    Turn::Think {
+      thought: "A red one.",
+      say: "A red square.",
+    },
+  ];
+
+  // The same conversation twice, once with the session closed and reopened
+  // partway through it, and what each asked the model for afterwards.
+  let asked = |reopened: bool| -> String {
+    let provider = Provider::start(script.clone());
+    let term = Term::start("reopened-request", &provider, &[]);
+    let red = image::ImageBuffer::from_pixel(16, 16, image::Rgb([220u8, 20, 60]));
+    image::DynamicImage::ImageRgb8(red)
+      .save(term.dir.join("red.png"))
+      .expect("an image to read");
+    // A turn the user stopped partway through: its work is kept, and it is
+    // part of the conversation from here on.
+    term.submit("look at red.png");
+    term.wait_for("⚙ bash sleep 60");
+    term.type_in("Escape");
+    term.wait_for("Aborted.");
+    term.settle();
+    term.submit("and again");
+    term.wait_for("A red square.");
+    term.settle();
+
+    let so_far = provider.bodies().len();
+    let term = match reopened {
+      true => {
+        let term = term.reopen(&provider, &["-c"]);
+        term.wait_for("Resumed session");
+        term
+      }
+      false => term,
+    };
+    term.submit("carry on");
+    let asked = wait_bodies(&provider, so_far + 1).last().expect("a request").clone();
+    term.settle();
+    asked
+  };
+
+  let unbroken = asked(false);
+  let reopened = asked(true);
+  let common = unbroken
+    .as_bytes()
+    .iter()
+    .zip(reopened.as_bytes())
+    .take_while(|(one, other)| one == other)
+    .count();
+  // Only the window around the parting is worth printing: the whole of either
+  // request is the system prompt and every tool schema again. Where the two
+  // part company is a byte, which need not be where a character starts.
+  let window = |text: &str| {
+    let boundary = |mut at: usize| {
+      while !text.is_char_boundary(at) {
+        at -= 1;
+      }
+      at
+    };
+    let from = boundary(common.min(text.len()));
+    text[from..boundary((from + 200).min(text.len()))].to_string()
+  };
+  assert!(
+    unbroken == reopened,
+    "the reopened session asks for something else from byte {common}:\n  unbroken: {}\n  reopened: {}",
+    window(&unbroken),
+    window(&reopened),
   );
 }
