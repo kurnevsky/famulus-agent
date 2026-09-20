@@ -302,10 +302,27 @@ mouse usually requires holding `Shift`.
   highlight queries and are used as they come, except Haskell, whose query is
   written for neovim's pattern precedence and needs one of our own.
 - `src/ui.rs` – ratatui app: transcript, input, footer.
+- `tests/e2e.rs` – the binary driven through tmux against a mock provider: a
+  call written token by token and its output landing under it, pass and fail
+  as the stripe beside each, an aborted run keeping its work and carrying on
+  from it, and a reopened session reading exactly as it did before.
 
 ## Testing
 
-`src/agent.rs` has an end-to-end test that runs against a mock server when
+```sh
+cargo test
+```
+
+`tests/e2e.rs` runs the real binary under tmux against a scripted mock of an
+OpenAI-compatible server, types at it, and reads the screen back with
+`capture-pane`. tmux does the terminal emulation, so what comes back is what a
+person would have seen — wrapping, overwriting, colours and all, which is
+where most of this program's behaviour lives and none of which a unit test can
+reach. The mock decides which turn to play from the request rather than
+counting, so a resumed session picks up where the last one left off. Without
+tmux installed these skip rather than fail.
+
+`src/agent.rs` also has an end-to-end test against a mock server when
 `FA_TEST_BASE_URL` is set; without it the test is skipped.
 
 ```sh
