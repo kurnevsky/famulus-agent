@@ -3,14 +3,15 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use rig_agent::agent::{
-  Agent, AgentBuilder, AgentHook, CompletionCallAction, CompletionCallEvent, HookContext, MultiTurnStreamItem,
-  RequestPatch, StreamingError, ToolCall, ToolCallAction, ToolResultAction, ToolResultEvent,
+  Agent, AgentBuilder, AgentHook, CompletionCallAction, CompletionCallEvent, HookContext, ModelTurnAction,
+  ModelTurnFinished, MultiTurnStreamItem, RequestPatch, StreamingError, ToolCall, ToolCallAction, ToolResultAction,
+  ToolResultEvent,
 };
 use rig_agent::client::AgentClientExt;
 use rig_agent::completion::PromptError;
@@ -73,14 +74,21 @@ pub enum AgentEvent {
     /// Numbered diff for `edit`, shown in place of the output text.
     diff: Option<String>,
   },
-  /// The run finished. `messages` holds only this run's new transcript
-  /// messages (prompt, tool calls/results, final answer); append them to the
-  /// history. `context_tokens` is the size of the last completion request
-  /// as reported by the provider (0 if it reported nothing).
-  Done {
-    messages: Vec<Message>,
+  /// What one model call cost, sent as soon as that call comes back rather
+  /// than when the run ends: a run of twenty turns moves the counters twenty
+  /// times, and a run that never reaches an answer still says what it spent.
+  /// `context_tokens` is how big that request was — the provider's own count
+  /// when it gives one, and what the request was weighed at before it went
+  /// out when it does not.
+  Usage {
     usage: Usage,
     context_tokens: u64,
+  },
+  /// The run finished. `messages` holds only this run's new transcript
+  /// messages (prompt, tool calls/results, final answer); append them to the
+  /// history.
+  Done {
+    messages: Vec<Message>,
   },
   /// The `ask` tool wants the user to answer something. The dialog the UI
   /// opens sends what they said back down `reply`; dropping it instead is a
@@ -102,12 +110,19 @@ pub struct Agents {
   pub summarizer: Arc<Agent>,
   /// Raised while a message the user typed is waiting behind the run.
   pub waiting: Waiting,
+  /// Raised when the context has outgrown the window.
+  pub overflow: Overflow,
 }
 
 /// Whether something the user typed is waiting to be sent. The UI raises it,
 /// the run reads it at each turn boundary, so a message that arrives mid-run
 /// is taken at the next opportunity rather than after the whole answer.
 pub type Waiting = Arc<AtomicBool>;
+
+/// Whether the conversation has grown past what the context window holds. The
+/// run raises it as soon as a request goes over the limit and stops at its
+/// next turn boundary; the UI takes it back down once it has compacted.
+pub type Overflow = Arc<AtomicBool>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provider {
@@ -153,31 +168,88 @@ struct UiHook {
   /// everything. Per turn is the only place rig takes it, so it is said again
   /// every turn.
   tools: Option<Vec<String>>,
+  /// What the context window holds and when to make room in it.
+  compaction: Settings,
+  overflow: Overflow,
+  /// How much of the conversation the provider has counted, and what it said.
+  tally: Mutex<Tally>,
+}
+
+/// What the last answered request cost, and how much of the conversation that
+/// figure covers.
+///
+/// A provider counts the request it was sent, so its figure is the truth
+/// about everything up to the answer it gave — and says nothing about what a
+/// tool has returned since. Holding the two apart is what keeps the guessing
+/// down to the few messages nobody has counted yet.
+#[derive(Default)]
+struct Tally {
+  /// The provider's own count for the request it has answered, or 0 while it
+  /// has answered none — or reports nothing.
+  reported: u64,
+  /// How many messages that count covers: everything the request carried,
+  /// and the answer its output tokens paid for.
+  counted: usize,
+  /// How many the request in flight carries, to become `counted` once it is
+  /// answered.
+  sent: usize,
+  /// What the context last weighed, for the turn to report when the provider
+  /// will not say.
+  estimated: u64,
 }
 
 impl AgentHook for UiHook {
   /// Stop before the next model call when the user has said something since
-  /// the run started, so their message is the next thing the model reads.
+  /// the run started, or when the conversation no longer fits the context
+  /// window — so their message is the next thing the model reads, and so the
+  /// room to read it in is made before the request that needs it goes out.
   ///
   /// Between turns is the only place a run can be cut without leaving a call
   /// unanswered: every tool the turn just ended asked for has come back. The
-  /// run's work is kept the way an abort keeps it, and the waiting message is
-  /// sent as a fresh run over that history — which is what the model would
-  /// have seen had it been typed a moment earlier.
+  /// run's work is kept the way an abort keeps it, and what comes next — the
+  /// waiting message, or the same run picked back up over a compacted
+  /// history — is sent as a fresh run over it. Which is what the model would
+  /// have seen had the message been typed a moment earlier, or had the
+  /// summary been written a moment before it was needed.
   ///
   /// Never before the first call, where the run has done nothing yet: the
-  /// message it stopped for would start a run that stops for the next one.
+  /// message it stopped for would start a run that stops for the next one,
+  /// and a compaction it stopped for would be handed the same history again.
   async fn on_completion_call(&self, _ctx: &HookContext, event: CompletionCallEvent<'_>) -> CompletionCallAction {
-    if event.turn > 1 && self.waiting.load(Ordering::Relaxed) {
+    // Weighed before it is sent, rather than only once the answer to it has
+    // come back: a tool can return a file the size of the window, and the
+    // request carrying it is the one that would be refused.
+    let context = self.weigh_request(event.history, event.prompt, event.turn);
+    self.weigh(context);
+    if event.turn > 1 {
       // The reason is rig's to carry, not anything this program reads: the
       // stop comes back as a `PromptCancelled` and `start_run` knows it by
       // that, not by what it says. It is here for a stack trace to say.
-      return CompletionCallAction::Stop("a message is waiting to be sent".into());
+      if self.waiting.load(Ordering::Relaxed) {
+        return CompletionCallAction::Stop("a message is waiting to be sent".into());
+      }
+      if self.overflow.load(Ordering::Relaxed) {
+        return CompletionCallAction::Stop("the context window is full".into());
+      }
     }
     match &self.tools {
       Some(tools) => CompletionCallAction::Patch(RequestPatch::new().active_tools(tools.clone())),
       None => CompletionCallAction::Continue,
     }
+  }
+
+  /// Report what a call cost as soon as it comes back. Rig hands the whole
+  /// run's usage back at the end too, but a run is many calls and an hour of
+  /// them is a long time to say nothing — and a run that ends in an error or
+  /// an abort never gets to the end at all.
+  async fn on_model_turn_finished(&self, _ctx: &HookContext, event: ModelTurnFinished<'_>) -> ModelTurnAction {
+    let context_tokens = self.record(&event.usage);
+    let _ = self.tx.send(AgentEvent::Usage {
+      usage: event.usage,
+      context_tokens,
+    });
+    self.weigh(context_tokens);
+    ModelTurnAction::Continue
   }
 
   async fn on_tool_call(&self, _ctx: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
@@ -225,6 +297,56 @@ impl AgentHook for UiHook {
   }
 }
 
+impl UiHook {
+  /// What the request about to go out comes to: the provider's own count of
+  /// everything it has already weighed, plus a chars/4 estimate of what has
+  /// been said since — the tool results it has never seen. Nothing it has
+  /// counted is guessed at, which is as close as a client gets without a
+  /// tokenizer of its own.
+  fn weigh_request(&self, history: &[Message], prompt: &Message, turn: usize) -> u64 {
+    let mut tally = self.tally.lock().expect("a tally nobody panicked holding");
+    // A run starts over. The history it was handed is not the one the last
+    // run's figure was counted against: compacting rewrites it, and so does
+    // moving the session to another point of itself.
+    if turn == 1 {
+      *tally = Tally::default();
+    }
+    let counted = tally.counted.min(history.len());
+    let context = tally.reported
+      + compaction::estimate_tokens(&history[counted..])
+      + compaction::estimate_tokens(std::slice::from_ref(prompt));
+    tally.sent = history.len() + 1;
+    tally.estimated = context;
+    context
+  }
+
+  /// Take the provider's word for what the answered request held, and say
+  /// how big the context now is. A provider that reports nothing leaves the
+  /// estimate standing.
+  fn record(&self, usage: &Usage) -> u64 {
+    let mut tally = self.tally.lock().expect("a tally nobody panicked holding");
+    match usage.input_tokens + usage.output_tokens {
+      0 => tally.estimated,
+      reported => {
+        tally.reported = reported;
+        // Everything the request carried, and the answer it was charged for
+        // — which is the next request's last message but one.
+        tally.counted = tally.sent + 1;
+        reported
+      }
+    }
+  }
+
+  /// Mark the context as full when a request of `context_tokens` no longer
+  /// leaves the window room to answer in. Only ever raised here: the UI takes
+  /// it back down when it has made the room.
+  fn weigh(&self, context_tokens: u64) {
+    if compaction::should_compact(context_tokens, &self.compaction) {
+      self.overflow.store(true, Ordering::Relaxed);
+    }
+  }
+}
+
 pub fn build_agents(
   cfg: &Config,
   cwd: &Path,
@@ -268,6 +390,7 @@ pub fn build_agents(
   let output_tx = tx.clone();
   let ask_tx = tx.clone();
   let waiting = Waiting::default();
+  let overflow = Overflow::default();
   let agent = agent
     .preamble(&preamble)
     .default_max_turns(cfg.max_turns)
@@ -275,6 +398,9 @@ pub fn build_agents(
       tx,
       waiting: waiting.clone(),
       tools: cfg.tools.clone(),
+      compaction: cfg.compaction,
+      overflow: overflow.clone(),
+      tally: Mutex::default(),
     })
     .tool(ReadTool {
       cwd: cwd.to_path_buf(),
@@ -304,6 +430,7 @@ pub fn build_agents(
     agent: Arc::new(agent),
     summarizer: Arc::new(summarizer),
     waiting,
+    overflow,
   })
 }
 
@@ -512,17 +639,13 @@ pub fn start_run(
           }),
           _ => None,
         },
-        // Tool calls and results are reported by `UiHook`.
+        // Tool calls and results are reported by `UiHook`, and so is what
+        // each of them cost — by the time a run ends, everything it spent
+        // has already been said.
         Ok(MultiTurnStreamItem::FinalResponse(response)) => {
           sent_done = true;
           Some(AgentEvent::Done {
             messages: response.messages.unwrap_or_default(),
-            usage: response.usage,
-            context_tokens: response
-              .completion_calls
-              .last()
-              .map(|call| call.usage.input_tokens + call.usage.output_tokens)
-              .unwrap_or(0),
           })
         }
         Ok(_) => None,
@@ -641,17 +764,21 @@ mod tests {
       })
       .collect();
     assert_eq!(text, "Hello there! I see 2 messages in history.");
-    let Some(AgentEvent::Done {
-      messages: history,
-      usage,
-      context_tokens,
-    }) = events.last()
-    else {
+    let Some(AgentEvent::Done { messages: history }) = events.last() else {
       panic!("no Done")
     };
     assert_eq!(history.len(), 2, "messages = user + assistant, got {history:?}");
-    assert_eq!(usage.output_tokens, 7);
-    assert_eq!(*context_tokens, 19);
+    // What the call cost is reported by the call, not by the run it belongs
+    // to: this one is the whole run, but a run of twenty turns says it
+    // twenty times.
+    let spent: Vec<(u64, u64)> = events
+      .iter()
+      .filter_map(|e| match e {
+        AgentEvent::Usage { usage, context_tokens } => Some((usage.output_tokens, *context_tokens)),
+        _ => None,
+      })
+      .collect();
+    assert_eq!(spent, [(7, 19)]);
 
     // 2. Tool call -> tool result -> reasoning + final text, continuing the history.
     let events = collect(&agent, history.clone(), "run it", &mut rx, &tx).await;
@@ -667,6 +794,7 @@ mod tests {
           format!("result:{}", if *is_error { "err" } else { "ok" })
         }
         AgentEvent::Done { .. } => "done".into(),
+        AgentEvent::Usage { .. } => "usage".into(),
         AgentEvent::Error(e) => format!("error:{e}"),
         AgentEvent::Ended => "ended".into(),
         AgentEvent::Compacted(_) => "compacted".into(),
@@ -815,6 +943,64 @@ mod tests {
     };
     assert_eq!((compacted.summarized, compacted.kept), (2, 0));
     assert_eq!(compacted.history.len(), 1, "one fresh summary, not nested");
+  }
+
+  /// The provider counts what it was sent; only what has been said since is
+  /// guessed at. Nothing a request was charged for is estimated a second
+  /// time, and a figure counted against one run's history is not carried into
+  /// the next, whose history compaction may have rewritten underneath it.
+  #[test]
+  fn the_context_is_the_providers_own_count_plus_what_it_has_not_seen_yet() {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let hook = UiHook {
+      tx,
+      waiting: Waiting::default(),
+      tools: None,
+      compaction: TEST_SETTINGS,
+      overflow: Overflow::default(),
+      tally: Mutex::default(),
+    };
+    let result = |text: &str| Message::User {
+      content: vec![UserContent::tool_result(
+        "call",
+        "bash",
+        vec![ToolResultContent::text(text)],
+      )],
+    };
+    let asked = Message::user("x".repeat(400));
+    let answered = Message::assistant("y".repeat(400));
+
+    // Nothing counted yet: the whole request is the estimate, 400 chars of
+    // it to the hundred tokens.
+    assert_eq!(hook.weigh_request(&[], &asked, 1), 100);
+    // The provider's figure covers the message it was sent and the answer it
+    // gave, so the next request estimates neither: only the result that came
+    // back after it.
+    assert_eq!(
+      hook.record(&Usage {
+        input_tokens: 500,
+        output_tokens: 20,
+        ..Usage::new()
+      }),
+      520
+    );
+    let history = vec![asked.clone(), answered.clone()];
+    assert_eq!(hook.weigh_request(&history, &result(&"z".repeat(800)), 2), 520 + 200);
+    // Two results in the same turn: the one in the history is estimated
+    // alongside the one being sent, and still nothing before them.
+    let history = vec![asked.clone(), answered.clone(), result(&"z".repeat(800))];
+    assert_eq!(
+      hook.weigh_request(&history, &result(&"z".repeat(400)), 2),
+      520 + 200 + 100
+    );
+
+    // A provider that says nothing leaves the last weighing standing rather
+    // than reporting the context as empty.
+    assert_eq!(hook.record(&Usage::new()), 520 + 200 + 100);
+
+    // The next run is weighed from scratch: after a compaction the history
+    // those figures were counted against is not this one.
+    assert_eq!(hook.weigh_request(&[], &Message::user("x".repeat(40)), 1), 10);
   }
 
   #[test]

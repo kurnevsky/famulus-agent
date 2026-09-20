@@ -21,7 +21,7 @@ use tokio::task::JoinHandle;
 
 use crate::agent::{AgentEvent, Agents, start_compaction, start_run};
 use crate::ask::{self, Dialog};
-use crate::compaction::{self, SUMMARY_PREFIX, SUMMARY_SUFFIX, Settings};
+use crate::compaction::{SUMMARY_PREFIX, SUMMARY_SUFFIX, Settings};
 use crate::session::{Node, NodeKind, Outcome, Session, SessionInfo, Store};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
@@ -468,6 +468,9 @@ pub struct App {
   run: Option<JoinHandle<()>>,
   /// The background task in `run` is a compaction rather than a model turn.
   compacting: bool,
+  /// That compaction is making room for a run which stopped short of the
+  /// context window, and which carries on once there is some.
+  resuming: bool,
   /// The run in flight, kept for abort recovery.
   in_flight: Option<InFlight>,
   /// Tool calls the model is still writing, oldest first.
@@ -491,9 +494,9 @@ pub struct App {
   /// Rebuilt each draw by moving live entries across, which evicts the rest.
   markdown: HashMap<(u64, u16, bool), Vec<Line<'static>>>,
   usage: Usage,
-  /// Size of the last completion request, for the footer and compaction.
-  /// `None` until the provider reports usage for a request: the figure is
-  /// hidden after compaction rather than shown as an estimate.
+  /// Size of the last completion request, for the footer. `None` until a
+  /// call has come back: after a compaction the figure is hidden rather than
+  /// left saying what the context no longer holds.
   context_tokens: Option<u64>,
   tick: usize,
   quit: bool,
@@ -544,6 +547,7 @@ impl App {
       tx,
       run: None,
       compacting: false,
+      resuming: false,
       in_flight: None,
       writing: Vec::new(),
       outcomes: HashMap::new(),
@@ -1008,6 +1012,8 @@ impl App {
   fn reset_conversation(&mut self) {
     self.queued.clear();
     self.waiting();
+    self.overflowed();
+    self.resuming = false;
     self.usage = Usage::new();
     self.context_tokens = None;
     self.anchor = None;
@@ -1180,9 +1186,16 @@ impl App {
       .store(!self.queued.is_empty(), std::sync::atomic::Ordering::Relaxed);
   }
 
+  /// Whether the run that just ended found the context window full — and
+  /// clear the mark, since answering it is this side's half of the bargain.
+  fn overflowed(&self) -> bool {
+    self.agents.overflow.swap(false, std::sync::atomic::Ordering::Relaxed)
+  }
+
   fn compact(&mut self) {
     if self.session.history.is_empty() {
       self.entries.push(Entry::Info("Nothing to compact.".into()));
+      self.resuming = false;
       self.next_queued();
       return;
     }
@@ -1238,6 +1251,10 @@ impl App {
     // results of this turn are not the next turn's to record.
     self.writing.clear();
     self.outcomes.clear();
+    // Esc is the end of it: a run stopped to be compacted is not resumed
+    // afterwards, and the next one starts with the window weighed afresh.
+    self.overflowed();
+    self.resuming = false;
     if self.compacting {
       self.compacting = false;
       self.entries.push(Entry::Info("Compaction aborted.".into()));
@@ -1391,11 +1408,16 @@ impl App {
       AgentEvent::Error(err) => {
         self.entries.push(Entry::Error(err));
       }
-      AgentEvent::Done {
-        messages,
-        usage,
-        context_tokens,
-      } => {
+      // One model call, counted as it happens: a run that takes twenty of
+      // them moves the footer twenty times rather than sitting still until
+      // it is over.
+      AgentEvent::Usage { usage, context_tokens } => {
+        self.usage.input_tokens += usage.input_tokens;
+        self.usage.output_tokens += usage.output_tokens;
+        self.usage.total_tokens += usage.total_tokens;
+        self.context_tokens = Some(context_tokens);
+      }
+      AgentEvent::Done { messages } => {
         self.run = None;
         self.writing.clear();
         self.close_question();
@@ -1407,18 +1429,11 @@ impl App {
           .session
           .append_with(messages.into_iter().skip(resumed).collect(), &outcomes);
         self.report(result);
-        self.usage.input_tokens += usage.input_tokens;
-        self.usage.output_tokens += usage.output_tokens;
-        self.usage.total_tokens += usage.total_tokens;
-        // Fall back to a chars/4 estimate only when the provider reports
-        // no usage at all.
-        let context_tokens = if context_tokens > 0 {
-          context_tokens
-        } else {
-          compaction::estimate_tokens(&self.session.history)
-        };
-        self.context_tokens = Some(context_tokens);
-        if compaction::should_compact(context_tokens, &self.settings) {
+        // The run ended with its answer, so there is nothing to pick back
+        // up; a context that outgrew the window is still made room in,
+        // before the next message is sent into it.
+        self.resuming = false;
+        if self.overflowed() {
           self.compact();
         } else {
           self.next_queued();
@@ -1429,16 +1444,28 @@ impl App {
         self.writing.clear();
         self.outcomes.clear();
         self.close_question();
+        let full = self.overflowed();
         if self.compacting {
+          // A compaction that did not finish is not worth starting again on
+          // the next turn: the room it was going to make is not coming.
           self.compacting = false;
+          self.resuming = false;
         } else {
           self.recover_in_flight();
+          if full {
+            // The run stopped at a turn boundary to let this happen, and
+            // goes on once there is room again.
+            self.resuming = true;
+            self.compact();
+            return;
+          }
         }
         self.next_queued();
       }
       AgentEvent::Compacted(result) => {
         self.run = None;
         self.compacting = false;
+        let resuming = std::mem::take(&mut self.resuming);
         match result {
           Some(compacted) => {
             let result = self.session.compacted(compacted.history, &compacted.summary);
@@ -1449,8 +1476,21 @@ impl App {
               compacted.summarized, compacted.kept
             )));
             self.entries.push(Entry::Summary(compacted.summary));
+            // What was cut short to make this room carries on where it
+            // stopped — unless the user has said something since, which is
+            // what it would have read next anyway.
+            if resuming && self.queued.is_empty() {
+              self.continue_run();
+              return;
+            }
           }
-          None => self.entries.push(Entry::Info("Nothing to compact.".into())),
+          // Nothing left to summarize but the turn the context is full of.
+          // Carrying on regardless would only fill it again and ask for the
+          // same summary, so this is where it stops and the user decides.
+          None => self.entries.push(Entry::Info(match resuming {
+            true => "The context is full and there is nothing left to compact — /continue to carry on anyway.".into(),
+            false => "Nothing to compact.".to_string(),
+          })),
         }
         self.next_queued();
       }

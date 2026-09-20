@@ -193,8 +193,38 @@ fn serve(mut stream: TcpStream, script: &[Turn], seen: &Mutex<Vec<String>>) -> s
       chunk(serde_json::json!({}), Some("tool_calls"))?;
     }
   }
+  // What the turn cost, in the usage-only chunk a provider sends last when
+  // the request asked for one — which rig's does. Every turn answers the
+  // same for what it wrote, so a run of two says twice as much as a run of
+  // one, which is how a test can tell when it was counted.
+  let prompt_tokens = conversation_tokens(&body);
+  let payload = serde_json::json!({
+    "id": "1", "object": "chat.completion.chunk", "created": 0, "model": "mock",
+    "choices": [],
+    "usage": { "prompt_tokens": prompt_tokens, "completion_tokens": SPENT,
+               "total_tokens": prompt_tokens + SPENT },
+  });
+  stream.write_all(format!("data: {payload}\n\n").as_bytes())?;
   stream.write_all(b"data: [DONE]\n\n")?;
   stream.flush()
+}
+
+/// What the mock says every turn costs to write.
+const SPENT: u64 = 7;
+
+/// How big the conversation in a request is, in the mock's own tokens: a
+/// quarter of the JSON its messages take, leaving out the system prompt —
+/// which is the same size whatever has been said, and is not something
+/// compacting can bring down.
+fn conversation_tokens(body: &str) -> u64 {
+  let body: serde_json::Value = serde_json::from_str(body).unwrap_or_default();
+  body["messages"]
+    .as_array()
+    .into_iter()
+    .flatten()
+    .filter(|message| message["role"] != "system")
+    .map(|message| message.to_string().len() as u64 / 4)
+    .sum()
 }
 
 /// One whole completion, for the requests that are not streamed.
@@ -1142,6 +1172,135 @@ fn a_compacted_conversation_reaches_the_model_as_its_summary() {
     request.contains("and the pomelo"),
     "while the recent turn stays verbatim: {request}"
   );
+}
+
+/// A run is many calls to the model, and what each cost is known the moment
+/// it comes back. Waiting until the run is over to say so leaves the footer
+/// standing still through the long ones — which are the ones worth watching.
+#[test]
+fn what_a_call_cost_is_counted_when_it_comes_back_not_when_the_run_ends() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "",
+      tool: "bash",
+      args: serde_json::json!({ "command": "sleep 2; echo ok" }),
+    },
+    Turn::Say("all done"),
+  ]);
+  let term = Term::start("usage", &provider, &["--no-session"]);
+  term.submit("go");
+  // The first call has been paid for while the command it asked for is
+  // still running — the run has not reported anything yet.
+  let screen = term.wait_for(&format!("{SPENT}↓"));
+  assert!(
+    !screen.contains("all done"),
+    "counted mid-run, before the answer: {screen}"
+  );
+  term.wait_for("all done");
+  let screen = term.screen();
+  assert!(
+    screen.contains(&format!("{}↓", SPENT * 2)),
+    "the second call adds to the first: {screen}"
+  );
+}
+
+/// The context window fills up mid-run, and the run makes room and carries
+/// on by itself: the user asked for the work, not for a conversation about
+/// how much of it fits.
+#[test]
+fn a_run_that_fills_the_context_window_compacts_and_picks_itself_back_up() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "",
+      tool: "bash",
+      // Slow enough that what the run does after compacting cannot be
+      // mistaken for something it had already done before.
+      args: serde_json::json!({ "command": "sleep 1; echo ok" }),
+    },
+    Turn::Say("all done"),
+  ]);
+  // A window of 1000 tokens with 700 held back for the answer leaves 300 to
+  // say everything in, and a single message of 400 fills it.
+  let term = Term::start(
+    "overflow",
+    &provider,
+    &[
+      "--no-session",
+      "--context-window",
+      "1000",
+      "--reserve-tokens",
+      "700",
+      "--keep-recent-tokens",
+      "1",
+    ],
+  );
+  term.submit(&format!("remember the kumquat {}", "x".repeat(1600)));
+
+  // The run stops at the turn after the one that overflowed, everything
+  // behind it becomes the summary, and it goes on where it stopped without
+  // anything being typed at it.
+  let screen = term.wait_for("Compacted 3 messages into a summary; kept the last 0.");
+  assert!(
+    !screen.contains("all done"),
+    "the run stopped short of its answer to make the room first: {screen}"
+  );
+  term.wait_for("all done");
+
+  // The turn it finished on was asked over the summary, not over what the
+  // summary stands for.
+  let bodies = provider.bodies();
+  let last = bodies
+    .iter()
+    .rfind(|body| !body.contains(SUMMARIZING))
+    .expect("a request that was not the summarizer's");
+  assert!(
+    last.contains("Fruit was discussed.") && !last.contains("kumquat"),
+    "the run carried on over the compacted history: {last}"
+  );
+}
+
+/// When the one turn the context is full of is the turn it is full of, there
+/// is no room to be made: carrying on regardless would fill the window again,
+/// ask for the same summary again, and never stop. So it stops, and says so.
+#[test]
+fn a_context_full_of_a_single_turn_stops_rather_than_compacting_forever() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "",
+      tool: "bash",
+      args: serde_json::json!({ "command": "echo ok" }),
+    },
+    Turn::Say("all done"),
+  ]);
+  // The same full window as above, but keeping the recent turns verbatim —
+  // and one turn is all there is, so the summary would have nothing to say.
+  let term = Term::start(
+    "stuck",
+    &provider,
+    &["--no-session", "--context-window", "1000", "--reserve-tokens", "700"],
+  );
+  term.submit(&format!("remember the kumquat {}", "x".repeat(1600)));
+
+  term.wait_for("nothing left to compact");
+  term.settle();
+  let screen = term.screen();
+  assert!(
+    !screen.contains("all done"),
+    "the run is left where it stopped, for the user to decide: {screen}"
+  );
+  // And `/continue` is the deciding: one more turn goes out, full window or
+  // not, and it is the model's own next step rather than another summary.
+  term.submit("/continue");
+  term.wait_for("all done");
 }
 
 /// MCP is a feature, and a build without it is a build with four tools and no

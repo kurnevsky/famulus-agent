@@ -472,16 +472,42 @@ nothing left to draw.
 
 ## Compaction
 
-After each turn the agent compares the provider-reported context size of the
-last request with `context_window - reserve_tokens`. When it is exceeded (or
-on `/compact`), the older part of the history is rendered as a transcript and
-summarized by the same model into pi's structured checkpoint format (goal,
-progress, decisions, next steps, critical context). The summary replaces those
-messages as a single user message; the most recent turns, about
-`keep_recent_tokens` worth, stay verbatim as entries of their own, so `/tree`
-can still go back to any of them; tool call/result pairs are never split. A
-later compaction updates the existing summary instead of nesting it. The footer
-shows the current context usage as `ctx N%`.
+Every request is weighed against `context_window - reserve_tokens`, both as it
+comes back and before the next one goes out. What a request cost is the
+provider's own count, which is the truth about everything up to the answer it
+gave — and says nothing about what a tool has returned since, which is how a
+single `read` can fill the window between one call and the next. So the
+weighing before a request is that count plus a chars/4 estimate of only the
+messages added after it, and nothing the provider has already counted is ever
+guessed at. A provider that reports no usage leaves the estimate standing for
+the whole conversation, which is the one case where all of it is a guess.
+
+Whichever weighing finds the window full, the run stops at its next turn
+boundary, which is the only place a run can be cut without leaving a tool call
+unanswered: what it got through is kept the way an abort keeps it.
+
+Then the older part of the history is rendered as a transcript and summarized
+by the same model into pi's structured checkpoint format (goal, progress,
+decisions, next steps, critical context). The summary replaces those messages
+as a single user message; the most recent turns, about `keep_recent_tokens`
+worth, stay verbatim as entries of their own, so `/tree` can still go back to
+any of them; tool call/result pairs are never split. Where that cut falls is
+chars/4 and nothing else — it needs a size per message, and no provider
+reports one. A later compaction updates the existing summary instead of
+nesting it.
+
+With the room made, the run picks itself back up where it stopped — unless
+something was typed while it ran, which goes first, as it would have anyway.
+A context full of a single turn is where it ends instead: there is nothing
+left to summarize, and carrying on would only fill the window again and ask
+for the same summary, so it says so and leaves the next move to `/continue`.
+`/compact` does all of this on demand, without waiting for the window to
+fill.
+
+The footer shows the current context usage as `ctx N%`, and what the
+conversation has cost as `N↑ M↓`. Both move as each call comes back rather
+than when the run ends, so a run of twenty turns counts twenty times — and a
+run that ends in an error or an abort still says what it spent.
 
 ## Keys
 
@@ -523,7 +549,10 @@ mouse usually requires holding `Shift`.
   `AgentEvent`s to the UI over a channel. Tool-call argument fragments are
   accumulated per call and sent whole, so the UI has nothing to reassemble.
   Tool calls and results are reported
-  through an `AgentHook`, which carries the call id and an error flag.
+  through an `AgentHook`, which carries the call id and an error flag. The
+  same hook reports what each model call cost as it comes back, and is where
+  a run learns to stop at a turn boundary — for a message typed while it ran,
+  or for a context window that has no room left in it.
   Nothing in rig hands a tool its own call id and the hook that knows it runs
   before the body rather than around it, so for `bash` the hook rewrites the
   arguments to carry it — the one channel between the two. It is stripped from
@@ -578,7 +607,10 @@ mouse usually requires holding `Shift`.
   mid-run waiting at the bottom and going at the next turn, `↑` walking back
   through the prompts of a session and of the one that resumes it, going back into a
   branch the conversation left, forking into a session of its own, a compacted
-  conversation reaching the model as its summary, and a tool from a real MCP
+  conversation reaching the model as its summary, what a call cost being
+  counted while the run it belongs to is still going, a run that fills the
+  window compacting and picking itself back up, a window with nothing left to
+  compact stopping instead of doing it forever, and a tool from a real MCP
   server being offered, called and drawn like any other.
 
 ## Testing
