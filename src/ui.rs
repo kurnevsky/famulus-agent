@@ -1518,9 +1518,12 @@ impl App {
             Span::styled(name.clone(), Style::default().fg(Color::Yellow).bold()),
             Span::raw(" "),
           ];
-          // A command is code, and reads as code.
+          // A command is code, and reads as code. So is what a tool the agent
+          // did not bring is being asked for: nothing here knows what its
+          // arguments mean, so they are shown as the JSON they arrived as.
           match name.as_str() {
-            "bash" => spans.extend(command_spans(summary, dim)),
+            "bash" => spans.extend(code_spans("bash", summary, dim)),
+            name if !crate::tools::BUILT_IN.contains(&name) => spans.extend(code_spans("json", summary, dim)),
             _ => spans.push(Span::styled(summary.clone(), dim)),
           }
           lines.push(Line::from(spans));
@@ -1548,9 +1551,13 @@ impl App {
               (file_lines(path, content), TOOL_OUTPUT_LINES, false)
             }
             (None, Some(diff)) => (marked_lines(diff, true), DIFF_LINES, false),
-            // A command's output is most useful at its end and a file's at
-            // its start, so each keeps the end that matters.
-            (None, None) => (marked_lines(output, false), TOOL_OUTPUT_LINES, name == "bash"),
+            // Structure a tool answered with is worth reading as structure.
+            (None, None) => match structured(name, output) {
+              Some(lines) => (lines, TOOL_OUTPUT_LINES, false),
+              // A command's output is most useful at its end and a file's at
+              // its start, so each keeps the end that matters.
+              None => (marked_lines(output, false), TOOL_OUTPUT_LINES, name == "bash"),
+            },
           };
           Preview {
             body,
@@ -1636,7 +1643,8 @@ impl App {
       // Highlighted as it is typed, so the line does not recolour under the
       // reader when the call is finally made.
       match writing.name.as_str() {
-        "bash" => header.extend(command_spans(&summary, dim)),
+        "bash" => header.extend(code_spans("bash", &summary, dim)),
+        name if !crate::tools::BUILT_IN.contains(&name) => header.extend(code_spans("json", &summary, dim)),
         _ => header.push(Span::styled(summary, dim)),
       }
       // The cursor follows the model: on the first line until there is a body
@@ -1778,6 +1786,12 @@ fn file_lines(path: &str, content: &str) -> Vec<Vec<Span<'static>>> {
     .extension()
     .and_then(|extension| extension.to_str())
     .unwrap_or_default();
+  code_lines(language, content)
+}
+
+/// Lines of code in `language`, highlighted where there is a grammar for it
+/// and plain where there is not.
+fn code_lines(language: &str, content: &str) -> Vec<Vec<Span<'static>>> {
   let highlighted = crate::highlight::highlight(language, content);
   content
     .split('\n')
@@ -1791,6 +1805,27 @@ fn file_lines(path: &str, content: &str) -> Vec<Vec<Span<'static>>> {
       _ => vec![Span::styled(format!(" {line}"), mark_style(None))],
     })
     .collect()
+}
+
+/// What a tool answered, laid out and highlighted as the JSON it is — or
+/// nothing, when it did not answer with any.
+///
+/// Only for the tools the agent did not bring. What `bash` printed is the
+/// command's own to lay out, and a file `read` holds should be seen the way it
+/// is written, so neither is re-indented for being valid JSON. An MCP server's
+/// answer has no such shape of its own: it arrives as one long line, which is
+/// the worst way to read a structure.
+fn structured(name: &str, output: &str) -> Option<Vec<Vec<Span<'static>>>> {
+  if crate::tools::BUILT_IN.contains(&name) {
+    return None;
+  }
+  let value: serde_json::Value = serde_json::from_str(output.trim()).ok()?;
+  // A bare string or number is already the shortest way to say itself.
+  if !value.is_object() && !value.is_array() {
+    return None;
+  }
+  let pretty = serde_json::to_string_pretty(&value).ok()?;
+  Some(code_lines("json", &pretty))
 }
 
 /// Lines of a tool's own text. A diff says what each line is with its first
@@ -1894,12 +1929,13 @@ fn gutter(running: bool, is_error: bool) -> Span<'static> {
   }
 }
 
-/// A command as bash, so a long one reads as the code it is.
+/// One line of code, so a command reads as the command it is and a call's
+/// arguments as the JSON they are.
 ///
 /// Falls back to the plain line when the grammar was not built in, which is
 /// the same text either way.
-fn command_spans(command: &str, style: Style) -> Vec<Span<'static>> {
-  crate::highlight::highlight("bash", command)
+fn code_spans(language: &str, code: &str, style: Style) -> Vec<Span<'static>> {
+  crate::highlight::highlight(language, code)
     .and_then(|lines| lines.into_iter().next())
     .filter(|spans| !spans.is_empty())
     .map(|spans| {
@@ -1908,7 +1944,7 @@ fn command_spans(command: &str, style: Style) -> Vec<Span<'static>> {
         .map(|span| Span::styled(span.content, style.patch(span.style)))
         .collect()
     })
-    .unwrap_or_else(|| vec![Span::styled(command.to_string(), style)])
+    .unwrap_or_else(|| vec![Span::styled(code.to_string(), style)])
 }
 
 /// Where the call `call` was announced.
@@ -2486,6 +2522,58 @@ mod tests {
 
   fn names(matches: &[Match]) -> Vec<&'static str> {
     matches.iter().map(|m| COMMANDS[m.index].0).collect()
+  }
+
+  /// The text of a block of spans, line by line.
+  fn text(lines: &[Vec<Span<'static>>]) -> Vec<String> {
+    lines
+      .iter()
+      .map(|spans| spans.iter().map(|span| span.content.as_ref()).collect())
+      .collect()
+  }
+
+  #[test]
+  fn a_structured_answer_is_laid_out_as_the_structure_it_is() {
+    let answer = r#"{"city":"Berlin","rain":true,"hours":[1,2]}"#;
+    let lines = structured("weather", answer).expect("one long line is the worst way to read this");
+    assert_eq!(
+      text(&lines),
+      [
+        " {",
+        r#"   "city": "Berlin","#,
+        r#"   "rain": true,"#,
+        r#"   "hours": ["#,
+        "     1,",
+        "     2",
+        "   ]",
+        " }",
+      ]
+    );
+
+    // What a command printed is the command's own to lay out, and a file is
+    // to be seen the way it is written — neither is re-indented for being
+    // valid JSON.
+    assert!(structured("bash", answer).is_none());
+    assert!(structured("read", answer).is_none());
+    // Nor is anything that is not a structure to begin with.
+    assert!(structured("weather", "It rains in Berlin.").is_none());
+    assert!(structured("weather", "42").is_none(), "a number says itself");
+    assert!(structured("weather", r#""rain""#).is_none(), "and so does a string");
+  }
+
+  #[cfg(feature = "lang-json")]
+  #[test]
+  fn a_structured_answer_is_highlighted_by_what_it_is() {
+    let lines = structured("weather", r#"{"city":"Berlin"}"#).expect("a structure");
+    let coloured: Vec<&Span<'static>> = lines
+      .iter()
+      .flatten()
+      .filter(|span| span.style.fg.is_some() && !span.content.trim().is_empty())
+      .collect();
+    assert!(
+      coloured.iter().any(|span| span.content.contains("Berlin")),
+      "the values are coloured: {lines:?}"
+    );
   }
 
   #[test]

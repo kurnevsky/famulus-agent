@@ -84,6 +84,13 @@ Tools from [MCP](https://modelcontextprotocol.io) servers sit beside the four
 built-in ones, and the transcript draws them the same way — rig speaks the
 protocol, through `rmcp`, so a server's tool is a tool like any other.
 
+Both halves of such a call are read as the JSON they are: the arguments on the
+call's own line, highlighted the way a command is, and an answer with a shape
+laid out a field to a line rather than left as the one long line it arrived as.
+Only for these tools — what `bash` printed is the command's own to lay out, and
+a file `read` holds should be seen the way it is written, so neither is
+re-indented for being valid JSON.
+
 Servers are declared in `mcp.toml`, a table each, under the name its tools will
 be called by:
 
@@ -137,9 +144,11 @@ Servers come up before the terminal does, and what happened is the first thing
 the transcript says: which server offered how many tools, and what went wrong
 with the rest. The footer keeps a count of both — `2 mcp, 14 tools` — since a
 session with servers is a session with more than the four tools fa was built
-with. A session with no servers says nothing about MCP anywhere. A server that fails, or takes more than 20 seconds to say what
-it offers, is a note rather than a failure — the session still has its own four
-tools, which beats refusing to start. A tool named like one of those four is
+with. A session with no servers says nothing about MCP anywhere.
+
+A server that fails, or takes more than 20 seconds to say what it offers, is a
+note rather than a failure — the session still has its own four tools, which
+beats refusing to start. A tool named like one of those four is
 left alone: the model is told about `read`, `write`, `edit` and `bash` in the
 system prompt, and cannot say which of two it meant.
 
@@ -430,7 +439,8 @@ mouse usually requires holding `Shift`.
 - `src/images.rs` – image preparation for `read`, following pi: magic-byte
   detection, conversion of gif/webp/bmp to PNG, and resizing to fit 2000x2000
   pixels and 4.5 MB of base64 (PNG first, then JPEG at decreasing quality).
-- `src/highlight.rs` – tree-sitter syntax highlighting for code blocks: the
+- `src/highlight.rs` – tree-sitter syntax highlighting for code blocks, a
+  command's own line, and the JSON either half of an MCP call is: the
   grammar registry (one cargo feature per language), the capture-name theme,
   and the per-line spans the markdown renderer draws. Grammars ship their own
   highlight queries and are used as they come, except Haskell, whose query is

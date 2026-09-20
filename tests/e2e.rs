@@ -261,7 +261,9 @@ for line in sys.stdin:
         result = {"tools": TOOLS}
     elif method == "tools/call":
         city = (params.get("arguments") or {}).get("city", "nowhere")
-        result = {"content": [{"type": "text", "text": "It rains in %s." % city}], "isError": False}
+        # Structure, as one long line — which is how a server answers.
+        answer = json.dumps({"city": city, "rain": True, "hours": [1, 2]})
+        result = {"content": [{"type": "text", "text": answer}], "isError": False}
     else:
         result = {}
     sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}) + "\n")
@@ -1015,10 +1017,26 @@ fn a_tool_from_an_mcp_server_is_offered_called_and_drawn_like_any_other() {
     lines[call].contains("Berlin"),
     "its arguments are on its line: {lines:?}"
   );
+  // What the server answered, under the call — and laid out as the structure
+  // it is rather than left as the one long line it arrived as.
   assert!(
-    lines[call + 1].contains("It rains in Berlin."),
-    "what the server answered, under the call: {lines:?}"
+    lines[call + 1].trim_start().starts_with('{'),
+    "under its call: {lines:?}"
   );
+  assert!(
+    lines[call + 2].contains(r#""city": "Berlin","#),
+    "a field to a line, with room to read it: {lines:?}"
+  );
+  // And read as JSON, not as a block of dim text.
+  #[cfg(feature = "lang-json")]
+  {
+    let coloured = term.coloured();
+    let field = coloured
+      .lines()
+      .find(|line| line.contains("Berlin"))
+      .expect("the field on screen");
+    assert!(field.contains("\u{1b}[38;5;"), "highlighted: {field:?}");
+  }
   let _ = std::fs::remove_dir_all(&dir);
 }
 
