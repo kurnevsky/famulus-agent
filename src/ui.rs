@@ -91,6 +91,8 @@ pub struct Options {
   pub notes: Vec<String>,
   /// How many MCP servers came up, and how many tools they brought.
   pub mcp: (usize, usize),
+  /// Whether a question the model asks rings the terminal.
+  pub bell: bool,
 }
 
 /// Slash commands offered by the `/` popup: name, description, takes an argument.
@@ -360,6 +362,8 @@ pub struct App {
   /// How many MCP servers came up, and how many tools they brought, for the
   /// footer to say a session has more than the five it was built with.
   mcp: (usize, usize),
+  /// Whether a question the model asks rings the terminal.
+  bell: bool,
   /// The conversation: history plus its on-disk file.
   session: Session,
   overlay: Option<Overlay>,
@@ -417,6 +421,7 @@ impl App {
       start,
       notes,
       mcp,
+      bell,
     } = options;
     let mut input = TextArea::default();
     input.set_cursor_line_style(Style::default());
@@ -435,6 +440,7 @@ impl App {
       last_scroll: None,
       model,
       mcp,
+      bell,
       cwd,
       store,
       session,
@@ -1218,6 +1224,9 @@ impl App {
       // asked it is waiting on the answer, so there is nothing else to be
       // doing here anyway.
       AgentEvent::AskUser { questions, reply } => {
+        if self.bell {
+          bell();
+        }
         self.overlay = Some(Overlay {
           list: OverlayList::Question {
             dialog: Box::new(Dialog::new(questions)),
@@ -1852,6 +1861,21 @@ fn prefix(lead: &'static str, line: Line<'static>) -> Line<'static> {
   spans.push(Span::raw(lead));
   spans.extend(line.spans);
   Line::from(spans)
+}
+
+/// One terminal bell, rung when the model stops and waits on an answer.
+///
+/// The questionnaire is the one thing in fa that goes nowhere until somebody
+/// comes back to it, and a run is usually left to get on with its work. What a
+/// bell then does — a sound, a flash of the window, a badge, nothing at all —
+/// is the terminal's own business, which is what makes it the right thing to
+/// send: every terminal has already been told how its user wants to be
+/// interrupted, and fa has not.
+fn bell() {
+  use std::io::Write;
+  let mut out = std::io::stdout();
+  let _ = out.write_all(b"\x07");
+  let _ = out.flush();
 }
 
 /// Alt+Enter and Shift+Enter (where the terminal reports it) insert a newline.

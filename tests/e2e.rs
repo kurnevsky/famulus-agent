@@ -461,6 +461,17 @@ impl Term {
     panic!("could not put the cursor on {needle:?}");
   }
 
+  /// Whether the terminal has been rung since anyone last looked at it. tmux
+  /// keeps the flag for a window nobody is watching, which is the case a bell
+  /// is rung for in the first place.
+  fn rang(&self) -> bool {
+    let out = Command::new("tmux")
+      .args(["display-message", "-p", "-t", &self.name, "#{window_bell_flag}"])
+      .output()
+      .expect("tmux answers");
+    String::from_utf8_lossy(&out.stdout).trim() == "1"
+  }
+
   /// What is in the input box, or nothing when it is empty.
   fn typed(&self) -> String {
     let screen = self.screen();
@@ -1272,12 +1283,16 @@ fn a_question_the_model_asked_is_answered_in_a_dialog_and_read_back() {
     Turn::Say("Understood."),
   ]);
   let term = Term::start("asking", &provider, &["--no-session"]);
+  assert!(!term.rang(), "nothing has been asked yet");
   term.submit("add caching");
 
   // The first question is up, with its options and the row to type in.
   // Waiting on a row rather than on the question, which the line announcing
   // the call already says.
   let screen = term.wait_for("› 1. In memory");
+  // And the terminal was rung, since a run nobody is watching has just
+  // stopped and is waiting on an answer.
+  assert!(term.rang(), "the bell rang when the question went up");
   assert!(screen.contains("survives a restart"), "and what each means:\n{screen}");
   assert!(screen.contains("3. Type something."), "{screen}");
   assert!(screen.contains("Tab to switch questions"), "{screen}");
@@ -1341,7 +1356,7 @@ fn a_question_nobody_answers_is_a_decline_and_the_run_carries_on() {
     },
     Turn::Say("I will guess then."),
   ]);
-  let term = Term::start("declining", &provider, &["--no-session"]);
+  let term = Term::start("declining", &provider, &["--no-session", "--no-bell"]);
   term.submit("add caching");
   let screen = term.wait_for("› 1. In memory");
   // One question has no tabs to switch between and nothing to review.
@@ -1350,6 +1365,9 @@ fn a_question_nobody_answers_is_a_decline_and_the_run_carries_on() {
     screen.contains("Cache"),
     "the header, where there is no tab strip:\n{screen}"
   );
+
+  // Started with the bell turned off, the question goes up in silence.
+  assert!(!term.rang(), "--no-bell keeps it quiet:\n{screen}");
 
   term.type_in("Escape");
   term.wait_for("I will guess then.");

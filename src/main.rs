@@ -97,6 +97,10 @@ struct Cli {
   #[arg(long, env = "FA_SCROLLBAR", value_enum, default_value_t = ui::ScrollbarMode::Auto)]
   scrollbar: ui::ScrollbarMode,
 
+  /// Do not ring the terminal when the model asks a question
+  #[arg(long, env = "FA_NO_BELL")]
+  no_bell: bool,
+
   /// MCP servers to start, instead of the mcp.toml in $XDG_CONFIG_HOME/fa
   #[arg(long, env = "FA_MCP_CONFIG")]
   mcp_config: Option<PathBuf>,
@@ -230,6 +234,7 @@ async fn main() -> Result<()> {
       start,
       notes,
       mcp: servers.count(),
+      bell: !cli.no_bell,
     },
   );
 

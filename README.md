@@ -41,6 +41,7 @@ GEMINI_API_KEY=... ./target/release/fa --provider gemini -m gemini-2.5-pro
 | `--no-session` | | | Do not save this session |
 | `--sessions-dir` | `FA_SESSIONS_DIR` | `~/.local/share/fa/sessions` | Where session files live (global) |
 | `--scrollbar` | `FA_SCROLLBAR` | `auto` | Transcript scrollbar: `auto` (while scrolling), `always`, `hidden` |
+| `--no-bell` | `FA_NO_BELL` | | Do not ring the terminal when `ask` puts a question up |
 | `--mcp-config` | `FA_MCP_CONFIG` | XDG search path | Read MCP servers from this file instead |
 | `--no-mcp` | | | Start no MCP servers this session |
 | `--tools` | `FA_TOOLS` | all of them | Offer the model only these tools, by name |
@@ -128,6 +129,12 @@ stops the run it belonged to. Either way the model is told
 `User declined to answer questions` — one signal for "they did not answer",
 rather than one per way of not answering. A run aborted while the dialog is up
 takes the dialog with it.
+
+A question going up rings the terminal once — a plain `BEL`, so what it turns
+into is whatever your terminal has already been told to do with one: a sound, a
+flash of the window, a badge, or nothing. A run is usually left to get on with
+its work, and this is the one thing in fa that goes nowhere until somebody comes
+back to it. `--no-bell` (or `FA_NO_BELL`) keeps it quiet.
 
 `--no-tools ask` takes it away altogether, for a session that should get on
 with it rather than stop to ask — the system prompt then says nothing about
