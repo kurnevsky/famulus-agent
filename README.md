@@ -114,7 +114,7 @@ Submitting with a question left blank is allowed — a partial answer beats a
 dismissed dialog — and the questions left out simply say nothing to the model.
 
 Every question ends with a `Type something.` row, so the options are never a
-cage: walk onto it and it takes the keyboard, `Shift+Enter` breaks a line,
+cage: walk onto it and it takes the keyboard, `Alt+Enter` breaks a line,
 `Ctrl+U` clears it, and the arrows walk the draft before they walk the list
 again. What you type stays in the row while you look at the other options, and
 is kept per question.
@@ -300,6 +300,22 @@ to be fixed and sent again — from an empty box only, where it cannot land on
 top of something half-typed. `Esc` stops the run and what was waiting behind
 it — it stays in the transcript as `Not sent`, since it was typed.
 
+## Prompt history
+
+`↑` walks back through the prompts already sent, `↓` walks forward again, and
+past the newest it hands back whatever was in the box when the walk began.
+Like pi, there is no history file of its own: the prompts come from the
+session, so one resumed with `-c` or `/resume` brings its own back, a new one
+starts empty, and `/tree` or `/fork` rebuilds the list to match the
+conversation now on screen. Slash commands are recalled too as long as the
+session lasts, though the session itself never sees them.
+
+Both keys stay the cursor's while it has a line to move to, so a prompt of
+several lines can still be edited: `↑` walks only from the first line of the
+box and from the start of it — a first press goes there, a second walks back —
+and `↓` only from the last. Editing a recalled prompt ends the walk and keeps
+what it handed back; sending it puts it at the front, where `↑` finds it next.
+
 ## Going back
 
 `/tree` — or `Esc` twice on an empty input box, which is pi's shortcut and its
@@ -473,6 +489,7 @@ shows the current context usage as `ctx N%`.
 |-----|--------|
 | `Enter` | Send (queued if a run is in progress) |
 | `Alt+↑` | Take the last queued message back for editing (empty input) |
+| `↑` / `↓` | Walk back through the prompts already sent, and forward again — from the first/last line of the input |
 | `/` | Command popup: type to fuzzy-filter, `↑`/`↓` move, `Tab`/`Enter` complete, `Esc` dismiss |
 | `Alt+Enter`, `Ctrl+J`, `Shift+Enter`* | Newline |
 | `Esc` | Abort the current run |
@@ -558,7 +575,8 @@ mouse usually requires holding `Shift`.
   as the stripe beside each, an aborted run keeping its work and carrying on
   from it, a reopened session reading exactly as it did before, a session held
   to some of its tools, a message typed
-  mid-run waiting at the bottom and going at the next turn, going back into a
+  mid-run waiting at the bottom and going at the next turn, `↑` walking back
+  through the prompts of a session and of the one that resumes it, going back into a
   branch the conversation left, forking into a session of its own, a compacted
   conversation reaching the model as its summary, and a tool from a real MCP
   server being offered, called and drawn like any other.

@@ -911,7 +911,10 @@ impl Dialog {
     }
     parts.push("Esc to cancel");
     if self.typing {
-      parts.push("Shift+Enter for newline");
+      // The one the input box's own placeholder names, and the one every
+      // terminal reports: Shift+Enter breaks a line here too, but only where
+      // the kitty keyboard protocol says it was pressed.
+      parts.push("Alt+Enter for newline");
       parts.push("Ctrl+U to clear");
     }
     parts.join(" · ")

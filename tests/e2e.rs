@@ -922,6 +922,48 @@ fn asked_twice(test: &str, provider: &Provider, args: &[&str]) -> Term {
 }
 
 #[test]
+fn up_walks_back_through_the_prompts_and_a_resumed_session_brings_its_own() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![Turn::Echo]);
+  let term = asked_twice("history", &provider, &[]);
+
+  term.type_in("unsent");
+  // From the middle of a line, the first Up only goes to the start of it:
+  // reaching the top of something being typed is not also leaving it.
+  term.type_in("Up");
+  term.settle();
+  assert_eq!(term.typed(), "unsent", "still what was being typed");
+
+  term.type_in("Up");
+  term.settle();
+  assert_eq!(term.typed(), "pear", "the prompt before it");
+  term.type_in("Up");
+  term.settle();
+  assert_eq!(term.typed(), "apple");
+  // The oldest is as far back as it goes.
+  term.type_in("Up");
+  term.settle();
+  assert_eq!(term.typed(), "apple");
+
+  term.type_in("Down");
+  term.settle();
+  assert_eq!(term.typed(), "pear");
+  term.type_in("Down");
+  term.settle();
+  assert_eq!(term.typed(), "unsent", "and what was being typed comes back");
+
+  // The prompts are the session's, so reopening it brings them back — there
+  // is no history file of our own, only the conversation.
+  let term = term.reopen(&provider, &["-c"]);
+  term.wait_for("Resumed session");
+  term.type_in("Up");
+  term.settle();
+  assert_eq!(term.typed(), "pear", "the resumed session's last prompt");
+}
+
+#[test]
 fn going_back_leaves_a_branch_that_can_be_walked_into_again() {
   if !have_tmux() {
     return;
@@ -1409,7 +1451,7 @@ fn an_answer_of_ones_own_is_typed_into_the_row_that_offers_it() {
   term.type_in("redis");
   let screen = term.wait_for("redis▌");
   assert!(
-    screen.contains("Shift+Enter for newline"),
+    screen.contains("Alt+Enter for newline"),
     "the hint follows the keys:\n{screen}"
   );
 

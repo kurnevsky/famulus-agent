@@ -13,7 +13,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
 use ratatui::{DefaultTerminal, Frame};
-use ratatui_textarea::{TextArea, WrapMode};
+use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 use rig_core::completion::{Message, Usage};
 use rig_core::message::{AssistantContent, ToolCall, ToolResult, ToolResultContent, UserContent};
 use tokio::sync::{mpsc, oneshot};
@@ -350,6 +350,93 @@ enum Entry {
   Summary(String),
 }
 
+/// The prompts this conversation has been sent, and where `Up` and `Down`
+/// have walked back to among them.
+///
+/// Not a store of its own: the session already holds every prompt it was
+/// told, so resuming one brings its prompts back with it and a new one starts
+/// empty — the walk is over what is on screen, not over everything ever
+/// typed. Slash commands are kept here as they are sent, since they never
+/// reach the session and are worth recalling until it is left.
+#[derive(Default)]
+struct Prompts {
+  /// Oldest first, never two of the same in a row.
+  sent: Vec<String>,
+  /// The walk `Up` started, while one is under way.
+  walk: Option<Walk>,
+}
+
+/// Where a walk back through the prompts has got to.
+struct Walk {
+  /// Which of `sent` is in the input box.
+  at: usize,
+  /// What was in the box when the walk began, for `Down` to hand back.
+  draft: String,
+}
+
+impl Prompts {
+  /// The prompts of a session, in the order it was told them.
+  fn of(session: &Session) -> Self {
+    let mut prompts = Self::default();
+    for message in &session.history {
+      if let Some(text) = crate::session::user_text(message) {
+        prompts.add(text);
+      }
+    }
+    prompts
+  }
+
+  /// Remember a prompt, and end any walk: it has been sent, so the box is
+  /// the user's own again.
+  fn add(&mut self, text: String) {
+    self.walk = None;
+    if text.is_empty() || self.sent.last() == Some(&text) {
+      return;
+    }
+    self.sent.push(text);
+  }
+
+  fn walking(&self) -> bool {
+    self.walk.is_some()
+  }
+
+  fn stop(&mut self) {
+    self.walk = None;
+  }
+
+  /// The prompt before the one in the box, `draft` being what is in it now.
+  /// `None` at the oldest, which leaves the walk standing where it is.
+  fn previous(&mut self, draft: &str) -> Option<String> {
+    let (at, draft) = match self.walk.take() {
+      Some(walk) => match walk.at.checked_sub(1) {
+        Some(at) => (at, walk.draft),
+        None => {
+          self.walk = Some(walk);
+          return None;
+        }
+      },
+      None => (self.sent.len().checked_sub(1)?, draft.to_string()),
+    };
+    let text = self.sent[at].clone();
+    self.walk = Some(Walk { at, draft });
+    Some(text)
+  }
+
+  /// The prompt after it, and past the newest the draft the walk began from.
+  /// `None` when there is no walk to come back from.
+  fn next(&mut self) -> Option<String> {
+    let mut walk = self.walk.take()?;
+    match self.sent.get(walk.at + 1).cloned() {
+      Some(text) => {
+        walk.at += 1;
+        self.walk = Some(walk);
+        Some(text)
+      }
+      None => Some(walk.draft),
+    }
+  }
+}
+
 pub struct App {
   agents: Agents,
   settings: Settings,
@@ -375,6 +462,8 @@ pub struct App {
   last_escape: Option<Instant>,
   entries: Vec<Entry>,
   input: TextArea<'static>,
+  /// What `Up` and `Down` walk back through from the input box.
+  prompts: Prompts,
   tx: mpsc::UnboundedSender<AgentEvent>,
   run: Option<JoinHandle<()>>,
   /// The background task in `run` is a compaction rather than a model turn.
@@ -451,6 +540,7 @@ impl App {
       last_escape: None,
       entries: Vec::new(),
       input,
+      prompts: Prompts::default(),
       tx,
       run: None,
       compacting: false,
@@ -596,13 +686,20 @@ impl App {
       // to be fixed and sent again. Only from an empty box, where it cannot
       // land on top of something half-typed.
       (KeyCode::Up, _) if key.modifiers.contains(KeyModifiers::ALT) && self.input_is_blank() => self.unqueue(),
+      // Up and Down walk back through the prompts already sent, but only from
+      // the ends of the box: inside a prompt of several lines they are still
+      // the cursor's, which is what the walk hands back.
+      (KeyCode::Up, false) if key.modifiers.is_empty() => self.walk_back(),
+      (KeyCode::Down, false) if key.modifiers.is_empty() => self.walk_forward(),
       (KeyCode::PageUp, _) => self.scroll_by(10),
       (KeyCode::PageDown, _) => self.scroll_by(-10),
       (KeyCode::Enter, _) if is_newline(&key) => {
+        self.prompts.stop();
         self.input.insert_newline();
         self.refresh_completion();
       }
       (KeyCode::Char('j'), true) => {
+        self.prompts.stop();
         self.input.insert_newline();
         self.refresh_completion();
       }
@@ -610,6 +707,9 @@ impl App {
       _ => {
         if self.input.input(key) {
           self.completion_dismissed = false;
+          // A recalled prompt that has been edited is the user's text now,
+          // and Down is no longer a way back out of it.
+          self.prompts.stop();
         }
         self.refresh_completion();
       }
@@ -772,13 +872,56 @@ impl App {
     self.scrollbar == ScrollbarMode::Auto && self.last_scroll.is_some_and(|t| t.elapsed() < SCROLLBAR_HIDE_DELAY)
   }
 
-  /// Replace whatever is in the input box, without disturbing the yank buffer
-  /// — the user's own cut text is theirs, not ours to overwrite.
+  /// Replace whatever is in the input box, with text from somewhere other
+  /// than the prompts being walked through — which is what ends the walk.
   fn set_input(&mut self, text: &str) {
+    self.prompts.stop();
+    self.fill_input(text);
+  }
+
+  /// The replacement itself, without disturbing the yank buffer — the user's
+  /// own cut text is theirs, not ours to overwrite.
+  fn fill_input(&mut self, text: &str) {
     self.input.select_all();
     self.input.cut();
     self.input.set_yank_text("");
     self.input.insert_str(text);
+  }
+
+  /// `Up`: the cursor while it has a line above it, and the prompts already
+  /// sent once it is on the first one. From the start of that line, so that
+  /// reaching the top of something being typed is not also leaving it — the
+  /// first press goes there, a second walks back.
+  fn walk_back(&mut self) {
+    let cursor = self.input.screen_cursor();
+    if cursor.row > 0 {
+      self.input.move_cursor(CursorMove::Up);
+      return;
+    }
+    if cursor.col > 0 && !self.prompts.walking() && !self.input_is_blank() {
+      self.input.move_cursor(CursorMove::Head);
+      return;
+    }
+    let draft = self.input.lines().join("\n");
+    if let Some(text) = self.prompts.previous(&draft) {
+      self.fill_input(&text);
+      // At the top of the prompt it just handed back, so that holding Up
+      // keeps walking rather than reading down the one it landed on.
+      self.input.move_cursor(CursorMove::Jump(0, 0));
+    }
+  }
+
+  /// `Down`: the way back, a prompt at a time from the last line of the box,
+  /// ending at whatever was being typed when the walk began.
+  fn walk_forward(&mut self) {
+    let row = self.input.screen_cursor().row;
+    self.input.move_cursor(CursorMove::Down);
+    if !self.prompts.walking() || self.input.screen_cursor().row != row {
+      return;
+    }
+    if let Some(text) = self.prompts.next() {
+      self.fill_input(&text);
+    }
   }
 
   /// Nothing to send: empty, or only whitespace.
@@ -791,6 +934,9 @@ impl App {
     if text.is_empty() {
       return;
     }
+    // Everything sent is worth recalling, commands included — the session
+    // will only remember the prompts.
+    self.prompts.add(text.clone());
     self.set_input("");
     self.completion = None;
     self.anchor = None;
@@ -871,6 +1017,7 @@ impl App {
     self.abort();
     self.session = Session::new(self.store.as_ref(), &self.cwd, &self.model);
     self.entries.clear();
+    self.prompts = Prompts::default();
     self.reset_conversation();
     self.entries.push(Entry::Info("New session.".into()));
   }
@@ -888,6 +1035,9 @@ impl App {
           session.history.len()
         )));
         self.session = session;
+        // The prompts of the conversation being resumed are the ones Up
+        // walks back through in it.
+        self.prompts = Prompts::of(&self.session);
         self.reset_conversation();
       }
       Err(err) => self
@@ -971,6 +1121,9 @@ impl App {
   /// user back the prompt they landed on.
   fn show_point(&mut self, point: &Point, note: String) {
     self.entries = entries_from_history(&self.session);
+    // The conversation is another one now, down to which prompts are behind
+    // the input box.
+    self.prompts = Prompts::of(&self.session);
     self.entries.push(Entry::Info(note));
     // The token counts and the queue belonged to a conversation that is no
     // longer the one we are in.
@@ -2871,6 +3024,52 @@ mod tests {
     points.retain(|point| point.text.is_some());
     assert_eq!(points.len(), 1);
     assert_eq!(points[0].text.as_deref(), Some("look at a.rs"));
+  }
+
+  #[test]
+  fn the_prompts_walked_back_through_are_the_session_s_own() {
+    let mut history = tool_history();
+    // A compaction checkpoint travels as a user message, and is no more a
+    // prompt than the tool result above it is.
+    history.push(Message::user(format!(
+      "{SUMMARY_PREFIX}Files were read.{SUMMARY_SUFFIX}"
+    )));
+    history.push(Message::user("and now b.rs"));
+    let prompts = Prompts::of(&session_of(history));
+    assert_eq!(prompts.sent, ["look at a.rs", "and now b.rs"]);
+  }
+
+  #[test]
+  fn up_walks_back_through_the_prompts_and_down_hands_the_draft_back() {
+    let mut prompts = Prompts::default();
+    prompts.add("first".into());
+    prompts.add("second".into());
+    // The same thing sent twice running is one entry to walk past.
+    prompts.add("second".into());
+
+    assert_eq!(prompts.previous("half-typed").as_deref(), Some("second"));
+    assert_eq!(prompts.previous("").as_deref(), Some("first"));
+    // The oldest is as far back as it goes; the box keeps what it has.
+    assert_eq!(prompts.previous(""), None);
+
+    assert_eq!(prompts.next().as_deref(), Some("second"));
+    // Past the newest is what was being typed when the walk began.
+    assert_eq!(prompts.next().as_deref(), Some("half-typed"));
+    assert!(!prompts.walking());
+    assert_eq!(prompts.next(), None);
+  }
+
+  #[test]
+  fn sending_something_ends_the_walk_it_was_recalled_by() {
+    let mut prompts = Prompts::default();
+    prompts.add("first".into());
+    prompts.previous("");
+    assert!(prompts.walking());
+
+    prompts.add("first, edited".into());
+    assert!(!prompts.walking());
+    // And Up starts again from the newest, which is what was just sent.
+    assert_eq!(prompts.previous("").as_deref(), Some("first, edited"));
   }
 
   #[test]
