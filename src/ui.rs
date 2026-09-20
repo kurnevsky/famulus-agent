@@ -375,10 +375,12 @@ impl App {
     } = options;
     let mut input = TextArea::default();
     input.set_cursor_line_style(Style::default());
-    input.set_placeholder_text(
-      "Ask anything. Enter sends, Alt+Enter inserts a newline, /new /resume /compact, Ctrl+C quits.",
-    );
-    input.set_placeholder_style(Style::default().dim());
+    // Not a list of commands: `/` opens one that is complete and filters
+    // itself, where three names picked out here only ever go stale.
+    input.set_placeholder_text("Ask anything. Enter sends, Alt+Enter a newline, / commands, Ctrl+C quits.");
+    // The terminal's own grey rather than a dimmed foreground, which some
+    // terminals ignore and others render as the text colour proper.
+    input.set_placeholder_style(Style::default().fg(Color::DarkGray));
     input.set_wrap_mode(WrapMode::WordOrGlyph);
     let session = Session::new(store.as_ref(), &cwd, &model);
     let mut app = Self {
