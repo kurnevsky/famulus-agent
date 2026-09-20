@@ -457,17 +457,15 @@ impl Tool for WriteTool {
       .into()
   }
 
-  async fn call(&self, ctx: &mut ToolContext, args: WriteArgs) -> Result<String, ToolError> {
+  async fn call(&self, _ctx: &mut ToolContext, args: WriteArgs) -> Result<String, ToolError> {
     let path = resolve(&self.cwd, &args.path);
     let _guard = lock_file(&path).await;
     if let Some(parent) = path.parent() {
       tokio::fs::create_dir_all(parent).await?;
     }
-    // What the file said before, so the UI can show what changed rather than
-    // a sentence saying that something did. A new file simply had nothing.
-    let before = tokio::fs::read_to_string(&path).await.unwrap_or_default();
     tokio::fs::write(&path, &args.content).await?;
-    attach_diff(ctx, &before, &args.content);
+    // Nothing is left for the transcript here: what a write put in the file
+    // is what it was asked to, and the asking is already in the call.
     Ok(format!("Successfully wrote to {}", args.path))
   }
 }
@@ -629,28 +627,23 @@ mod write_tests {
   }
 
   #[tokio::test]
-  async fn a_write_shows_what_changed_rather_than_that_something_did() {
+  async fn a_write_puts_the_file_down_and_leaves_nothing_behind() {
     let dir = std::env::temp_dir().join(format!("fa-write-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
 
-    // A new file is all new lines.
     let (result, ctx) = write(&dir, "one\ntwo\n").await;
-    assert!(result.is_ok());
-    let diff = &ctx.result::<EditDiff>().expect("a new file is a change").diff;
-    assert!(diff.contains("+1 one") && diff.contains("+2 two"), "{diff}");
-
-    // Rewriting it differently is the difference, not the whole file.
-    let (_, ctx) = write(&dir, "one\ntwo!\n").await;
-    let diff = &ctx.result::<EditDiff>().expect("a rewrite is a change").diff;
-    assert!(diff.contains("-2 two") && diff.contains("+2 two!"), "{diff}");
-    assert!(!diff.contains("-1 one"), "the line that did not change: {diff}");
-
-    // Writing what is already there changed nothing, and there is no diff to
-    // show — the transcript falls back to the tool saying it wrote the file.
-    let (result, ctx) = write(&dir, "one\ntwo!\n").await;
     assert_eq!(result.unwrap(), "Successfully wrote to f.txt");
-    assert!(ctx.result::<EditDiff>().is_none(), "nothing changed, nothing to show");
+    assert_eq!(std::fs::read_to_string(dir.join("f.txt")).unwrap(), "one\ntwo\n");
+    // Nothing of its own: what a write put in the file is what it was asked
+    // to put there, and the asking is already in the transcript, so that is
+    // where the transcript reads it from.
+    assert!(ctx.result::<EditDiff>().is_none(), "a write is not a change to mark up");
+
+    // The same on a rewrite, which is still just the file as it now reads.
+    let (result, ctx) = write(&dir, "one\ntwo!\n").await;
+    assert!(result.is_ok());
+    assert!(ctx.result::<EditDiff>().is_none());
     std::fs::remove_dir_all(&dir).unwrap();
   }
 }

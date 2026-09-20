@@ -194,9 +194,15 @@ way a thinking block does, with a line saying how much is folded away;
 still being written, so a long file can be watched arriving in full or kept to
 its last lines. A command keeps the
 end of its output and a file the start of its contents, since that is the end
-that matters in each. `write` and `edit` show what changed as a diff — what a
-file says now is worth seeing, where "Successfully wrote to it" only repeats
-the line above.
+that matters in each.
+
+`edit` shows what it changed as a diff. `write` shows the file it wrote, as the
+file it is: highlighted by the language its name gives, with none of a diff's
+pluses and none of its green, because a write did not change lines, it put them
+there. Either way what the tool did is on screen, where "Successfully wrote to
+it" would only repeat the line above. The write costs the session nothing to
+show: the content is already in the call that asked for it, so the transcript
+keeps the sentence and the screen draws the file.
 
 A finished tool's output carries a stripe down its side saying how it went —
 green when it worked, red when it did not — in place of the `│` gutter it has

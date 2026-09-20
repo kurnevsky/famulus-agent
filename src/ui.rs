@@ -284,6 +284,10 @@ enum Entry {
     /// The call this is, so its output finds it again when several tools are
     /// in flight at once and finish in whatever order they finish.
     call: String,
+    /// What a `write` put in the file. A write leaves nothing behind but a
+    /// sentence, and the file it wrote is worth more than the sentence — so
+    /// the transcript takes it from the asking, where it already is.
+    wrote: Option<String>,
     started: Instant,
   },
   ToolResult {
@@ -1033,6 +1037,7 @@ impl App {
         }
         let summary = summarize_args(&name, &args);
         self.entries.push(Entry::ToolCall {
+          wrote: wrote_content(&name, &args),
           name,
           summary,
           call,
@@ -1389,7 +1394,7 @@ impl App {
     // Only the last entry can still be growing, and only while a turn is in
     // flight. Everything else is final, and is parsed as written.
     let streaming = self.run.is_some().then(|| self.entries.len().saturating_sub(1));
-    for (i, entry) in self.entries.iter().enumerate() {
+    for (at, entry) in self.entries.iter().enumerate() {
       match entry {
         Entry::User(text) => {
           lines.push(Line::default());
@@ -1408,7 +1413,7 @@ impl App {
           // parse per message rather than one per draw. `streaming` is part
           // of the key so the completed text is not served its mid-stream
           // rendering, which closes tokens this one should leave literal.
-          let streaming = streaming == Some(i);
+          let streaming = streaming == Some(at);
           let key = (hash(ASSISTANT_KIND, text), width, streaming);
           let rendered = match cached.remove(&key) {
             Some(rendered) => rendered,
@@ -1463,33 +1468,31 @@ impl App {
           name,
           output,
           is_error,
+          call,
           running,
           diff,
           started,
           took,
-          ..
         } => {
-          // What the tool has to show, and how it reads. A diff is what it
-          // changed; anything else is what it said — and a diff of nothing is
-          // not worth a block of nothing, so a write that changed the file
-          // not at all falls back to saying so.
+          // What the tool has to show. A write shows the file it wrote, an
+          // edit what it changed, and anything else what it said — and a
+          // diff of nothing is not worth a block of nothing.
           let diff = diff.as_deref().filter(|diff| !diff.trim().is_empty());
-          let (body, cap, from_end) = match diff {
-            Some(diff) => (diff, DIFF_LINES, false),
+          let wrote = wrote_by(&self.entries[..at], call);
+          let (body, cap, from_end) = match (wrote, diff) {
+            (Some((path, content)), _) => {
+              // A file's last newline ends its last line; it does not start
+              // another.
+              let content = content.strip_suffix('\n').unwrap_or(content);
+              (file_lines(path, content), TOOL_OUTPUT_LINES, false)
+            }
+            (None, Some(diff)) => (marked_lines(diff, true), DIFF_LINES, false),
             // A command's output is most useful at its end and a file's at
             // its start, so each keeps the end that matters.
-            None => (output.as_str(), TOOL_OUTPUT_LINES, name == "bash"),
+            (None, None) => (marked_lines(output, false), TOOL_OUTPUT_LINES, name == "bash"),
           };
           Preview {
-            // A diff says what each line is with its first character;
-            // anything else is the tool talking, and stays out of the way.
-            body: body
-              .lines()
-              .map(|line| {
-                let mark = diff.and(line.chars().next());
-                (mark_style(mark), format!(" {line}"))
-              })
-              .collect(),
+            body,
             gutter: gutter(*running, *is_error),
             cap,
             expanded: self.expand_tools,
@@ -1534,25 +1537,36 @@ impl App {
     // become so that nothing moves when it does.
     for writing in &self.writing {
       lines.push(Line::default());
-      // Every line of every block, each carrying the mark it is drawn under:
-      // a replacement says which half it is, and a file's own text says
-      // nothing, since the gutter is already saying it.
-      let body: Vec<(Style, String)> = writing_body(&writing.name, &writing.args)
-        .into_iter()
-        .flat_map(|(mark, text)| {
-          let prefix = match mark {
-            "│" => String::new(),
-            mark => format!("{mark} "),
-          };
-          // Split rather than `lines`, so a body ending in a newline keeps
-          // the empty line the model is about to write into.
-          text
-            .split('\n')
-            .map(|line| (mark_style(mark.chars().next()), format!(" {prefix}{line}")))
-            .collect::<Vec<_>>()
-        })
-        .collect();
       let summary = writing_summary(&writing.name, &writing.args);
+      let blocks = writing_body(&writing.name, &writing.args);
+      let body: Vec<Vec<Span<'static>>> = match (writing.name.as_str(), blocks.as_slice()) {
+        // A file arriving is shown as the file it will be, highlighted the
+        // same way — so nothing recolours when the call is finally made.
+        ("write", [(_, content)]) => file_lines(&summary, content),
+        // Every line of every other block, each carrying the mark it is
+        // drawn under: a replacement says which half it is, and anything
+        // else says nothing, since the gutter is already saying it.
+        _ => blocks
+          .iter()
+          .flat_map(|(mark, text)| {
+            let prefix = match *mark {
+              "│" => String::new(),
+              mark => format!("{mark} "),
+            };
+            // Split rather than `lines`, so a body ending in a newline keeps
+            // the empty line the model is about to write into.
+            text
+              .split('\n')
+              .map(|line| {
+                vec![Span::styled(
+                  format!(" {prefix}{line}"),
+                  mark_style(mark.chars().next()),
+                )]
+              })
+              .collect::<Vec<_>>()
+          })
+          .collect(),
+      };
       let mut header = vec![
         Span::styled("⚙ ", Style::default().fg(Color::Yellow)),
         Span::styled(writing.name.clone(), Style::default().fg(Color::Yellow).bold()),
@@ -1663,6 +1677,64 @@ fn fold_note(hidden: usize, earlier: bool) -> String {
   }
 }
 
+/// What a `write` is putting in the file, from the arguments asking for it.
+fn wrote_content(name: &str, args: &serde_json::Value) -> Option<String> {
+  (name == "write")
+    .then(|| args.get("content")?.as_str().map(str::to_string))
+    .flatten()
+}
+
+/// The file a write put down, and the name that says how to read it, from the
+/// call that asked for it.
+fn wrote_by<'a>(entries: &'a [Entry], call: &str) -> Option<(&'a str, &'a str)> {
+  entries.iter().rev().find_map(|entry| match entry {
+    Entry::ToolCall {
+      call: at,
+      summary,
+      wrote: Some(content),
+      ..
+    } if at == call => Some((summary.as_str(), content.as_str())),
+    _ => None,
+  })
+}
+
+/// A file as the transcript shows it: highlighted when its name says what
+/// language it is, plain when it does not.
+///
+/// A write is not a change to be marked up — it is the file, so it is shown
+/// as the file, with none of a diff's pluses and none of its green.
+fn file_lines(path: &str, content: &str) -> Vec<Vec<Span<'static>>> {
+  let language = Path::new(path)
+    .extension()
+    .and_then(|extension| extension.to_str())
+    .unwrap_or_default();
+  let highlighted = crate::highlight::highlight(language, content);
+  content
+    .split('\n')
+    .enumerate()
+    .map(|(i, line)| match highlighted.as_ref().and_then(|lines| lines.get(i)) {
+      Some(spans) if !spans.is_empty() => {
+        let mut row = vec![Span::raw(" ")];
+        row.extend(spans.iter().cloned());
+        row
+      }
+      _ => vec![Span::styled(format!(" {line}"), mark_style(None))],
+    })
+    .collect()
+}
+
+/// Lines of a tool's own text. A diff says what each line is with its first
+/// character; anything else is the tool talking, and stays out of the way.
+fn marked_lines(text: &str, diff: bool) -> Vec<Vec<Span<'static>>> {
+  text
+    .lines()
+    .map(|line| {
+      let mark = diff.then(|| line.chars().next()).flatten();
+      vec![Span::styled(format!(" {line}"), mark_style(mark))]
+    })
+    .collect()
+}
+
 /// What a `+` and a `-` mean, wherever they are drawn — in the diff a call
 /// left behind, or in the replacement it is still writing.
 fn mark_style(mark: Option<char>) -> Style {
@@ -1680,8 +1752,9 @@ fn mark_style(mark: Option<char>) -> Style {
 /// leaves behind are the same thing at different moments, and drawing them
 /// from one place is what stops them drifting apart on screen.
 struct Preview {
-  /// Each line and the style it carries.
-  body: Vec<(Style, String)>,
+  /// Each line, as the spans it is drawn from — a line at a time rather than
+  /// a style at a time, so a highlighted one can carry a colour per word.
+  body: Vec<Vec<Span<'static>>>,
   /// Drawn at the head of every line: the verdict stripe once there is one,
   /// the plain gutter until then.
   gutter: Span<'static>,
@@ -1707,17 +1780,19 @@ impl Preview {
       true => 0,
       false => body.len().saturating_sub(cap),
     };
-    let row = |text: String, style: Style, tip: bool| {
-      let mut spans = vec![Span::raw("  "), gutter.clone(), Span::styled(text, style)];
+    let row = |line: Vec<Span<'static>>, tip: bool| {
+      let mut spans = vec![Span::raw("  "), gutter.clone()];
+      spans.extend(line);
       if tip {
         spans.push(Span::styled("▌", Style::default().fg(Color::Yellow)));
       }
       Line::from(spans)
     };
+    let note = |hidden, earlier| vec![Span::styled(fold_note(hidden, earlier), mark_style(None))];
     if hidden > 0 && from_end {
-      out.push(row(fold_note(hidden, true), mark_style(None), false));
+      out.push(row(note(hidden, true), false));
     }
-    let kept: Vec<(Style, String)> = match from_end {
+    let kept: Vec<Vec<Span<'static>>> = match from_end {
       true => body.into_iter().skip(hidden).collect(),
       false => {
         let shown = body.len() - hidden;
@@ -1725,11 +1800,11 @@ impl Preview {
       }
     };
     let last = kept.len().saturating_sub(1);
-    for (i, (style, text)) in kept.into_iter().enumerate() {
-      out.push(row(text, style, cursor && i == last));
+    for (i, line) in kept.into_iter().enumerate() {
+      out.push(row(line, cursor && i == last));
     }
     if hidden > 0 && !from_end {
-      out.push(row(fold_note(hidden, false), mark_style(None), false));
+      out.push(row(note(hidden, false), false));
     }
   }
 }
@@ -1980,6 +2055,7 @@ fn entries_from_history(session: &Session) -> Vec<Entry> {
             }
             AssistantContent::ToolCall(call) => {
               entries.push(Entry::ToolCall {
+                wrote: wrote_content(&call.function.name, &call.function.arguments),
                 name: call.function.name.clone(),
                 summary: summarize_args(&call.function.name, &call.function.arguments),
                 call: call.id.as_str().to_string(),
@@ -2617,6 +2693,7 @@ mod tests {
       name: "bash".into(),
       summary: summary.into(),
       call: call.into(),
+      wrote: None,
       started: Instant::now(),
     }
   }
@@ -2852,6 +2929,77 @@ mod tests {
     assert_eq!(run.recovered(), [Message::user("hello")]);
     // A `/continue` run has no prompt of its own, and nothing yet to keep.
     assert!(InFlight::new(None, 1).recovered().is_empty());
+  }
+
+  /// The text of each line, and the colours it carries.
+  fn painted(lines: &[Vec<Span<'static>>]) -> Vec<(String, Vec<Option<Color>>)> {
+    lines
+      .iter()
+      .map(|line| {
+        let text = line.iter().map(|span| span.content.as_ref()).collect::<String>();
+        let colours = line
+          .iter()
+          .filter(|s| !s.content.trim().is_empty())
+          .map(|s| s.style.fg)
+          .collect();
+        (text, colours)
+      })
+      .collect()
+  }
+
+  #[test]
+  fn a_written_file_is_shown_as_the_file_it_is() {
+    // Plain: no diff's pluses down the side, and none of its green — a write
+    // put the file there, it did not change it.
+    let plain = painted(&file_lines("notes.txt", "hello\nthere"));
+    assert_eq!(
+      plain,
+      [(" hello".to_string(), vec![None]), (" there".to_string(), vec![None])]
+    );
+    assert!(plain.iter().all(|(text, _)| !text.trim_start().starts_with('+')));
+  }
+
+  #[test]
+  #[cfg(feature = "lang-rust")]
+  fn a_written_file_is_highlighted_by_the_name_it_was_written_to() {
+    // The extension is all the transcript has to go on, and all it needs.
+    let code = file_lines("src/main.rs", "fn main() {}");
+    let spans: Vec<(String, Option<Color>)> = code[0]
+      .iter()
+      .map(|span| (span.content.to_string(), span.style.fg))
+      .collect();
+    assert!(
+      spans.contains(&("fn".to_string(), Some(Color::Magenta))),
+      "a keyword is a keyword: {spans:?}"
+    );
+    assert!(
+      spans.contains(&("main".to_string(), Some(Color::Blue))),
+      "and a name is a name: {spans:?}"
+    );
+    // A name that says nothing about its language is shown as it is.
+    let unknown = painted(&file_lines("notes", "fn main() {}"));
+    assert_eq!(unknown, [(" fn main() {}".to_string(), vec![None])]);
+  }
+
+  #[test]
+  fn only_a_write_carries_its_file_and_only_from_its_own_call() {
+    let args = serde_json::json!({ "path": "a.rs", "content": "fn main() {}" });
+    assert_eq!(wrote_content("write", &args).as_deref(), Some("fn main() {}"));
+    assert!(wrote_content("read", &args).is_none(), "a read writes nothing");
+    assert!(wrote_content("bash", &serde_json::json!({ "command": "ls" })).is_none());
+
+    let entries = vec![
+      Entry::ToolCall {
+        name: "write".into(),
+        summary: "a.rs".into(),
+        call: "c1".into(),
+        wrote: Some("fn main() {}".into()),
+        started: Instant::now(),
+      },
+      announced("ls", "c2"),
+    ];
+    assert_eq!(wrote_by(&entries, "c1"), Some(("a.rs", "fn main() {}")));
+    assert_eq!(wrote_by(&entries, "c2"), None, "a command wrote no file");
   }
 
   #[test]
