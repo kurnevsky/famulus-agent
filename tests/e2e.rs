@@ -541,6 +541,51 @@ fn a_message_typed_mid_run_waits_at_the_bottom_and_goes_at_the_next_turn() {
 }
 
 #[test]
+fn a_waiting_message_can_be_taken_back_and_fixed() {
+  if !have_tmux() {
+    return;
+  }
+  let file = (1..=400).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "Working. ",
+      tool: "write",
+      args: serde_json::json!({ "path": "notes.txt", "content": file }),
+    },
+    Turn::Say("Answered them both."),
+  ]);
+  let term = Term::start("unqueue", &provider, &["--no-session"]);
+  term.submit("start something slow");
+  term.wait_for("⚙ write notes.txt");
+  term.submit("second questionX");
+  term.wait_for("Queued: second questionX");
+
+  // Alt+Up hands the last one waiting back to the input box, typo and all.
+  term.type_in("M-Up");
+  term.settle();
+  let screen = term.screen();
+  assert!(
+    !screen.contains("Queued:"),
+    "taken back out of the queue, not copied out of it:\n{screen}"
+  );
+  let box_line = screen
+    .lines()
+    .find(|line| line.contains("second questionX"))
+    .unwrap_or_else(|| panic!("the message back in the box:\n{screen}"));
+  assert!(box_line.starts_with('│'), "in the input box: {box_line:?}");
+
+  // Fixed there and sent again — what goes to the model is the corrected one.
+  term.type_in("BSpace");
+  term.type_in("Enter");
+  term.wait_for("Answered them both.");
+  assert!(provider.sent("second question"), "the fixed message went");
+  assert!(
+    !provider.sent("second questionX"),
+    "and the one it was taken back from did not"
+  );
+}
+
+#[test]
 fn what_a_session_shows_is_what_it_showed_before_it_was_closed() {
   if !have_tmux() {
     return;

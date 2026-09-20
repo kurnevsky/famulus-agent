@@ -530,6 +530,10 @@ impl App {
           self.open_points(false);
         }
       }
+      // Alt+Up takes the last message still waiting back out of the queue,
+      // to be fixed and sent again. Only from an empty box, where it cannot
+      // land on top of something half-typed.
+      (KeyCode::Up, _) if key.modifiers.contains(KeyModifiers::ALT) && self.input_is_blank() => self.unqueue(),
       (KeyCode::PageUp, _) => self.scroll_by(10),
       (KeyCode::PageDown, _) => self.scroll_by(-10),
       (KeyCode::Enter, _) if is_newline(&key) => {
@@ -910,6 +914,15 @@ impl App {
       self.usage.output_tokens
     );
     self.entries.push(Entry::Info(info));
+  }
+
+  /// Hand the newest waiting message back to the input box. Newest first, so
+  /// pressing it again after sending walks back through the queue in the
+  /// order the messages would have gone out, last one first.
+  fn unqueue(&mut self) {
+    let Some(text) = self.queued.pop_back() else { return };
+    self.waiting();
+    self.set_input(&text);
   }
 
   fn next_queued(&mut self) {

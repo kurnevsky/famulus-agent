@@ -119,8 +119,10 @@ its first model call, where it has done nothing yet.
 
 A message waiting its turn is drawn at the bottom of the transcript, under
 whatever the run is still saying, because the bottom is where it will be sent
-from. `Esc` stops the run and what was waiting behind it — it stays in the
-transcript as `Not sent`, since it was typed.
+from. `Alt+↑` takes the last one back out of the queue and into the input box,
+to be fixed and sent again — from an empty box only, where it cannot land on
+top of something half-typed. `Esc` stops the run and what was waiting behind
+it — it stays in the transcript as `Not sent`, since it was typed.
 
 ## Going back
 
@@ -259,6 +261,7 @@ shows the current context usage as `ctx N%`.
 | Key | Action |
 |-----|--------|
 | `Enter` | Send (queued if a run is in progress) |
+| `Alt+↑` | Take the last queued message back for editing (empty input) |
 | `/` | Command popup: type to fuzzy-filter, `↑`/`↓` move, `Tab`/`Enter` complete, `Esc` dismiss |
 | `Alt+Enter`, `Ctrl+J`, `Shift+Enter`* | Newline |
 | `Esc` | Abort the current run |
