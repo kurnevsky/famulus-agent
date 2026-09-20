@@ -103,6 +103,14 @@ struct Cli {
   /// Start no MCP servers this session
   #[arg(long, conflicts_with = "mcp_config")]
   no_mcp: bool,
+
+  /// Offer the model only these tools, by name (comma-separated)
+  #[arg(long, env = "FA_TOOLS", value_delimiter = ',')]
+  tools: Vec<String>,
+
+  /// Keep these tools from the model, by name (comma-separated)
+  #[arg(long, env = "FA_NO_TOOLS", value_delimiter = ',')]
+  no_tools: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -124,7 +132,7 @@ async fn main() -> Result<()> {
     .api_key
     .or_else(|| std::env::var(key_env).ok().filter(|k| !k.is_empty()))
     .unwrap_or_else(|| "none".to_string());
-  let cfg = agent::Config {
+  let mut cfg = agent::Config {
     provider,
     base_url: cli.base_url,
     api_key,
@@ -132,6 +140,8 @@ async fn main() -> Result<()> {
     system_prompt: cli.system_prompt,
     max_turns: cli.max_turns,
     vision: !cli.no_vision,
+    // Worked out below, once the MCP servers have said what they brought.
+    tools: None,
     compaction: compaction::Settings {
       enabled: !cli.no_compaction,
       context_window: cli.context_window,
@@ -181,6 +191,29 @@ async fn main() -> Result<()> {
       (servers, notes)
     }
   };
+
+  // What this session may call: the built-in tools and whatever the servers
+  // brought are one list, since the model is offered them as one.
+  let available: Vec<String> = tools::BUILT_IN
+    .iter()
+    .map(|name| name.to_string())
+    .chain(servers.tool_names())
+    .collect();
+  let (allowed, unknown) = tools::choose(&available, &cli.tools, &cli.no_tools);
+  let mut notes = notes;
+  if !unknown.is_empty() {
+    notes.push(format!(
+      "No tool named {} — nothing left in or out by it.",
+      unknown.join(", ")
+    ));
+  }
+  if let Some(allowed) = &allowed {
+    notes.push(match allowed.is_empty() {
+      true => "No tools this session: the model can only answer.".to_string(),
+      false => format!("Tools this session: {}.", allowed.join(", ")),
+    });
+  }
+  cfg.tools = allowed;
 
   let (tx, rx) = mpsc::unbounded_channel();
   let agents = agent::build_agents(&cfg, &cwd, tx.clone(), &servers)?;

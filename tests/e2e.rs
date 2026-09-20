@@ -237,6 +237,10 @@ TOOLS = [{
   "name": "weather",
   "description": "What the weather is somewhere.",
   "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+}, {
+  "name": "forecast",
+  "description": "What the weather will be.",
+  "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
 }]
 
 for line in sys.stdin:
@@ -962,9 +966,10 @@ fn a_tool_from_an_mcp_server_is_offered_called_and_drawn_like_any_other() {
   std::fs::write(
     &config,
     // A line of shell, as it would be typed — the server is started by the
-    // command that starts it in a terminal.
+    // command that starts it in a terminal. It offers two tools; this session
+    // wants one of them.
     format!(
-      "[weather]\ncommand = \"python3 '{}'\"\ntimeout = 10\n",
+      "[weather]\ncommand = \"python3 '{}'\"\ntimeout = 10\nexcept = [\"forecast\"]\n",
       server.display()
     ),
   )
@@ -986,10 +991,15 @@ fn a_tool_from_an_mcp_server_is_offered_called_and_drawn_like_any_other() {
   term.submit("what is the weather in Berlin");
   term.wait_for("Take a coat.");
 
-  // The model was offered the tool by the name its server gave it.
+  // The model was offered the tool by the name its server gave it, and not
+  // the one this session asked the server to keep.
   assert!(
     provider.sent(r#""name":"weather""#),
     "the server's tool went to the model with the other four"
+  );
+  assert!(
+    !provider.sent("forecast"),
+    "a tool a server was asked to keep is never offered"
   );
   // And it reads in the transcript like any other tool: the call, then what
   // came back under it.
@@ -1008,6 +1018,40 @@ fn a_tool_from_an_mcp_server_is_offered_called_and_drawn_like_any_other() {
     "what the server answered, under the call: {lines:?}"
   );
   let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_session_can_be_held_to_some_of_its_tools() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![Turn::Echo]);
+  let term = Term::start(
+    "read-only",
+    &provider,
+    &["--no-session", "--no-tools", "write,edit,bash"],
+  );
+  term.wait_for("Tools this session: read.");
+  term.submit("what is here");
+  term.wait_for("Answer to what is here.");
+
+  let request = provider.request("what is here");
+  assert!(
+    request.contains(r#""name":"read""#),
+    "what is left is offered: {request}"
+  );
+  for gone in [r#""name":"write""#, r#""name":"edit""#, r#""name":"bash""#] {
+    assert!(!request.contains(gone), "{gone} is not offered: {request}");
+  }
+  // And the model is not told about what it cannot call, which it would
+  // otherwise try and report being refused.
+  assert!(
+    request.contains("- read: Read file contents") && !request.contains("Use bash for"),
+    "the prompt speaks only for the tools there are: {request}"
+  );
+  // A name nothing answers to is worth saying, since it leaves nothing out.
+  let term = Term::start("typo", &provider, &["--no-session", "--no-tools", "bahs"]);
+  term.wait_for("No tool named bahs");
 }
 
 #[test]

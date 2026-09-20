@@ -38,12 +38,6 @@ const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 /// The name servers are declared under, in each configuration directory.
 const FILE: &str = "mcp.toml";
 
-#[cfg(feature = "mcp")]
-/// Tool names the agent's own four answer to. An MCP server offering one of
-/// these would take the name from under a tool the model is told about in the
-/// system prompt, so it keeps its own.
-const BUILT_IN: [&str; 4] = ["read", "write", "edit", "bash"];
-
 /// Servers as the file declares them: one table each, under its own name.
 ///
 /// The names are the file's top level, so the file is nothing but servers.
@@ -79,6 +73,14 @@ pub struct Server {
   /// as an error the model can recover from. `0` waits forever.
   #[serde(default)]
   pub timeout: Option<u64>,
+  /// Take only these of the tools it offers. Everything it offers, when empty
+  /// — which is not the same as naming them all, since a server that grows a
+  /// tool later would keep it.
+  #[serde(default)]
+  pub tools: Vec<String>,
+  /// Take everything but these. Named in both lists, a tool is refused.
+  #[serde(default)]
+  pub except: Vec<String>,
 }
 
 /// Where servers are declared, in the order the files are read: the system's
@@ -198,6 +200,19 @@ impl Servers {
     &self.notes
   }
 
+  /// Every tool the session's servers brought, for a list that names tools
+  /// without knowing where each came from.
+  pub fn tool_names(&self) -> Vec<String> {
+    #[cfg(feature = "mcp")]
+    return self
+      .tools
+      .iter()
+      .flat_map(|(tools, ..)| tools.iter().map(|tool| tool.name.to_string()))
+      .collect();
+    #[cfg(not(feature = "mcp"))]
+    Vec::new()
+  }
+
   #[cfg(feature = "mcp")]
   fn note(&mut self, note: String) {
     self.notes.push(note);
@@ -207,7 +222,7 @@ impl Servers {
 #[cfg(feature = "mcp")]
 pub async fn connect(config: Config) -> Servers {
   let mut servers = Servers::default();
-  let mut taken: Vec<String> = BUILT_IN.map(str::to_string).to_vec();
+  let mut taken: Vec<String> = crate::tools::BUILT_IN.map(str::to_string).to_vec();
   for (name, server) in config {
     let started = tokio::time::timeout(START_TIMEOUT, start(&server));
     let running = match started.await {
@@ -227,6 +242,21 @@ pub async fn connect(config: Config) -> Servers {
         servers.note(format!("MCP {name}: could not list tools: {err}"));
         continue;
       }
+    };
+    // What the server offers, narrowed to what was asked of it. A name in
+    // neither list is a name nothing answers to — usually a typo, and a typo
+    // in a list like this is a tool quietly left in or out.
+    let offered: Vec<String> = tools.iter().map(|tool| tool.name.to_string()).collect();
+    let (wanted, unknown) = crate::tools::choose(&offered, &server.tools, &server.except);
+    if !unknown.is_empty() {
+      servers.note(format!("MCP {name}: offers no {}", unknown.join(", ")));
+    }
+    let tools: Vec<_> = match &wanted {
+      Some(wanted) => tools
+        .into_iter()
+        .filter(|tool| wanted.contains(&tool.name.to_string()))
+        .collect(),
+      None => tools,
     };
     // A tool cannot be had twice under one name: the model would have no way
     // to say which it meant, and the four the system prompt describes are the

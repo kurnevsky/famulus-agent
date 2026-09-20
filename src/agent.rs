@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use futures::StreamExt;
 use rig_agent::agent::{
   Agent, AgentBuilder, AgentHook, CompletionCallAction, CompletionCallEvent, HookContext, MultiTurnStreamItem,
-  StreamingError, ToolCall, ToolCallAction, ToolResultAction, ToolResultEvent,
+  RequestPatch, StreamingError, ToolCall, ToolCallAction, ToolResultAction, ToolResultEvent,
 };
 use rig_agent::client::AgentClientExt;
 use rig_agent::completion::PromptError;
@@ -119,6 +119,10 @@ pub struct Config {
   pub compaction: Settings,
   /// Whether the model accepts image input.
   pub vision: bool,
+  /// The tools to offer the model, or `None` to offer every one there is.
+  /// Every tool is registered either way; this is what the model is shown,
+  /// and rig refuses a call to anything left out of it.
+  pub tools: Option<Vec<String>>,
 }
 
 /// The id of the call a hook is reporting.
@@ -136,6 +140,10 @@ fn call_id(id: Option<&str>) -> String {
 struct UiHook {
   tx: mpsc::UnboundedSender<AgentEvent>,
   waiting: Waiting,
+  /// Narrows what each request advertises, when a session asked for less than
+  /// everything. Per turn is the only place rig takes it, so it is said again
+  /// every turn.
+  tools: Option<Vec<String>>,
 }
 
 impl AgentHook for UiHook {
@@ -151,12 +159,15 @@ impl AgentHook for UiHook {
   /// Never before the first call, where the run has done nothing yet: the
   /// message it stopped for would start a run that stops for the next one.
   async fn on_completion_call(&self, _ctx: &HookContext, event: CompletionCallEvent<'_>) -> CompletionCallAction {
-    match event.turn > 1 && self.waiting.load(Ordering::Relaxed) {
+    if event.turn > 1 && self.waiting.load(Ordering::Relaxed) {
       // The reason is rig's to carry, not anything this program reads: the
       // stop comes back as a `PromptCancelled` and `start_run` knows it by
       // that, not by what it says. It is here for a stack trace to say.
-      true => CompletionCallAction::Stop("a message is waiting to be sent".into()),
-      false => CompletionCallAction::Continue,
+      return CompletionCallAction::Stop("a message is waiting to be sent".into());
+    }
+    match &self.tools {
+      Some(tools) => CompletionCallAction::Patch(RequestPatch::new().active_tools(tools.clone())),
+      None => CompletionCallAction::Continue,
     }
   }
 
@@ -200,7 +211,7 @@ pub fn build_agents(
 ) -> Result<Agents> {
   let preamble = match &cfg.system_prompt {
     Some(p) => p.clone(),
-    None => default_system_prompt(cwd),
+    None => default_system_prompt(cwd, cfg.tools.as_deref()),
   };
   let base_url = cfg.base_url.as_deref().map(|u| u.trim_end_matches('/'));
 
@@ -240,6 +251,7 @@ pub fn build_agents(
     .add_hook(UiHook {
       tx,
       waiting: waiting.clone(),
+      tools: cfg.tools.clone(),
     })
     .tool(ReadTool {
       cwd: cwd.to_path_buf(),
@@ -348,8 +360,41 @@ fn relay_tool_images(history: &mut Vec<Message>) {
   *history = out;
 }
 
-fn default_system_prompt(cwd: &Path) -> String {
-  let mut prompt = String::from(
+/// The lines of the built-in prompt that speak for a tool, by the tool they
+/// speak for: a session without one should not be told to use it.
+/// A whole word, so `read` does not take `already` with it — and the plural
+/// too, since the rules speak of a tool's arguments as `edits[]`.
+fn mentions(line: &str, tool: &str) -> bool {
+  line
+    .split(|c: char| !c.is_ascii_alphanumeric())
+    .any(|word| word == tool || word.strip_suffix('s') == Some(tool))
+}
+
+/// Drop what the prompt says about tools this session does not have.
+///
+/// A model told about `bash` and then refused it does not quietly do without:
+/// it tries, is refused, and says so instead of using what it does have.
+fn for_tools(prompt: &str, tools: Option<&[String]>) -> String {
+  let Some(tools) = tools else {
+    return prompt.to_string();
+  };
+  let gone: Vec<&str> = crate::tools::BUILT_IN
+    .iter()
+    .copied()
+    .filter(|name| !tools.iter().any(|tool| tool == name))
+    .collect();
+  if gone.is_empty() {
+    return prompt.to_string();
+  }
+  prompt
+    .lines()
+    .filter(|line| !gone.iter().any(|tool| mentions(line, tool)))
+    .collect::<Vec<_>>()
+    .join("\n")
+}
+
+fn default_system_prompt(cwd: &Path, tools: Option<&[String]>) -> String {
+  let mut prompt = for_tools(
     "You are an expert coding assistant operating inside a minimal terminal coding agent. \
          You help users by reading files, executing commands, editing code, and writing new files.\n\n\
          <tools>\n\
@@ -369,6 +414,7 @@ fn default_system_prompt(cwd: &Path) -> String {
          - Be concise in your responses\n\
          - Show file paths clearly when working with files\n\
          </rules>\n",
+    tools,
   );
 
   let mut context_files = Vec::new();
@@ -562,6 +608,7 @@ mod tests {
       max_turns: 5,
       compaction: TEST_SETTINGS,
       vision: true,
+      tools: None,
     };
     let (tx, mut rx) = mpsc::unbounded_channel();
     let agent = build_agents(&cfg, Path::new("/tmp"), tx.clone(), &Default::default())
@@ -699,6 +746,7 @@ mod tests {
       max_turns: 5,
       compaction: TEST_SETTINGS,
       vision: true,
+      tools: None,
     };
     let (tx, mut rx) = mpsc::unbounded_channel();
     let agents = build_agents(&cfg, Path::new("/tmp"), tx.clone(), &Default::default()).unwrap();
@@ -750,6 +798,44 @@ mod tests {
     };
     assert_eq!((compacted.summarized, compacted.kept), (2, 0));
     assert_eq!(compacted.history.len(), 1, "one fresh summary, not nested");
+  }
+
+  #[test]
+  fn the_prompt_stops_speaking_for_a_tool_the_session_does_not_have() {
+    let all = default_system_prompt(Path::new("/work"), None);
+    for tool in crate::tools::BUILT_IN {
+      assert!(all.contains(&format!("- {tool}:")), "{tool} is introduced by default");
+    }
+
+    // A model told about `bash` and then refused it tries anyway and reports
+    // being refused, instead of using what it does have.
+    let reading = default_system_prompt(Path::new("/work"), Some(&["read".to_string()]));
+    assert!(reading.contains("- read: Read file contents"));
+    for gone in [
+      "- bash:",
+      "- edit:",
+      "- write:",
+      "Use bash for",
+      "Use edit for",
+      "Use write only",
+      // Including where the rules speak of a tool's arguments rather than of
+      // the tool by name.
+      "edits[].oldText",
+    ] {
+      assert!(!reading.contains(gone), "{gone:?} is not this session's: {reading}");
+    }
+    // What does not speak for a tool stays, and so does the rest of it.
+    assert!(reading.contains("- Be concise in your responses"));
+    assert!(reading.contains("Use read to examine files"));
+    assert!(reading.contains("<cwd>\n/work\n</cwd>"));
+
+    // A list that leaves the built-in four alone changes nothing, however
+    // many other tools it names.
+    let with_mcp = default_system_prompt(
+      Path::new("/work"),
+      Some(crate::tools::BUILT_IN.map(str::to_string).as_ref()),
+    );
+    assert_eq!(with_mcp, all);
   }
 
   #[test]
@@ -826,6 +912,7 @@ mod tests {
       max_turns: 5,
       compaction: TEST_SETTINGS,
       vision: true,
+      tools: None,
     };
     let (tx, mut rx) = mpsc::unbounded_channel();
     let agent = build_agents(&cfg, Path::new("/tmp"), tx.clone(), &Default::default())
@@ -872,6 +959,7 @@ mod tests {
       max_turns: 5,
       compaction: TEST_SETTINGS,
       vision: true,
+      tools: None,
     };
     let (tx, mut rx) = mpsc::unbounded_channel();
     let agent = build_agents(&cfg, Path::new("/tmp"), tx.clone(), &Default::default())

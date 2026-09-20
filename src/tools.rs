@@ -19,6 +19,39 @@ use tokio::io::AsyncReadExt;
 const MAX_LINES: usize = 2000;
 const MAX_BYTES: usize = 50 * 1024;
 
+/// The names the agent's own tools answer to, in the order the system prompt
+/// introduces them.
+pub const BUILT_IN: [&str; 4] = [ReadTool::NAME, BashTool::NAME, EditTool::NAME, WriteTool::NAME];
+
+/// Which of `available` to offer the model, given what was allowed and what
+/// was refused, with the names asked for that nothing answers to.
+///
+/// `None` is everything: a session that said nothing about tools is offered
+/// all of them, which is not the same as one that allowed all of them by name
+/// and would lose a tool that arrived later.
+///
+/// An allow-list is the first word and a deny-list the last, so naming a tool
+/// in both refuses it — the narrower intent wins, which is the safe way round
+/// for a list whose point is usually to keep something away from the model.
+pub fn choose(available: &[String], allow: &[String], deny: &[String]) -> (Option<Vec<String>>, Vec<String>) {
+  let unknown: Vec<String> = allow
+    .iter()
+    .chain(deny)
+    .filter(|name| !available.contains(name))
+    .cloned()
+    .collect();
+  if allow.is_empty() && deny.is_empty() {
+    return (None, unknown);
+  }
+  let chosen = available
+    .iter()
+    .filter(|name| allow.is_empty() || allow.contains(name))
+    .filter(|name| !deny.contains(name))
+    .cloned()
+    .collect();
+  (Some(chosen), unknown)
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct ToolError(String);
@@ -605,6 +638,50 @@ impl Tool for EditTool {
       edits.len(),
       args.path
     ))
+  }
+}
+
+#[cfg(test)]
+mod choosing_tests {
+  use super::*;
+
+  fn names(names: &[&str]) -> Vec<String> {
+    names.iter().map(|name| name.to_string()).collect()
+  }
+
+  #[test]
+  fn an_allow_list_is_the_first_word_and_a_deny_list_the_last() {
+    let there = names(&["read", "write", "edit", "bash", "weather"]);
+    let none: Vec<String> = Vec::new();
+
+    // Nothing asked for is everything offered, and says so as `None` rather
+    // than by listing what there happens to be today.
+    assert_eq!(choose(&there, &none, &none), (None, none.clone()));
+
+    // Only these.
+    let (chosen, unknown) = choose(&there, &names(&["read", "weather"]), &none);
+    assert_eq!(chosen.as_deref(), Some(&names(&["read", "weather"])[..]));
+    assert!(unknown.is_empty());
+
+    // Everything but these — which is how a session goes read-only.
+    let (chosen, _) = choose(&there, &none, &names(&["write", "edit", "bash"]));
+    assert_eq!(chosen.as_deref(), Some(&names(&["read", "weather"])[..]));
+
+    // Named in both, a tool is refused: the narrower intent wins, which is
+    // the safe way round for a list meant to keep something away.
+    let (chosen, _) = choose(&there, &names(&["read", "bash"]), &names(&["bash"]));
+    assert_eq!(chosen.as_deref(), Some(&names(&["read"])[..]));
+
+    // Refusing everything is a session that can only answer, not a session
+    // with no list at all.
+    let (chosen, _) = choose(&there, &none, &there);
+    assert_eq!(chosen, Some(Vec::new()));
+
+    // A name nothing answers to is handed back, since a typo in a list like
+    // this is a tool quietly left in or out.
+    let (chosen, unknown) = choose(&there, &names(&["reed"]), &names(&["bahs"]));
+    assert_eq!(unknown, names(&["reed", "bahs"]));
+    assert_eq!(chosen, Some(Vec::new()), "a misspelled allow-list allows nothing");
   }
 }
 

@@ -43,9 +43,40 @@ GEMINI_API_KEY=... ./target/release/fa --provider gemini -m gemini-2.5-pro
 | `--scrollbar` | `FA_SCROLLBAR` | `auto` | Transcript scrollbar: `auto` (while scrolling), `always`, `hidden` |
 | `--mcp-config` | `FA_MCP_CONFIG` | XDG search path | Read MCP servers from this file instead |
 | `--no-mcp` | | | Start no MCP servers this session |
+| `--tools` | `FA_TOOLS` | all of them | Offer the model only these tools, by name |
+| `--no-tools` | `FA_NO_TOOLS` | | Keep these tools from the model, by name |
 
 The agent works in the current directory. If `AGENTS.md` (or `CLAUDE.md`)
 exists there, it is appended to the system prompt.
+
+## Which tools
+
+`--tools` and `--no-tools` name what the model is offered, out of the four
+built-in ones and whatever the MCP servers brought — one list, since the model
+is offered them as one:
+
+```sh
+# Read-only: it can look and answer, and change nothing
+fa -m gpt-5.2 --no-tools write,edit,bash
+
+# Only these, whatever else is there
+fa -m gpt-5.2 --tools read,weather
+```
+
+An allow-list is the first word and a deny-list the last, so a tool named in
+both is refused — the narrower intent wins, which is the safe way round for a
+list whose point is usually to keep something away from the model. Saying
+nothing is everything, which is not the same as allowing everything by name: a
+tool that arrives later is kept by the one and not by the other. A name nothing
+answers to is said in the transcript, since a typo in a list like this is a
+tool quietly left in or out.
+
+Tools are all registered either way; the list is what each request advertises,
+and rig refuses a call to anything left out of it. The system prompt follows:
+what it says about `bash`, `edit` and `write` is dropped when they are not
+this session's, because a model told about a tool and then refused it tries
+anyway and reports being refused, instead of using what it does have. A
+`--system-prompt` of your own is left alone.
 
 ## MCP
 
@@ -70,6 +101,7 @@ env.TOKEN = "…"
 url = "https://example.com/mcp"
 headers.Authorization = "Bearer …"
 timeout = 60
+except = ["delete_page"]
 ```
 
 A server is a `command` to run, spoken to over its own stdin and stdout, or a
@@ -82,6 +114,12 @@ A server is a `command` to run, spoken to over its own stdin and stdout, or a
 | `url` | Endpoint of a server that speaks streamable HTTP |
 | `headers` | Sent with every request to it, which is where a token goes |
 | `timeout` | Seconds one of this server's tools may take, `0` to wait forever (default 300) |
+| `tools` | Take only these of the tools it offers |
+| `except` | Take everything but these |
+
+`tools` and `except` are the same idea as `--tools` and `--no-tools`, for one
+server: a server with thirty tools can be cut to the two worth having without
+naming every tool of every other server.
 
 The file is fa's own, so it reads the way the rest of fa does — a command is
 the line you would type, not an argv — and a key it does not know is an error
@@ -404,7 +442,8 @@ mouse usually requires holding `Shift`.
 - `tests/e2e.rs` – the binary driven through tmux against a mock provider: a
   call written token by token and its output landing under it, pass and fail
   as the stripe beside each, an aborted run keeping its work and carrying on
-  from it, a reopened session reading exactly as it did before, a message typed
+  from it, a reopened session reading exactly as it did before, a session held
+  to some of its tools, a message typed
   mid-run waiting at the bottom and going at the next turn, going back into a
   branch the conversation left, forking into a session of its own, a compacted
   conversation reaching the model as its summary, and a tool from a real MCP
