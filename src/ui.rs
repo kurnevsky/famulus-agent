@@ -1380,20 +1380,10 @@ impl App {
           took,
           ..
         } => {
-          // How it went is a stripe down the side, the same for every tool, so
-          // a glance down the transcript reads as pass or fail without the
-          // text being recoloured — which the text has its own uses for.
-          let mut block = |text: String, style: Style| {
-            lines.push(Line::from(vec![
-              Span::raw("  "),
-              gutter(*running, *is_error),
-              Span::styled(text, style),
-            ]));
-          };
-          // What every tool has to show, and how it reads. A diff is what
-          // changed; anything else is what the tool said.
-          // A diff of nothing is not worth a block of nothing: a write that
-          // changed the file not at all falls back to saying so.
+          // What the tool has to show, and how it reads. A diff is what it
+          // changed; anything else is what it said — and a diff of nothing is
+          // not worth a block of nothing, so a write that changed the file
+          // not at all falls back to saying so.
           let diff = diff.as_deref().filter(|diff| !diff.trim().is_empty());
           let (body, cap, from_end) = match diff {
             Some(diff) => (diff, DIFF_LINES, false),
@@ -1401,30 +1391,23 @@ impl App {
             // its start, so each keeps the end that matters.
             None => (output.as_str(), TOOL_OUTPUT_LINES, name == "bash"),
           };
-          let all: Vec<&str> = body.lines().collect();
-          let shown = if self.expand_tools {
-            all.len()
-          } else {
-            all.len().min(cap)
-          };
-          let hidden = all.len() - shown;
-          if hidden > 0 && from_end {
-            block(fold_note(hidden, true), dim);
+          Preview {
+            // A diff says what each line is with its first character;
+            // anything else is the tool talking, and stays out of the way.
+            body: body
+              .lines()
+              .map(|line| {
+                let mark = diff.and(line.chars().next());
+                (mark_style(mark), format!(" {line}"))
+              })
+              .collect(),
+            gutter: gutter(*running, *is_error),
+            cap,
+            expanded: self.expand_tools,
+            from_end,
+            cursor: false,
           }
-          let kept = if from_end { &all[hidden..] } else { &all[..shown] };
-          for l in kept {
-            // A diff says what it is with its first character; everything
-            // else is the tool talking, and stays out of the way.
-            let style = match diff.is_some().then(|| l.chars().next()).flatten() {
-              Some('+') => Style::default().fg(Color::Green),
-              Some('-') => Style::default().fg(Color::Red),
-              _ => dim,
-            };
-            block(format!(" {l}"), style);
-          }
-          if hidden > 0 && !from_end {
-            block(fold_note(hidden, false), dim);
-          }
+          .draw(&mut lines);
           if name == "bash" && (*running || took.is_some()) {
             let (label, elapsed) = match took {
               Some(took) => ("Took", *took),
@@ -1460,18 +1443,23 @@ impl App {
     }
     // Calls the model is still writing, drawn like the entry each will
     // become so that nothing moves when it does.
-    let cursor = || Span::styled("▌", Style::default().fg(Color::Yellow));
     for writing in &self.writing {
       lines.push(Line::default());
-      // Every line of every block, each knowing how it is marked.
-      let body: Vec<(&str, String)> = writing_body(&writing.name, &writing.args)
+      // Every line of every block, each carrying the mark it is drawn under:
+      // a replacement says which half it is, and a file's own text says
+      // nothing, since the gutter is already saying it.
+      let body: Vec<(Style, String)> = writing_body(&writing.name, &writing.args)
         .into_iter()
         .flat_map(|(mark, text)| {
+          let prefix = match mark {
+            "│" => String::new(),
+            mark => format!("{mark} "),
+          };
           // Split rather than `lines`, so a body ending in a newline keeps
           // the empty line the model is about to write into.
           text
             .split('\n')
-            .map(|line| (mark, line.to_string()))
+            .map(|line| (mark_style(mark.chars().next()), format!(" {prefix}{line}")))
             .collect::<Vec<_>>()
         })
         .collect();
@@ -1490,29 +1478,20 @@ impl App {
       // The cursor follows the model: on the first line until there is a body
       // to write into, then at the end of what has arrived.
       if body.is_empty() {
-        header.push(cursor());
+        header.push(Span::styled("▌", Style::default().fg(Color::Yellow)));
       }
       lines.push(Line::from(header));
-      // The tail is what is being written; what came before is already said.
-      let hidden = match self.expand_tools {
-        true => 0,
-        false => body.len().saturating_sub(TOOL_OUTPUT_LINES),
-      };
-      if hidden > 0 {
-        lines.push(Line::styled(format!("  │{}", fold_note(hidden, true)), dim));
+      Preview {
+        body,
+        // Nothing has gone right or wrong yet, so the plain gutter.
+        gutter: gutter(true, false),
+        cap: TOOL_OUTPUT_LINES,
+        expanded: self.expand_tools,
+        // The tail is what is being written; what came before is already said.
+        from_end: true,
+        cursor: true,
       }
-      for (i, (mark, text)) in body.iter().enumerate().skip(hidden) {
-        let style = match *mark {
-          "+" => Style::default().fg(Color::Green),
-          "-" => Style::default().fg(Color::Red),
-          _ => dim,
-        };
-        let mut spans = vec![Span::styled(format!("  {mark} {text}"), style)];
-        if i + 1 == body.len() {
-          spans.push(cursor());
-        }
-        lines.push(Line::from(spans));
-      }
+      .draw(&mut lines);
     }
     self.markdown = live;
     lines
@@ -1592,6 +1571,77 @@ fn fold_note(hidden: usize, earlier: bool) -> String {
   match hidden {
     1 => format!(" … 1 {which} line (ctrl+o)"),
     n => format!(" … {n} {which} lines (ctrl+o)"),
+  }
+}
+
+/// What a `+` and a `-` mean, wherever they are drawn — in the diff a call
+/// left behind, or in the replacement it is still writing.
+fn mark_style(mark: Option<char>) -> Style {
+  match mark {
+    Some('+') => Style::default().fg(Color::Green),
+    Some('-') => Style::default().fg(Color::Red),
+    _ => Style::default().add_modifier(Modifier::DIM),
+  }
+}
+
+/// A block of a tool's text under its line: what it said, what it changed, or
+/// what it is still writing.
+///
+/// One shape for all three. The block a call is writing and the block it
+/// leaves behind are the same thing at different moments, and drawing them
+/// from one place is what stops them drifting apart on screen.
+struct Preview {
+  /// Each line and the style it carries.
+  body: Vec<(Style, String)>,
+  /// Drawn at the head of every line: the verdict stripe once there is one,
+  /// the plain gutter until then.
+  gutter: Span<'static>,
+  cap: usize,
+  expanded: bool,
+  /// Keep the end rather than the start, for text whose point is its latest.
+  from_end: bool,
+  /// Mark the last line kept as where the model has got to.
+  cursor: bool,
+}
+
+impl Preview {
+  fn draw(self, out: &mut Vec<Line<'static>>) {
+    let Preview {
+      body,
+      gutter,
+      cap,
+      expanded,
+      from_end,
+      cursor,
+    } = self;
+    let hidden = match expanded {
+      true => 0,
+      false => body.len().saturating_sub(cap),
+    };
+    let row = |text: String, style: Style, tip: bool| {
+      let mut spans = vec![Span::raw("  "), gutter.clone(), Span::styled(text, style)];
+      if tip {
+        spans.push(Span::styled("▌", Style::default().fg(Color::Yellow)));
+      }
+      Line::from(spans)
+    };
+    if hidden > 0 && from_end {
+      out.push(row(fold_note(hidden, true), mark_style(None), false));
+    }
+    let kept: Vec<(Style, String)> = match from_end {
+      true => body.into_iter().skip(hidden).collect(),
+      false => {
+        let shown = body.len() - hidden;
+        body.into_iter().take(shown).collect()
+      }
+    };
+    let last = kept.len().saturating_sub(1);
+    for (i, (style, text)) in kept.into_iter().enumerate() {
+      out.push(row(text, style, cursor && i == last));
+    }
+    if hidden > 0 && !from_end {
+      out.push(row(fold_note(hidden, false), mark_style(None), false));
+    }
   }
 }
 
