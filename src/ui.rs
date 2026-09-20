@@ -21,7 +21,7 @@ use tokio::task::JoinHandle;
 
 use crate::agent::{AgentEvent, Agents, start_compaction, start_run};
 use crate::compaction::{self, SUMMARY_PREFIX, SUMMARY_SUFFIX, Settings};
-use crate::session::{Node, NodeKind, Session, SessionInfo, Store};
+use crate::session::{Node, NodeKind, Outcome, Session, SessionInfo, Store};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
@@ -242,10 +242,10 @@ pub struct App {
   in_flight: Option<InFlight>,
   /// Tool calls the model is still writing, oldest first.
   writing: Vec<Writing>,
-  /// Calls in this run whose result was an error, by the id the transcript
-  /// will name them with. Handed to the session so a reload draws them red
-  /// again; the transcript itself does not record it.
-  failing: HashSet<String>,
+  /// How this run's tool calls went, by the id the transcript names them
+  /// with. Handed to the session so a reload draws them the same; the
+  /// transcript itself records neither the verdict nor the diff.
+  outcomes: HashMap<String, Outcome>,
   queued: VecDeque<String>,
   /// Transcript position. `None` follows new output at the bottom; `Some`
   /// is a fixed offset from the top, so appended text does not move the view.
@@ -306,7 +306,7 @@ impl App {
       compacting: false,
       in_flight: None,
       writing: Vec::new(),
-      failing: HashSet::new(),
+      outcomes: HashMap::new(),
       queued: VecDeque::new(),
       anchor: None,
       view: (0, 0),
@@ -871,7 +871,7 @@ impl App {
     // A call the model had not finished writing was never run, and the
     // results of this turn are not the next turn's to record.
     self.writing.clear();
-    self.failing.clear();
+    self.outcomes.clear();
     if self.compacting {
       self.compacting = false;
       self.entries.push(Entry::Info("Compaction aborted.".into()));
@@ -958,8 +958,16 @@ impl App {
         call,
         diff,
       } => {
-        if is_error {
-          self.failing.insert(call.clone());
+        // What the transcript will not carry on its own.
+        if is_error || diff.is_some() {
+          self.outcomes.insert(
+            call.clone(),
+            Outcome {
+              call: call.clone(),
+              failed: is_error,
+              diff: diff.clone(),
+            },
+          );
         }
         place_result(&mut self.entries, name, output, is_error, call, diff);
       }
@@ -976,10 +984,10 @@ impl App {
         // A `/continue` run echoes back the messages it resumed from; they
         // are already in the history.
         let resumed = self.in_flight.take().map_or(0, |f| f.resumed);
-        let failing = std::mem::take(&mut self.failing);
+        let outcomes = std::mem::take(&mut self.outcomes);
         let result = self
           .session
-          .append_failing(messages.into_iter().skip(resumed).collect(), &failing);
+          .append_with(messages.into_iter().skip(resumed).collect(), &outcomes);
         self.report(result);
         self.usage.input_tokens += usage.input_tokens;
         self.usage.output_tokens += usage.output_tokens;
@@ -1001,7 +1009,7 @@ impl App {
       AgentEvent::Ended => {
         self.run = None;
         self.writing.clear();
-        self.failing.clear();
+        self.outcomes.clear();
         if self.compacting {
           self.compacting = false;
         } else {
@@ -1343,12 +1351,17 @@ impl App {
         }
         Entry::ToolCall { name, summary, .. } => {
           lines.push(Line::default());
-          lines.push(Line::from(vec![
+          let mut spans = vec![
             Span::styled("⚙ ", Style::default().fg(Color::Yellow)),
             Span::styled(name.clone(), Style::default().fg(Color::Yellow).bold()),
             Span::raw(" "),
-            Span::styled(summary.clone(), dim),
-          ]));
+          ];
+          // A command is code, and reads as code.
+          match name.as_str() {
+            "bash" => spans.extend(command_spans(summary, dim)),
+            _ => spans.push(Span::styled(summary.clone(), dim)),
+          }
+          lines.push(Line::from(spans));
         }
         Entry::ToolResult {
           name,
@@ -1360,6 +1373,16 @@ impl App {
           took,
           ..
         } => {
+          // How it went is a stripe down the side, the same for every tool, so
+          // a glance down the transcript reads as pass or fail without the
+          // text being recoloured — which the text has its own uses for.
+          let mut block = |text: String, style: Style| {
+            lines.push(Line::from(vec![
+              Span::raw("  "),
+              gutter(*running, *is_error),
+              Span::styled(text, style),
+            ]));
+          };
           if let Some(diff) = diff {
             // An edit is shown as a diff: removed red, added green, context
             // dim, capped like other tool output.
@@ -1371,25 +1394,13 @@ impl App {
                 Some('-') => Style::default().fg(Color::Red),
                 _ => dim,
               };
-              lines.push(Line::styled(format!("  {l}"), style));
+              block(l.to_string(), style);
             }
             if all.len() > shown {
-              lines.push(Line::styled(format!("  … {} more lines", all.len() - shown), dim));
+              block(format!(" … {} more lines", all.len() - shown), dim);
             }
             continue;
           }
-          // A command is worth reading as pass or fail at a glance, so its
-          // output carries the verdict. Other tools stay dim: a file read
-          // back in green would be colour for its own sake, and the text of
-          // a file has its own reasons to be coloured.
-          let style = if *is_error {
-            Style::default().fg(Color::Red)
-          } else if name == "bash" && !*running {
-            // Still running is not yet a verdict.
-            Style::default().fg(Color::Green)
-          } else {
-            dim
-          };
           let all: Vec<&str> = output.lines().collect();
           let shown = all.len().min(TOOL_OUTPUT_LINES);
           let hidden = all.len() - shown;
@@ -1397,17 +1408,17 @@ impl App {
           // start.
           if name == "bash" {
             if hidden > 0 {
-              lines.push(Line::styled(format!("  │ … {hidden} earlier lines"), dim));
+              block(format!(" … {hidden} earlier lines"), dim);
             }
             for l in &all[hidden..] {
-              lines.push(Line::styled(format!("  │ {l}"), style));
+              block(format!(" {l}"), dim);
             }
           } else {
             for l in &all[..shown] {
-              lines.push(Line::styled(format!("  │ {l}"), style));
+              block(format!(" {l}"), dim);
             }
             if hidden > 0 {
-              lines.push(Line::styled(format!("  │ … {hidden} more lines"), dim));
+              block(format!(" … {hidden} more lines"), dim);
             }
           }
           if name == "bash" && (*running || took.is_some()) {
@@ -1460,12 +1471,18 @@ impl App {
             .collect::<Vec<_>>()
         })
         .collect();
+      let summary = writing_summary(&writing.name, &writing.args);
       let mut header = vec![
         Span::styled("⚙ ", Style::default().fg(Color::Yellow)),
         Span::styled(writing.name.clone(), Style::default().fg(Color::Yellow).bold()),
         Span::raw(" "),
-        Span::styled(writing_summary(&writing.name, &writing.args), dim),
       ];
+      // Highlighted as it is typed, so the line does not recolour under the
+      // reader when the call is finally made.
+      match writing.name.as_str() {
+        "bash" => header.extend(command_spans(&summary, dim)),
+        _ => header.push(Span::styled(summary, dim)),
+      }
       // The cursor follows the model: on the first line until there is a body
       // to write into, then at the end of what has arrived.
       if body.is_empty() {
@@ -1559,6 +1576,38 @@ fn finish_running(entries: &mut [Entry]) {
       *took = Some(started.elapsed());
     }
   }
+}
+
+/// The stripe down the side of a finished tool's output, saying how it went.
+///
+/// A background rather than coloured text, so the output keeps whatever
+/// colours are its own — and one cell wide, which is where the terminal's own
+/// red and green are right: saturated enough to read at a glance, and carrying
+/// no text to be legible against. A tool still running has no verdict yet, so
+/// it keeps the plain gutter.
+fn gutter(running: bool, is_error: bool) -> Span<'static> {
+  match (running, is_error) {
+    (true, _) => Span::styled("│", Style::default().add_modifier(Modifier::DIM)),
+    (false, true) => Span::styled(" ", Style::default().bg(Color::Red)),
+    (false, false) => Span::styled(" ", Style::default().bg(Color::Green)),
+  }
+}
+
+/// A command as bash, so a long one reads as the code it is.
+///
+/// Falls back to the plain line when the grammar was not built in, which is
+/// the same text either way.
+fn command_spans(command: &str, style: Style) -> Vec<Span<'static>> {
+  crate::highlight::highlight("bash", command)
+    .and_then(|lines| lines.into_iter().next())
+    .filter(|spans| !spans.is_empty())
+    .map(|spans| {
+      spans
+        .into_iter()
+        .map(|span| Span::styled(span.content, style.patch(span.style)))
+        .collect()
+    })
+    .unwrap_or_else(|| vec![Span::styled(command.to_string(), style)])
 }
 
 /// Where the call `call` was announced.
@@ -1692,17 +1741,18 @@ impl<'a> Results<'a> {
       })
       .collect::<Vec<_>>()
       .join("\n");
+    // A failed result reads like any other in the transcript, and the diff an
+    // edit produced is not in it at all, so both are things the session
+    // remembers — against this result's own call, since one message can
+    // answer several calls that went differently.
+    let outcome = crate::session::result_ids(result).find_map(|id| session.outcome(&id));
     Entry::ToolResult {
       name: result.name.clone(),
       output,
       call: result.call.as_str().to_string(),
-      // A failed tool result reads like any other in the transcript, so
-      // whether it was one is something the session remembers — against this
-      // result's own call, since one message can answer several calls with
-      // different luck.
-      is_error: crate::session::result_ids(result).any(|id| session.failed(&id)),
+      is_error: outcome.is_some_and(|outcome| outcome.failed),
       running: false,
-      diff: None,
+      diff: outcome.and_then(|outcome| outcome.diff.clone()),
       started: now,
       took: None,
     }

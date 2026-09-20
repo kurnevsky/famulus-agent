@@ -182,9 +182,20 @@ at a time (rig's `tool_concurrency` defaults to 1 and fa leaves it there), but
 were that raised, two commands in flight would still each keep their own
 output.
 
-A command's output is green when it succeeded and red when it did not, live
-and on a session reopened later alike. Other tools stay dim, since exit status
-is a thing commands have; a failed `read` or `edit` is still red.
+A finished tool's output carries a stripe down its side saying how it went —
+green when it worked, red when it did not — in place of the `│` gutter it has
+while it is still running, which is not yet a verdict. The same for every
+tool, so a glance down the transcript reads as pass or fail without the text
+being recoloured, which the text has its own uses for. The stripe is a
+background rather than coloured text, and one cell wide: that is where the
+terminal's own red and green are right, saturated enough to read at a glance
+and carrying no text to be legible against, so it needs no colour of fa's own
+and follows whatever theme the terminal is wearing. A command's own line is
+highlighted as bash, by the same tree-sitter grammar the code blocks use.
+
+All of it reads the same on a session reopened later, which takes the session
+remembering two things a transcript does not carry: whether each tool result
+was an error, and the diff an `edit` produced.
 
 The line itself shows only what the finished line leads with — the command, or
 the path — so it and the entry it becomes read the same and nothing moves when

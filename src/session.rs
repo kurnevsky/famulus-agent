@@ -40,12 +40,10 @@ enum Record {
     id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent: Option<String>,
-    /// Tool calls this message answers with an error, by the id the result
-    /// carries. A failed tool result is indistinguishable from a successful
-    /// one on the wire, so a session that wants to draw it the same way
-    /// tomorrow has to remember which was which.
+    /// What the transcript does not say about the tool results in this
+    /// message, by the call each answers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    failed: Vec<String>,
+    outcomes: Vec<Outcome>,
     message: Message,
   },
   /// Compaction replaced everything above it with a summary. The turns it
@@ -62,6 +60,22 @@ enum Record {
   Leaf { id: Option<String> },
   /// The user named the session.
   Name { name: String },
+}
+
+/// How a tool result went, which its transcript does not record.
+///
+/// A failed result looks exactly like a successful one on the wire, and the
+/// diff an `edit` produced is not in the transcript at all — it was worked
+/// out while the edit ran. Both were on screen at the time, so both are kept
+/// here, or reopening the session would quietly lose them.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct Outcome {
+  /// The call this answers, as the result names it.
+  pub call: String,
+  #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+  pub failed: bool,
+  #[serde(default, skip_serializing_if = "Option::is_none")]
+  pub diff: Option<String>,
 }
 
 /// The global directory holding all session files.
@@ -344,8 +358,8 @@ pub struct Session {
   leaf: Option<String>,
   /// Counter behind `mint`, past every id already in the file.
   ids: u64,
-  /// Tool calls whose result was an error, by the id the result carries.
-  failed: HashSet<String>,
+  /// How each tool result went, by the call it answers.
+  outcomes: HashMap<String, Outcome>,
   /// The session this one was forked from, written into its header.
   parent: Option<String>,
   /// Where new sessions get their file; `None` disables persistence.
@@ -366,7 +380,7 @@ impl Session {
       nodes: Vec::new(),
       leaf: None,
       ids: 0,
-      failed: HashSet::new(),
+      outcomes: HashMap::new(),
       parent: None,
       dir: store.map(|s| s.dir.clone()),
       file: None,
@@ -398,7 +412,7 @@ impl Session {
       nodes: Vec::new(),
       leaf: None,
       ids: 0,
-      failed: HashSet::new(),
+      outcomes: HashMap::new(),
       parent,
       dir: path.parent().map(Path::to_path_buf),
       file: None,
@@ -414,10 +428,12 @@ impl Session {
         Record::Message {
           id,
           parent,
-          failed,
+          outcomes,
           message,
         } => {
-          session.failed.extend(failed);
+          session
+            .outcomes
+            .extend(outcomes.into_iter().map(|outcome| (outcome.call.clone(), outcome)));
           (id, parent, NodeKind::Message(message))
         }
         Record::Compaction { id, parent, summary } => (id, parent, NodeKind::Checkpoint { summary }),
@@ -530,23 +546,25 @@ impl Session {
 
   /// Extend the conversation, each message a child of the one before it.
   pub fn append(&mut self, messages: Vec<Message>) -> Result<()> {
-    self.append_failing(messages, &HashSet::new())
+    self.append_with(messages, &HashMap::new())
   }
 
-  /// The same, told which of the tool calls these messages answer came back
-  /// an error, so the transcript can be drawn the same way when it is
-  /// reopened. `failing` may name calls from any turn; only the ones these
-  /// messages actually answer are written.
-  pub fn append_failing(&mut self, messages: Vec<Message>, failing: &HashSet<String>) -> Result<()> {
+  /// The same, told how the tool calls these messages answer went, so the
+  /// transcript can be drawn the same way when it is reopened. `outcomes` may
+  /// describe calls from any turn; only the ones these messages actually
+  /// answer are written.
+  pub fn append_with(&mut self, messages: Vec<Message>, outcomes: &HashMap<String, Outcome>) -> Result<()> {
     let mut records = Vec::with_capacity(messages.len());
     for message in messages {
       let id = self.mint();
-      let failed: Vec<String> = call_ids(&message).filter(|id| failing.contains(id)).collect();
-      self.failed.extend(failed.iter().cloned());
+      let answered: Vec<Outcome> = call_ids(&message).filter_map(|id| outcomes.get(&id).cloned()).collect();
+      for outcome in &answered {
+        self.outcomes.insert(outcome.call.clone(), outcome.clone());
+      }
       records.push(Record::Message {
         id: id.clone(),
         parent: self.leaf.clone(),
-        failed,
+        outcomes: answered,
         message: message.clone(),
       });
       self.history.push(message.clone());
@@ -560,9 +578,9 @@ impl Session {
     self.write_all(&records)
   }
 
-  /// Whether the tool result answering `call` was an error.
-  pub fn failed(&self, call: &str) -> bool {
-    self.failed.contains(call)
+  /// How the tool result answering `call` went, if anything was recorded.
+  pub fn outcome(&self, call: &str) -> Option<&Outcome> {
+    self.outcomes.get(call)
   }
 
   /// Replace the history after compaction and persist the checkpoint.
@@ -628,7 +646,7 @@ impl Session {
       leaf: None,
       ids: 0,
       // The fork draws the conversation it copied the same way this one did.
-      failed: self.failed.clone(),
+      outcomes: self.outcomes.clone(),
       parent: self.path().map(|path| path.display().to_string()),
       dir: self.dir.clone(),
       file: None,
@@ -833,27 +851,52 @@ mod tests {
   }
 
   #[test]
-  fn which_tool_results_failed_survives_a_reload() {
-    let store = temp_store("failed");
+  fn how_a_tool_result_went_survives_a_reload() {
+    let store = temp_store("outcomes");
     let mut session = Session::new(Some(&store), Path::new("/work"), "mock");
     let messages = vec![
       tool_result("a", "all good"),
       tool_result("b", "Command exited with code 1"),
+      tool_result("c", "Successfully replaced 1 block(s)."),
     ];
-    // Nothing in a tool result says it failed, so the session is told.
-    session
-      .append_failing(messages, &HashSet::from(["b".to_string()]))
-      .unwrap();
-    assert!(!session.failed("a"));
-    assert!(session.failed("b"));
+    // None of that is in a transcript: a failed result looks like any other,
+    // and the diff an edit produced is not there at all.
+    let outcomes = HashMap::from([
+      (
+        "b".to_string(),
+        Outcome {
+          call: "b".into(),
+          failed: true,
+          diff: None,
+        },
+      ),
+      (
+        "c".to_string(),
+        Outcome {
+          call: "c".into(),
+          failed: false,
+          diff: Some(" 1 before\n-2 old\n+2 new".into()),
+        },
+      ),
+    ]);
+    session.append_with(messages, &outcomes).unwrap();
 
     let path = session.path().unwrap().to_path_buf();
-    let loaded = Session::load(&path).unwrap();
-    assert!(!loaded.failed("a"), "a succeeded before and still did");
-    assert!(loaded.failed("b"), "b failed before and still did");
+    for (which, session) in [("now", &session), ("reopened", &Session::load(&path).unwrap())] {
+      assert!(session.outcome("a").is_none(), "{which}: nothing to say about a");
+      assert!(session.outcome("b").unwrap().failed, "{which}: b failed");
+      assert!(!session.outcome("c").unwrap().failed, "{which}: c did not");
+      assert_eq!(
+        session.outcome("c").unwrap().diff.as_deref(),
+        Some(" 1 before\n-2 old\n+2 new"),
+        "{which}: c keeps its diff"
+      );
+    }
 
     // A fork draws the conversation it copied the same way.
-    assert!(session.fork(session.leaf()).unwrap().failed("b"));
+    let forked = session.fork(session.leaf()).unwrap();
+    assert!(forked.outcome("b").unwrap().failed);
+    assert!(forked.outcome("c").unwrap().diff.is_some());
     std::fs::remove_dir_all(&store.dir).unwrap();
   }
 
