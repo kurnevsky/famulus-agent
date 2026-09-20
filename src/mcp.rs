@@ -128,7 +128,7 @@ fn search(config_home: Option<String>, home: Option<String>, config_dirs: Option
 }
 
 /// Read every file that is there. A file that cannot be read or makes no sense
-/// is a note rather than a failure: the session still has its own four tools,
+/// is a note rather than a failure: the session still has its own five tools,
 /// and saying so beats refusing to start.
 ///
 /// `strict` is for a file that was asked for by name, where not being there is
@@ -267,7 +267,7 @@ pub async fn connect(config: Config) -> Servers {
       None => tools,
     };
     // A tool cannot be had twice under one name: the model would have no way
-    // to say which it meant, and the four the system prompt describes are the
+    // to say which it meant, and the five the system prompt describes are the
     // ones it was told about.
     let (tools, clashed): (Vec<_>, Vec<_>) = tools
       .into_iter()

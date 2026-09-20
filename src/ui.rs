@@ -16,10 +16,11 @@ use ratatui::{DefaultTerminal, Frame};
 use ratatui_textarea::{TextArea, WrapMode};
 use rig_core::completion::{Message, Usage};
 use rig_core::message::{AssistantContent, ToolCall, ToolResult, ToolResultContent, UserContent};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::agent::{AgentEvent, Agents, start_compaction, start_run};
+use crate::ask::{self, Dialog};
 use crate::compaction::{self, SUMMARY_PREFIX, SUMMARY_SUFFIX, Settings};
 use crate::session::{Node, NodeKind, Outcome, Session, SessionInfo, Store};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
@@ -232,6 +233,15 @@ enum OverlayList {
   Tree(Vec<Point>),
   /// `/fork`: the prompts, to start a new session from one of them.
   Fork(Vec<Point>),
+  /// What the `ask` tool put to the user, and the channel the answer goes
+  /// back down. The dialog keeps its own cursor, so `Overlay::selected` says
+  /// nothing about this one.
+  Question {
+    dialog: Box<Dialog>,
+    /// Taken when the questionnaire is answered. Dropping it unanswered is
+    /// what tells the tool the user walked away.
+    reply: Option<oneshot::Sender<ask::Outcome>>,
+  },
 }
 
 /// A point the conversation can be moved to.
@@ -256,13 +266,14 @@ impl Overlay {
   fn points(&self) -> &[Point] {
     match &self.list {
       OverlayList::Tree(points) | OverlayList::Fork(points) => points,
-      OverlayList::Sessions(_) => &[],
+      OverlayList::Sessions(_) | OverlayList::Question { .. } => &[],
     }
   }
 
   fn len(&self) -> usize {
     match &self.list {
       OverlayList::Sessions(sessions) => sessions.len(),
+      OverlayList::Question { .. } => 0,
       _ => self.points().len(),
     }
   }
@@ -272,6 +283,17 @@ impl Overlay {
       OverlayList::Sessions(_) => " Resume session — ↑↓ select · Enter resume · Esc cancel ",
       OverlayList::Tree(_) => " Tree — ↑↓ PgUp/PgDn select · Enter go there · Esc cancel ",
       OverlayList::Fork(_) => " Fork — ↑↓ PgUp/PgDn select · Enter fork · Esc cancel ",
+      // The dialog says which keys do what along its own bottom, where the
+      // answer to that changes with the question.
+      OverlayList::Question { .. } => " The model is asking ",
+    }
+  }
+
+  /// The questionnaire this overlay is, if it is one.
+  fn dialog(&mut self) -> Option<(&mut Dialog, &mut Option<oneshot::Sender<ask::Outcome>>)> {
+    match &mut self.list {
+      OverlayList::Question { dialog, reply } => Some((dialog, reply)),
+      _ => None,
     }
   }
 }
@@ -336,7 +358,7 @@ pub struct App {
   cwd: PathBuf,
   store: Option<Store>,
   /// How many MCP servers came up, and how many tools they brought, for the
-  /// footer to say a session has more than the four it was built with.
+  /// footer to say a session has more than the five it was built with.
   mcp: (usize, usize),
   /// The conversation: history plus its on-disk file.
   session: Session,
@@ -519,6 +541,10 @@ impl App {
       return;
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if self.overlay.as_mut().is_some_and(|o| o.dialog().is_some()) {
+      self.handle_question_key(key, ctrl);
+      return;
+    }
     if self.overlay.is_some() {
       self.handle_overlay_key(key.code, ctrl);
       return;
@@ -646,6 +672,29 @@ impl App {
       .and_then(|prev| items.iter().position(|m| m.index == prev))
       .unwrap_or(0);
     self.completion = Some(Completion { items, selected });
+  }
+
+  /// A key while the model's questionnaire is open. It is the dialog's to
+  /// answer — the whole keyboard belongs to it while it is up, which is what
+  /// makes typing an answer of one's own possible at all.
+  ///
+  /// Ctrl+C is the exception: the run the question came from is still in
+  /// flight, and stopping it is what that key means everywhere else in fa.
+  fn handle_question_key(&mut self, key: KeyEvent, ctrl: bool) {
+    if ctrl && key.code == KeyCode::Char('c') {
+      self.abort();
+      return;
+    }
+    let Some((dialog, reply)) = self.overlay.as_mut().and_then(Overlay::dialog) else {
+      return;
+    };
+    let Some(outcome) = dialog.key(key) else {
+      return;
+    };
+    if let Some(reply) = reply.take() {
+      let _ = reply.send(outcome);
+    }
+    self.overlay = None;
   }
 
   fn handle_overlay_key(&mut self, code: KeyCode, ctrl: bool) {
@@ -1019,6 +1068,9 @@ impl App {
   }
 
   fn abort(&mut self) {
+    // A question the run was waiting on has nobody left to answer to; closing
+    // it drops the channel, which is how the tool hears that.
+    self.close_question();
     let Some(handle) = self.run.take() else {
       return;
     };
@@ -1044,6 +1096,14 @@ impl App {
         .push(Entry::Info(format!("Not sent: {}", first_line(&text))));
     }
     self.waiting();
+  }
+
+  /// Take down the model's questionnaire, if one is up. What it had been
+  /// asked is left unanswered, which the tool reads as a decline.
+  fn close_question(&mut self) {
+    if self.overlay.as_mut().is_some_and(|o| o.dialog().is_some()) {
+      self.overlay = None;
+    }
   }
 
   /// Freeze every live tool output when the run was killed.
@@ -1154,6 +1214,18 @@ impl App {
           },
         );
       }
+      // The question takes the screen until it is answered: the run that
+      // asked it is waiting on the answer, so there is nothing else to be
+      // doing here anyway.
+      AgentEvent::AskUser { questions, reply } => {
+        self.overlay = Some(Overlay {
+          list: OverlayList::Question {
+            dialog: Box::new(Dialog::new(questions)),
+            reply: Some(reply),
+          },
+          selected: 0,
+        });
+      }
       AgentEvent::Error(err) => {
         self.entries.push(Entry::Error(err));
       }
@@ -1164,6 +1236,7 @@ impl App {
       } => {
         self.run = None;
         self.writing.clear();
+        self.close_question();
         // A `/continue` run echoes back the messages it resumed from; they
         // are already in the history.
         let resumed = self.in_flight.take().map_or(0, |f| f.resumed);
@@ -1193,6 +1266,7 @@ impl App {
         self.run = None;
         self.writing.clear();
         self.outcomes.clear();
+        self.close_question();
         if self.compacting {
           self.compacting = false;
         } else {
@@ -1366,6 +1440,17 @@ impl App {
     f.render_widget(block, area);
     let height = inner.height as usize;
     let width = inner.width as usize;
+    if let OverlayList::Question { dialog, .. } = &overlay.list {
+      let (lines, focus) = dialog.lines(inner.width);
+      // More dialog than screen: scroll it just far enough to keep the row
+      // the cursor is on in view, which is the row being answered.
+      let first = focus.saturating_sub(height.saturating_sub(1)).min(focus);
+      f.render_widget(
+        Paragraph::new(lines.into_iter().skip(first).take(height).collect::<Vec<_>>()),
+        inner,
+      );
+      return;
+    }
     // The window ends at the selection, so moving down walks off the bottom
     // rather than jumping the list around.
     let first = overlay.selected.saturating_sub(height.saturating_sub(1));
@@ -1401,6 +1486,8 @@ impl App {
         .iter()
         .map(|p| (p.label.clone(), format!("keeps {}", messages(p.len))))
         .collect(),
+      // Drawn above, where it draws itself.
+      OverlayList::Question { .. } => Vec::new(),
     };
     let dim = Style::default().add_modifier(Modifier::DIM);
     let mut lines = Vec::new();
@@ -1768,7 +1855,7 @@ fn prefix(lead: &'static str, line: Line<'static>) -> Line<'static> {
 }
 
 /// Alt+Enter and Shift+Enter (where the terminal reports it) insert a newline.
-fn is_newline(key: &KeyEvent) -> bool {
+pub fn is_newline(key: &KeyEvent) -> bool {
   key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT)
 }
 
@@ -2444,6 +2531,19 @@ fn summarize_args(name: &str, args: &serde_json::Value) -> String {
     "edit" => get("path").map(|p| {
       let n = args.get("edits").and_then(|e| e.as_array()).map_or(0, Vec::len);
       format!("{p} ({n} edit{})", if n == 1 { "" } else { "s" })
+    }),
+    // What was asked, which is the line the dialog was drawn over and the
+    // line the answer under it is an answer to.
+    "ask" => args.get("questions").and_then(|q| q.as_array()).map(|questions| {
+      let first = questions
+        .first()
+        .and_then(|q| q.get("question"))
+        .and_then(|q| q.as_str())
+        .unwrap_or_default();
+      match questions.len() {
+        0 | 1 => first.to_string(),
+        n => format!("{first} (+{} more)", n - 1),
+      }
     }),
     _ => None,
   };

@@ -1164,7 +1164,8 @@ fn a_session_can_be_held_to_some_of_its_tools() {
     &provider,
     &["--no-session", "--no-tools", "write,edit,bash"],
   );
-  let screen = term.wait_for("Tools this session: read.");
+  // Asking is not changing anything, so a read-only session keeps it.
+  let screen = term.wait_for("Tools this session: read, ask.");
   // And nothing about MCP in the footer of a session that has no servers.
   assert!(!screen.contains("mcp"), "no servers, nothing said:\n{screen}");
   term.submit("what is here");
@@ -1172,7 +1173,7 @@ fn a_session_can_be_held_to_some_of_its_tools() {
 
   let request = provider.request("what is here");
   assert!(
-    request.contains(r#""name":"read""#),
+    request.contains(r#""name":"read""#) && request.contains(r#""name":"ask""#),
     "what is left is offered: {request}"
   );
   for gone in [r#""name":"write""#, r#""name":"edit""#, r#""name":"bash""#] {
@@ -1235,4 +1236,170 @@ fn what_a_session_shows_is_what_it_showed_before_it_was_closed() {
       .collect::<Vec<_>>()
   };
   assert_eq!(body(&before), body(&after), "\nbefore:\n{before}\nafter:\n{after}");
+}
+
+#[test]
+fn a_question_the_model_asked_is_answered_in_a_dialog_and_read_back() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "I need to know two things.",
+      tool: "ask",
+      args: serde_json::json!({
+        "questions": [
+          {
+            "question": "Which cache?",
+            "header": "Cache",
+            "options": [
+              { "label": "In memory", "description": "fast, lost on restart" },
+              { "label": "On disk", "description": "survives a restart" },
+            ],
+          },
+          {
+            "question": "Which tests?",
+            "header": "Tests",
+            "multiSelect": true,
+            "options": [
+              { "label": "Unit", "description": "the functions on their own" },
+              { "label": "Integration", "description": "the pieces together" },
+            ],
+          },
+        ],
+      }),
+    },
+    Turn::Say("Understood."),
+  ]);
+  let term = Term::start("asking", &provider, &["--no-session"]);
+  term.submit("add caching");
+
+  // The first question is up, with its options and the row to type in.
+  // Waiting on a row rather than on the question, which the line announcing
+  // the call already says.
+  let screen = term.wait_for("› 1. In memory");
+  assert!(screen.contains("survives a restart"), "and what each means:\n{screen}");
+  assert!(screen.contains("3. Type something."), "{screen}");
+  assert!(screen.contains("Tab to switch questions"), "{screen}");
+
+  // Answering it moves on to the next, which has boxes rather than a choice.
+  term.type_in("Down");
+  term.type_in("Enter");
+  let screen = term.wait_for("[ ] Unit");
+  assert!(screen.contains("■ Cache"), "the answered tab is filled in:\n{screen}");
+
+  // Space ticks, and the Next row commits — which lands on the review.
+  term.type_in("Space");
+  term.type_in("Down");
+  term.type_in("Down");
+  term.type_in("Down");
+  term.type_in("Enter");
+  let screen = term.wait_for("Review your answers");
+  assert!(screen.contains("→ On disk"), "what was answered:\n{screen}");
+  assert!(screen.contains("→ Unit"), "{screen}");
+  assert!(screen.contains("Ready to submit"), "nothing left blank:\n{screen}");
+
+  term.type_in("Enter");
+  let screen = term.wait_for("Understood.");
+  // The transcript keeps what was asked and what was answered, with the
+  // dialog gone.
+  assert!(screen.contains("⚙ ask Which cache? (+1 more)"), "{screen}");
+  assert!(
+    screen.contains("User has answered your questions"),
+    "the answer is under the call:\n{screen}"
+  );
+  // What the model was told is the extension's own envelope.
+  assert!(
+    provider.sent(
+      "User has answered your questions: \\\"Which cache?\\\"=\\\"On disk\\\". \
+       \\\"Which tests?\\\"=\\\"Unit\\\". You can now continue with the user's answers in mind."
+    ),
+    "the answers went back: {}",
+    provider.request("Which cache?")
+  );
+}
+
+#[test]
+fn a_question_nobody_answers_is_a_decline_and_the_run_carries_on() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "",
+      tool: "ask",
+      args: serde_json::json!({
+        "questions": [{
+          "question": "Which cache?",
+          "header": "Cache",
+          "options": [
+            { "label": "In memory", "description": "fast, lost on restart" },
+            { "label": "On disk", "description": "survives a restart" },
+          ],
+        }],
+      }),
+    },
+    Turn::Say("I will guess then."),
+  ]);
+  let term = Term::start("declining", &provider, &["--no-session"]);
+  term.submit("add caching");
+  let screen = term.wait_for("› 1. In memory");
+  // One question has no tabs to switch between and nothing to review.
+  assert!(!screen.contains("Tab to switch questions"), "{screen}");
+  assert!(
+    screen.contains("Cache"),
+    "the header, where there is no tab strip:\n{screen}"
+  );
+
+  term.type_in("Escape");
+  term.wait_for("I will guess then.");
+  assert!(
+    provider.sent("User declined to answer questions"),
+    "the decline went back: {}",
+    provider.request("Which cache?")
+  );
+}
+
+#[test]
+fn an_answer_of_ones_own_is_typed_into_the_row_that_offers_it() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "",
+      tool: "ask",
+      args: serde_json::json!({
+        "questions": [{
+          "question": "Which cache?",
+          "header": "Cache",
+          "options": [
+            { "label": "In memory", "description": "fast, lost on restart" },
+            { "label": "On disk", "description": "survives a restart" },
+          ],
+        }],
+      }),
+    },
+    Turn::Say("Redis it is."),
+  ]);
+  let term = Term::start("typing", &provider, &["--no-session"]);
+  term.submit("add caching");
+  term.wait_for("› 1. In memory");
+
+  // The row above the first is the last one, which is the one typed into.
+  term.type_in("Up");
+  term.type_in("redis");
+  let screen = term.wait_for("redis▌");
+  assert!(
+    screen.contains("Shift+Enter for newline"),
+    "the hint follows the keys:\n{screen}"
+  );
+
+  term.type_in("Enter");
+  term.wait_for("Redis it is.");
+  assert!(
+    provider.sent("\\\"Which cache?\\\"=\\\"redis\\\""),
+    "what was typed went back: {}",
+    provider.request("Which cache?")
+  );
 }

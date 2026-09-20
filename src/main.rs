@@ -1,4 +1,5 @@
 mod agent;
+mod ask;
 mod compaction;
 mod edit;
 mod highlight;

@@ -23,11 +23,11 @@ use rig_core::completion::{
 use rig_core::message::{ToolResultContent, UserContent};
 use rig_core::providers::{gemini, openai};
 use rig_core::streaming::{StreamedAssistantContent, StreamingCompletionResponse, ToolCallDeltaContent};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::compaction::{self, Compacted, Settings};
-use crate::tools::{BashTool, CALL_ARG, EditDiff, EditTool, ReadTool, WriteTool};
+use crate::tools::{AskTool, BashTool, CALL_ARG, EditDiff, EditTool, ReadTool, WriteTool};
 
 /// Events streamed from a run to the UI.
 #[derive(Debug)]
@@ -81,6 +81,13 @@ pub enum AgentEvent {
     messages: Vec<Message>,
     usage: Usage,
     context_tokens: u64,
+  },
+  /// The `ask` tool wants the user to answer something. The dialog the UI
+  /// opens sends what they said back down `reply`; dropping it instead is a
+  /// decline, which is what an aborted run leaves behind.
+  AskUser {
+    questions: Vec<crate::ask::Question>,
+    reply: oneshot::Sender<crate::ask::Outcome>,
   },
   /// The run ended without a final response (after an `Error`).
   Ended,
@@ -248,6 +255,7 @@ pub fn build_agents(
   };
 
   let output_tx = tx.clone();
+  let ask_tx = tx.clone();
   let waiting = Waiting::default();
   let agent = agent
     .preamble(&preamble)
@@ -268,8 +276,13 @@ pub fn build_agents(
       on_output: Some(Arc::new(move |call, text| {
         let _ = output_tx.send(AgentEvent::ToolOutput { call, text });
       })),
+    })
+    .tool(AskTool {
+      ask: Some(Arc::new(move |questions, reply| {
+        let _ = ask_tx.send(AgentEvent::AskUser { questions, reply });
+      })),
     });
-  // Whatever the session's MCP servers offer, alongside the four the agent
+  // Whatever the session's MCP servers offer, alongside the five the agent
   // brought: a tool is a tool, and the transcript draws them all the same.
   let agent = crate::mcp::attach(agent, servers).build();
   let summarizer = summarizer
@@ -392,6 +405,7 @@ fn default_system_prompt(cwd: &Path, tools: Option<&[String]>) -> String {
          - bash: Execute bash commands (ls, grep, find, etc.)\n\
          - edit: Make precise file edits with exact text replacement, including multiple disjoint edits in one call\n\
          - write: Create or overwrite files\n\
+         - ask: Ask the user up to 4 structured questions (2-4 options each) when requirements are ambiguous\n\
          </tools>\n\n\
          <rules>\n\
          - Use bash for file operations like ls, rg, find\n\
@@ -401,6 +415,7 @@ fn default_system_prompt(cwd: &Path, tools: Option<&[String]>) -> String {
          - Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.\n\
          - Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.\n\
          - Use write only for new files or complete rewrites.\n\
+         - Use ask whenever the request is underspecified and you cannot proceed without a concrete decision; do not ask what the code itself can answer\n\
          - Be concise in your responses\n\
          - Show file paths clearly when working with files\n\
          </rules>\n",
@@ -644,6 +659,7 @@ mod tests {
         AgentEvent::Error(e) => format!("error:{e}"),
         AgentEvent::Ended => "ended".into(),
         AgentEvent::Compacted(_) => "compacted".into(),
+        AgentEvent::AskUser { .. } => "asking".into(),
       })
       .collect();
     assert!(names.contains(&"call:bash".to_string()), "{names:?}");
@@ -819,7 +835,7 @@ mod tests {
     assert!(reading.contains("Use read to examine files"));
     assert!(reading.contains("<cwd>\n/work\n</cwd>"));
 
-    // A list that leaves the built-in four alone changes nothing, however
+    // A list that leaves the built-in five alone changes nothing, however
     // many other tools it names.
     let with_mcp = default_system_prompt(
       Path::new("/work"),

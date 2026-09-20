@@ -1,8 +1,8 @@
 # fa
 
 A minimal terminal coding agent in Rust, in the spirit of [pi](https://pi.dev):
-one streaming transcript, one input box, four tools (`read`, `write`, `edit`,
-`bash`). Built on [rig](https://crates.io/crates/rig-core) for the LLM loop and
+one streaming transcript, one input box, five tools (`read`, `write`, `edit`,
+`bash`, `ask`). Built on [rig](https://crates.io/crates/rig-core) for the LLM loop and
 [ratatui](https://ratatui.rs) + [ratatui-textarea](https://crates.io/crates/ratatui-textarea)
 for the interface. Talks to any OpenAI-compatible chat completions endpoint,
 or to Google Gemini.
@@ -51,7 +51,7 @@ exists there, it is appended to the system prompt.
 
 ## Which tools
 
-`--tools` and `--no-tools` name what the model is offered, out of the four
+`--tools` and `--no-tools` name what the model is offered, out of the five
 built-in ones and whatever the MCP servers brought — one list, since the model
 is offered them as one:
 
@@ -73,14 +73,69 @@ tool quietly left in or out.
 
 Tools are all registered either way; the list is what each request advertises,
 and rig refuses a call to anything left out of it. The system prompt follows:
-what it says about `bash`, `edit` and `write` is dropped when they are not
-this session's, because a model told about a tool and then refused it tries
+what it says about `bash`, `edit`, `write` and `ask` is dropped when they are
+not this session's, because a model told about a tool and then refused it tries
 anyway and reports being refused, instead of using what it does have. A
 `--system-prompt` of your own is left alone.
 
+## Asking you
+
+Four of the tools do something to the project. The fifth, `ask`, does something
+to you: it stops and puts a question on the screen, and the run waits on the
+answer. It is a port of [`rpiv-ask-user-question`](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-ask-user-question),
+the pi extension: the same questions, the same dialog, and the same envelope
+read back to the model word for word. The tool answers to `ask` here rather
+than to `ask_user_question`, which is the one thing a prompt written for the
+extension has to be told.
+
+```
+╭ The model is asking ─────────────────────────────────────────────────────────╮
+│ ←  ■ Cache   □ Tests   ✓ Submit  →                                           │
+│                                                                              │
+│Which tests?                                                                  │
+│                                                                              │
+│› 1. [✔] Unit                                                                 │
+│         the functions on their own                                           │
+│  2. [ ] Integration                                                          │
+│         the pieces together                                                  │
+│  3. [ ] Type something.                                                      │
+│  Next                                                                        │
+│                                                                              │
+│Enter to select · ↑/↓ to navigate · Space to toggle · Tab to switch question… │
+╰──────────────────────────────────────────────────────────────────────────────╯
+```
+
+One call carries up to four questions, each with two to four options and a line
+under each saying what it means. More than one and they are tabs: `Tab` and
+`Shift+Tab` (or `←`/`→`) move between them, a box in the strip fills as each is
+answered, and the last tab reviews the answers and names anything still blank.
+Submitting with a question left blank is allowed — a partial answer beats a
+dismissed dialog — and the questions left out simply say nothing to the model.
+
+Every question ends with a `Type something.` row, so the options are never a
+cage: walk onto it and it takes the keyboard, `Shift+Enter` breaks a line,
+`Ctrl+U` clears it, and the arrows walk the draft before they walk the list
+again. What you type stays in the row while you look at the other options, and
+is kept per question.
+
+A multi-select question has boxes instead of a choice. `Space` ticks the row
+under the cursor and so does `Enter`, which makes ticking a list cost nothing;
+the question is committed from the `Next` row at the bottom. Ticking a box
+answers the question straight away, so the tab strip keeps up.
+
+`Esc` walks away from the whole questionnaire, and so does `Ctrl+C`, which also
+stops the run it belonged to. Either way the model is told
+`User declined to answer questions` — one signal for "they did not answer",
+rather than one per way of not answering. A run aborted while the dialog is up
+takes the dialog with it.
+
+`--no-tools ask` takes it away altogether, for a session that should get on
+with it rather than stop to ask — the system prompt then says nothing about
+asking either.
+
 ## MCP
 
-Tools from [MCP](https://modelcontextprotocol.io) servers sit beside the four
+Tools from [MCP](https://modelcontextprotocol.io) servers sit beside the five
 built-in ones, and the transcript draws them the same way — rig speaks the
 protocol, through `rmcp`, so a server's tool is a tool like any other.
 
@@ -143,14 +198,14 @@ a file whose name depends on where fa was started from.
 Servers come up before the terminal does, and what happened is the first thing
 the transcript says: which server offered how many tools, and what went wrong
 with the rest. The footer keeps a count of both — `2 mcp, 14 tools` — since a
-session with servers is a session with more than the four tools fa was built
+session with servers is a session with more than the five tools fa was built
 with. A session with no servers says nothing about MCP anywhere.
 
 A server that fails, or takes more than 20 seconds to say what it offers, is a
-note rather than a failure — the session still has its own four tools, which
-beats refusing to start. A tool named like one of those four is
-left alone: the model is told about `read`, `write`, `edit` and `bash` in the
-system prompt, and cannot say which of two it meant.
+note rather than a failure — the session still has its own five tools, which
+beats refusing to start. A tool named like one of those five is
+left alone: the model is told about `read`, `write`, `edit`, `bash` and `ask`
+in the system prompt, and cannot say which of two it meant.
 
 MCP is a feature, on by default:
 
@@ -420,6 +475,7 @@ shows the current context usage as `ctx N%`.
 | `Ctrl+D` | Quit (empty input) |
 | `Ctrl+T` | Thinking in full, or only its last lines |
 | `Ctrl+O` | Tool output in full, or only its preview |
+| `↑` / `↓`, `Enter`, `Space`, `Tab`, `Esc` | Answer what `ask` put on the screen — see [Asking you](#asking-you) |
 | `/compact` | Summarize older history now |
 | `/continue` | Run the model again with no new message |
 | `/new` | Start a new session |
@@ -454,7 +510,11 @@ mouse usually requires holding `Shift`.
   images inside function responses, so it uses rig's model directly.
 - `src/compaction.rs` – context compaction: trigger rule, cut point, transcript
   serialization, pi's summarization prompts.
-- `src/tools.rs` – the four tools, mirroring pi's descriptions, truncation
+- `src/ask.rs` – the `ask` tool's questionnaire: what a question may be, the
+  validation the model is held to, the dialog's state machine and how it draws.
+  All of it testable without a model or a terminal, which is what most of the
+  file's tests do.
+- `src/tools.rs` – the five tools, mirroring pi's descriptions, truncation
   limits (2000 lines / 50 KB), continuation notes, and error messages. Paths
   are resolved like pi (`~`, leading `@`, `file://`, Unicode spaces; reads also
   try NFD and curly-apostrophe name variants). `read` returns images (jpg,

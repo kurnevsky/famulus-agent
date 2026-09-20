@@ -1,4 +1,4 @@
-//! Built-in tools: read, write, edit, bash.
+//! Built-in tools: read, write, edit, bash, ask.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -11,17 +11,25 @@ use std::time::{Duration, Instant};
 use rig_agent::tool::{Tool, ToolContext, ToolExecutionError};
 use rig_core::message::{MimeType, ToolResultContent};
 
+use crate::ask::{self, Outcome, Question};
 use crate::{edit, images};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
+use tokio::sync::oneshot;
 
 const MAX_LINES: usize = 2000;
 const MAX_BYTES: usize = 50 * 1024;
 
 /// The names the agent's own tools answer to, in the order the system prompt
 /// introduces them.
-pub const BUILT_IN: [&str; 4] = [ReadTool::NAME, BashTool::NAME, EditTool::NAME, WriteTool::NAME];
+pub const BUILT_IN: [&str; 5] = [
+  ReadTool::NAME,
+  BashTool::NAME,
+  EditTool::NAME,
+  WriteTool::NAME,
+  AskTool::NAME,
+];
 
 /// Which of `available` to offer the model, given what was allowed and what
 /// was refused, with the names asked for that nothing answers to.
@@ -1456,5 +1464,157 @@ mod bash_tests {
     };
     let err = run(&tool, "true", None).await.unwrap_err();
     assert!(err.0.starts_with("Working directory does not exist: /nonexistent/dir"));
+  }
+}
+
+// ---------------------------------------------------------------- ask
+
+/// Puts a questionnaire to the user and hands back the channel its answer
+/// comes down. `None` is a session with no terminal to ask in.
+pub type QuestionSink = Arc<dyn Fn(Vec<Question>, oneshot::Sender<Outcome>) + Send + Sync>;
+
+#[derive(Clone)]
+pub struct AskTool {
+  pub ask: Option<QuestionSink>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct AskArgs {
+  /// Questions to ask the user (1-4 questions)
+  #[schemars(length(min = 1, max = ask::MAX_QUESTIONS as u32))]
+  questions: Vec<Question>,
+}
+
+impl Tool for AskTool {
+  const NAME: &'static str = "ask";
+  type Output = String;
+  tool_args!(AskArgs);
+
+  /// `rpiv-ask-user-question`'s own description, less what it says about
+  /// `preview` — an option here carries no artifact to put beside the list,
+  /// and a description advertising a field the schema does not have would only
+  /// teach the model to send one.
+  fn description(&self) -> String {
+    "Ask the user one or more structured questions during execution. Use when you need to:\n\
+         1. Gather user preferences or requirements\n\
+         2. Clarify ambiguous instructions\n\
+         3. Get decisions on implementation choices as you work\n\
+         4. Offer choices to the user about what direction to take\n\n\
+         Usage notes:\n\
+         - Users can type a custom answer via the automatically appended \"Type something.\" row on \
+         every question or press Esc to abandon the questionnaire. Do NOT author \"Other\" or \
+         \"Type something.\" labels yourself — reserved labels are rejected at runtime.\n\
+         - Use multiSelect: true when multiple answers are valid.\n\
+         - If you recommend a specific option, make that the first option in the list and add \
+         \"(Recommended)\" at the end of the label.\n\
+         - Group all clarifying questions into one call rather than asking again straight after."
+      .into()
+  }
+
+  /// Ask, and wait for however long the user takes.
+  ///
+  /// A dialog that goes away without answering — the run was aborted, the
+  /// terminal is gone — drops the channel, which reads the same as a decline:
+  /// the model is told nobody answered rather than left waiting.
+  async fn call(&self, _ctx: &mut ToolContext, args: AskArgs) -> Result<String, ToolError> {
+    let Some(sink) = &self.ask else {
+      return Err(ToolError(
+        "Error: UI not available (running in non-interactive mode)".into(),
+      ));
+    };
+    let questions = ask::prepare(args.questions);
+    ask::validate(&questions).map_err(ToolError)?;
+    let (tx, rx) = oneshot::channel();
+    sink(questions.clone(), tx);
+    let outcome = rx.await.unwrap_or_else(|_| Outcome::declined());
+    Ok(outcome.response(&questions))
+  }
+}
+
+#[cfg(test)]
+mod ask_tests {
+  use super::*;
+
+  fn questions() -> Vec<Question> {
+    vec![
+      serde_json::from_value(serde_json::json!({
+        "question": "Which cache?",
+        "header": "Cache",
+        "options": [
+          { "label": "Memory", "description": "fast, lost on restart" },
+          { "label": "Disk", "description": "survives a restart" },
+        ],
+      }))
+      .unwrap(),
+    ]
+  }
+
+  async fn ask(tool: &AskTool) -> Result<String, ToolError> {
+    tool
+      .call(&mut ToolContext::new(), AskArgs { questions: questions() })
+      .await
+  }
+
+  #[tokio::test]
+  async fn the_answer_the_dialog_gave_is_what_the_model_reads() {
+    let tool = AskTool {
+      ask: Some(Arc::new(|questions: Vec<Question>, reply| {
+        assert_eq!(questions.len(), 1);
+        let _ = reply.send(Outcome {
+          answers: vec![(0, crate::ask::Answer::Chose("Disk".into()))],
+          cancelled: false,
+        });
+      })),
+    };
+    assert_eq!(
+      ask(&tool).await.unwrap(),
+      "User has answered your questions: \"Which cache?\"=\"Disk\". \
+       You can now continue with the user's answers in mind."
+    );
+  }
+
+  #[tokio::test]
+  async fn a_dialog_that_never_answers_reads_as_a_decline() {
+    // Dropping the channel is what an aborted run leaves behind.
+    let tool = AskTool {
+      ask: Some(Arc::new(|_questions, _reply| {})),
+    };
+    assert_eq!(ask(&tool).await.unwrap(), "User declined to answer questions");
+  }
+
+  #[tokio::test]
+  async fn a_session_with_no_terminal_says_so_instead_of_waiting() {
+    let tool = AskTool { ask: None };
+    assert_eq!(
+      ask(&tool).await.unwrap_err().0,
+      "Error: UI not available (running in non-interactive mode)"
+    );
+  }
+
+  #[test]
+  fn the_model_is_told_what_a_question_may_be() {
+    // The bounds are the schema's to advertise; a model that ignores them is
+    // caught again by `ask::validate` before anything is drawn.
+    let schema = schema::<AskArgs>();
+    let question = &schema["$defs"]["Question"]["properties"];
+    assert_eq!(schema["properties"]["questions"]["maxItems"], 4);
+    assert_eq!(question["options"]["minItems"], 2);
+    assert_eq!(question["options"]["maxItems"], 4);
+    assert_eq!(question["header"]["maxLength"], 16);
+    assert_eq!(schema["$defs"]["Choice"]["properties"]["label"]["maxLength"], 60);
+    // The name the extension's models have been writing all along.
+    assert!(question.get("multiSelect").is_some(), "{schema}");
+  }
+
+  #[tokio::test]
+  async fn a_questionnaire_the_user_cannot_be_shown_is_refused_before_it_is() {
+    let tool = AskTool {
+      ask: Some(Arc::new(|_questions, _reply| panic!("nothing to show"))),
+    };
+    let err = tool
+      .call(&mut ToolContext::new(), AskArgs { questions: Vec::new() })
+      .await
+      .unwrap_err();
+    assert_eq!(err.0, "Error: At least one question is required");
   }
 }
