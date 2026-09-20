@@ -242,6 +242,10 @@ TOOLS = [{
   "name": "forecast",
   "description": "What the weather will be.",
   "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+}, {
+  "name": "flood",
+  "description": "More than anyone asked for.",
+  "inputSchema": {"type": "object", "properties": {"lines": {"type": "integer"}}, "required": ["lines"]},
 }]
 
 for line in sys.stdin:
@@ -261,9 +265,14 @@ for line in sys.stdin:
     elif method == "tools/list":
         result = {"tools": TOOLS}
     elif method == "tools/call":
-        city = (params.get("arguments") or {}).get("city", "nowhere")
-        # Structure, as one long line — which is how a server answers.
-        answer = json.dumps({"city": city, "rain": True, "hours": [1, 2]})
+        arguments = params.get("arguments") or {}
+        if params.get("name") == "flood":
+            # A server under no obligation to be brief.
+            answer = "\n".join("line %d" % i for i in range(1, arguments["lines"] + 1))
+        else:
+            city = arguments.get("city", "nowhere")
+            # Structure, as one long line — which is how a server answers.
+            answer = json.dumps({"city": city, "rain": True, "hours": [1, 2]})
         result = {"content": [{"type": "text", "text": answer}], "isError": False}
     else:
         result = {}
@@ -1137,7 +1146,7 @@ fn a_tool_from_an_mcp_server_is_offered_called_and_drawn_like_any_other() {
     // command that starts it in a terminal. It offers two tools; this session
     // wants one of them.
     format!(
-      "[weather]\ncommand = \"python3 '{}'\"\ntimeout = 10\nexcept = [\"forecast\"]\n",
+      "[weather]\ncommand = \"python3 '{}'\"\ntimeout = 10\nexcept = [\"forecast\", \"flood\"]\n",
       server.display()
     ),
   )
@@ -1203,6 +1212,73 @@ fn a_tool_from_an_mcp_server_is_offered_called_and_drawn_like_any_other() {
       .expect("the field on screen");
     assert!(field.contains("\u{1b}[38;5;"), "highlighted: {field:?}");
   }
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A built-in tool stops itself; a server answers with whatever it likes, and
+/// the answer is what the context window is spent on. So the reply is cut to
+/// the size `read` and `bash` keep to — and cut once, before the transcript
+/// and the model are told, so the terminal shows the copy the model was given.
+#[test]
+#[cfg(feature = "mcp")]
+fn a_reply_longer_than_a_tool_may_answer_with_is_cut_to_its_head() {
+  if !have_tmux() || !have_python() {
+    return;
+  }
+  let dir = scratch("mcp-long");
+  let server = dir.join("server.py");
+  std::fs::write(&server, MCP_SERVER).expect("a server to run");
+  let config = dir.join("mcp.toml");
+  std::fs::write(
+    &config,
+    format!(
+      "[deluge]\ncommand = \"python3 '{}'\"\ntimeout = 10\ntools = [\"flood\"]\n",
+      server.display()
+    ),
+  )
+  .expect("a config to read");
+
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "Bracing. ",
+      tool: "flood",
+      args: serde_json::json!({ "lines": 3000 }),
+    },
+    Turn::Say("That was a lot."),
+  ]);
+  let term = Term::start(
+    "mcp-long",
+    &provider,
+    &["--no-session", "--mcp-config", &shell(&config)],
+  );
+  term.wait_for("MCP deluge: 1 tool");
+  term.submit("open the floodgates");
+  term.wait_for("That was a lot.");
+
+  // The model was given the head of it and a note saying where the rest is.
+  let note = "[Showing lines 1-2000 of 3000. Full output: ";
+  let request = provider.request(note);
+  assert!(
+    request.contains("line 1\\nline 2\\n"),
+    "the front of it: {request:.400}"
+  );
+  assert!(!request.contains("line 2001"), "and not a line past where it was cut");
+
+  // The whole of it is on disk, for a model that wants more than the head.
+  let path = request
+    .split_once(note)
+    .and_then(|(_, rest)| rest.split_once(']'))
+    .map(|(path, _)| path.to_string())
+    .expect("the note says where the rest went");
+  let full = std::fs::read_to_string(&path).expect("the whole reply, written down");
+  assert_eq!(full.lines().count(), 3000);
+  assert!(full.ends_with("line 3000"));
+  let _ = std::fs::remove_file(&path);
+
+  // And the transcript shows that same cut copy, not the one that arrived.
+  let screen = term.screen();
+  assert!(screen.contains("line 1"), "what it said, under its call:\n{screen}");
+  assert!(!screen.contains("line 2001"), "nothing past the cut:\n{screen}");
   let _ = std::fs::remove_dir_all(&dir);
 }
 

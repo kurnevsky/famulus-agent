@@ -334,6 +334,177 @@ fn truncate_head(content: &str) -> HeadTruncation {
   }
 }
 
+/// A tool result cut to the size the built-in tools keep to, or `None` when
+/// it is already within it.
+///
+/// The built-in tools bound their output as they make it: `bash` never holds
+/// more than a rolling tail, and `read` stops at the line it stops at. A
+/// server's reply arrives whole and unasked, so the cut is made here, on what
+/// came back — the head of it, since the front of an answer is the part that
+/// answers, and the rest to a file the model can read if the head was not
+/// enough.
+///
+/// What is kept is text: several blocks become one, because a JSON block cut
+/// in half is no longer JSON, and a note saying where the rest went is worth
+/// more to the model than a shape it cannot parse. Images are left alone and
+/// in the order they came — they are bounded where they are decoded, and it
+/// is the text that runs away with a context window.
+pub fn cap_reply(content: &[ToolResultContent]) -> Option<Vec<ToolResultContent>> {
+  let mut images = Vec::new();
+  let mut said = Vec::new();
+  for block in content {
+    match block {
+      ToolResultContent::Text(text) => said.push(text.text.clone()),
+      ToolResultContent::Json { value } => said.push(value.to_string()),
+      ToolResultContent::Image(_) => images.push(block.clone()),
+    }
+  }
+  let text = said.join("\n");
+  let head = truncate_head(&text);
+  if !head.truncated {
+    return None;
+  }
+  let full = spill("fa-mcp", &text).map_or_else(|| "(unavailable)".to_string(), |p| p.display().to_string());
+  let kept = match head.first_line_exceeds_limit {
+    // One line longer than the whole budget — a JSON document written flat,
+    // usually. There is no line to stop at, so it is cut where the budget
+    // runs out, at a character boundary rather than inside one.
+    true => {
+      let mut end = MAX_BYTES;
+      while !text.is_char_boundary(end) {
+        end -= 1;
+      }
+      format!(
+        "{}\n\n[Showing first {} of line 1 (line is {}). Full output: {full}]",
+        &text[..end],
+        format_size(end),
+        format_size(text.split('\n').next().unwrap_or_default().len())
+      )
+    }
+    false => {
+      let mut lines = text.split('\n').count();
+      if text.ends_with('\n') {
+        lines -= 1;
+      }
+      let limit = match head.truncated_by == Some(TruncatedBy::Bytes) {
+        true => format!(" ({} limit)", format_size(MAX_BYTES)),
+        false => String::new(),
+      };
+      format!(
+        "{}\n\n[Showing lines 1-{} of {lines}{limit}. Full output: {full}]",
+        head.content, head.output_lines
+      )
+    }
+  };
+  let mut capped = vec![ToolResultContent::text(kept)];
+  capped.extend(images);
+  Some(capped)
+}
+
+/// Where output too long to hand over whole is put, so the note that cuts it
+/// can say where the rest is.
+fn temp_path(prefix: &str) -> PathBuf {
+  let nanos = std::time::SystemTime::now()
+    .duration_since(std::time::UNIX_EPOCH)
+    .map_or(0, |d| d.as_nanos());
+  std::env::temp_dir().join(format!("{prefix}-{:x}{:x}.log", nanos, std::process::id()))
+}
+
+/// The whole of a reply, written down once. A file that cannot be written is
+/// a note that says so rather than a call that fails: the model still has the
+/// head, which is the part it was going to read.
+fn spill(prefix: &str, text: &str) -> Option<PathBuf> {
+  let path = temp_path(prefix);
+  let mut file = std::fs::File::create(&path).ok()?;
+  file.write_all(text.as_bytes()).ok()?;
+  Some(path)
+}
+
+#[cfg(test)]
+mod capping_tests {
+  use super::*;
+
+  fn image() -> ToolResultContent {
+    ToolResultContent::image_base64("AAAA".to_string(), Some(rig_core::message::ImageMediaType::PNG), None)
+  }
+
+  /// The one text block a cut reply comes back as, and the note it ends with.
+  fn cut(content: &[ToolResultContent]) -> (String, String) {
+    let capped = cap_reply(content).expect("a reply over the limits is cut");
+    assert!(
+      matches!(capped.last(), Some(ToolResultContent::Image(_))),
+      "the images it came with are kept, and last"
+    );
+    let ToolResultContent::Text(text) = &capped[0] else {
+      panic!("what was said comes back as one text block")
+    };
+    let (body, note) = text.text.rsplit_once("\n\n").expect("a note saying what was cut");
+    (body.to_string(), note.to_string())
+  }
+
+  fn full_output(note: &str) -> String {
+    let path = note.rsplit("Full output: ").next().unwrap().trim_end_matches(']');
+    let text = std::fs::read_to_string(path).expect("the whole of it, written down");
+    std::fs::remove_file(path).expect("a file to remove");
+    text
+  }
+
+  #[test]
+  fn a_reply_within_the_limits_is_left_exactly_as_it_came() {
+    let json = serde_json::json!({ "ok": true });
+    let content = vec![ToolResultContent::text("short"), ToolResultContent::json(json), image()];
+    assert!(cap_reply(&content).is_none(), "nothing to cut, so nothing is rewritten");
+    // Every line and byte of the budget still fits.
+    let edge = "x".repeat(MAX_BYTES);
+    assert!(cap_reply(&[ToolResultContent::text(edge)]).is_none());
+    let edge = std::iter::repeat_n("y", MAX_LINES).collect::<Vec<_>>().join("\n");
+    assert!(cap_reply(&[ToolResultContent::text(edge)]).is_none());
+  }
+
+  #[test]
+  fn a_long_reply_keeps_its_head_and_says_where_the_rest_went() {
+    let lines: Vec<String> = (1..=3000).map(|i| i.to_string()).collect();
+    let content = vec![ToolResultContent::text(lines.join("\n")), image()];
+    let (body, note) = cut(&content);
+    assert!(body.starts_with("1\n2\n"), "the front of the answer, not the back");
+    assert!(body.ends_with("\n2000"));
+    assert_eq!(
+      note.split(". Full output: ").next().unwrap(),
+      "[Showing lines 1-2000 of 3000"
+    );
+    assert_eq!(full_output(&note).lines().count(), 3000);
+  }
+
+  #[test]
+  fn the_byte_budget_is_the_other_way_to_run_out() {
+    let lines: Vec<String> = (0..10).map(|_| "x".repeat(10 * 1024)).collect();
+    let content = vec![ToolResultContent::text(lines.join("\n")), image()];
+    let (body, note) = cut(&content);
+    assert_eq!(body.lines().count(), 4);
+    assert!(
+      note.starts_with("[Showing lines 1-4 of 10 (50.0KB limit). Full output: "),
+      "{note}"
+    );
+    assert_eq!(full_output(&note).len(), 10 * 10 * 1024 + 9);
+  }
+
+  #[test]
+  fn one_line_longer_than_the_budget_is_cut_inside_it_and_between_characters() {
+    // A JSON document written flat: there is no line to stop at, and the
+    // character at the cut is three bytes wide, so the cut moves off it.
+    let flat = "€".repeat(20_000);
+    let content = vec![ToolResultContent::text(flat.clone()), image()];
+    let (body, note) = cut(&content);
+    assert!(body.len() <= MAX_BYTES && MAX_BYTES - body.len() < 3, "{}", body.len());
+    assert!(flat.starts_with(&body), "the head of the line, verbatim");
+    assert!(
+      note.starts_with("[Showing first 50.0KB of line 1 (line is 58.6KB). Full output: "),
+      "{note}"
+    );
+    assert_eq!(full_output(&note), flat);
+  }
+}
+
 /// Image files come back as a note plus the image itself. Images the
 /// pipeline cannot deliver are replaced by the reason.
 const NON_VISION_NOTE: &str = "[Current model does not support images. The image will be omitted from this request.]";
@@ -1140,10 +1311,7 @@ impl OutputAccumulator {
     if self.temp.is_some() {
       return;
     }
-    let nanos = std::time::SystemTime::now()
-      .duration_since(std::time::UNIX_EPOCH)
-      .map_or(0, |d| d.as_nanos());
-    let path = std::env::temp_dir().join(format!("{}-{:x}{:x}.log", self.prefix, nanos, std::process::id()));
+    let path = temp_path(self.prefix);
     if let Ok(mut file) = std::fs::File::create(&path) {
       let _ = file.write_all(&self.pending);
       self.pending = Vec::new();

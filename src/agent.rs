@@ -27,7 +27,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::compaction::{self, Compacted, Settings};
-use crate::tools::{AskTool, BashTool, CALL_ARG, EditDiff, EditTool, ReadTool, WriteTool};
+use crate::tools::{AskTool, BUILT_IN, BashTool, CALL_ARG, EditDiff, EditTool, ReadTool, WriteTool};
 
 /// Events streamed from a run to the UI.
 #[derive(Debug)]
@@ -201,7 +201,16 @@ impl AgentHook for UiHook {
   }
 
   async fn on_tool_result(&self, _ctx: &HookContext, event: ToolResultEvent<'_>) -> ToolResultAction {
-    let (output, images) = crate::images::split(event.presentation.as_content());
+    // A built-in tool holds itself to a size as it makes its output; a
+    // server's reply arrives whole, and as long as the server felt like, so
+    // it is cut here — the one place every result passes through. Before the
+    // transcript is told, so the terminal shows the copy the model was given
+    // rather than one nobody read.
+    let capped = match BUILT_IN.contains(&event.tool_name) {
+      true => None,
+      false => crate::tools::cap_reply(event.presentation.as_content()),
+    };
+    let (output, images) = crate::images::split(capped.as_deref().unwrap_or(event.presentation.as_content()));
     let _ = self.tx.send(AgentEvent::ToolResult {
       name: event.tool_name.to_string(),
       call: call_id(event.tool_call_id),
@@ -210,7 +219,9 @@ impl AgentHook for UiHook {
       images,
       is_error: event.raw_result.is_error() || event.raw_result.is_refused(),
     });
-    ToolResultAction::Keep
+    capped
+      .and_then(|content| rig_agent::tool::ToolOutput::content(content).ok())
+      .map_or(ToolResultAction::Keep, ToolResultAction::rewrite_output)
   }
 }
 
