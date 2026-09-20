@@ -807,18 +807,26 @@ impl Tool for BashTool {
 
     // Own process group so a timeout or abort can kill the whole tree,
     // not just the shell.
+    // One pipe for both streams, not one each. Two pipes carry no record of
+    // which was written first, so a command that says something on each ends
+    // up reported in whichever order they happened to be read — while down a
+    // single pipe the kernel keeps the order the command wrote in, which is
+    // the order a terminal would have shown and the order the model should
+    // read. It is what `2>&1` does, done here so the command need not.
+    let (reads, writes) = std::io::pipe()?;
     let mut child = tokio::process::Command::new("bash")
       .arg("-c")
       .arg(&args.command)
       .current_dir(&self.cwd)
       .stdin(Stdio::null())
-      .stdout(Stdio::piped())
-      .stderr(Stdio::piped())
+      .stdout(Stdio::from(writes.try_clone()?))
+      .stderr(Stdio::from(writes))
       .process_group(0)
       .spawn()?;
     let mut guard = ProcessGroupGuard::new(child.id());
-    let mut stdout = child.stdout.take().expect("piped stdout");
-    let mut stderr = child.stderr.take().expect("piped stderr");
+    // Both write ends belong to the child now; ours are gone with the
+    // builder, which is what lets this see the end of the output at all.
+    let mut merged = tokio::net::unix::pipe::Receiver::from_owned_fd(reads.into())?;
 
     let mut output = OutputAccumulator::new("fa-bash");
     let mut throttle = UpdateThrottle::new(self.on_output.clone(), args.call.clone());
@@ -827,29 +835,22 @@ impl Tool for BashTool {
     let mut drain_deadline: Option<tokio::time::Instant> = None;
     let mut exit = None;
     let mut timed_out = false;
-    let (mut out_open, mut err_open) = (true, true);
-    let (mut out_buf, mut err_buf) = ([0u8; 8192], [0u8; 8192]);
+    let mut open = true;
+    let mut buf = [0u8; 8192];
 
-    while out_open || err_open || exit.is_none() {
+    while open || exit.is_none() {
       let wake = match (deadline, drain_deadline) {
         (Some(a), Some(b)) => a.min(b),
         (Some(a), None) | (None, Some(a)) => a,
         (None, None) => far_future,
       };
       tokio::select! {
-          r = stdout.read(&mut out_buf), if out_open => match r {
+          r = merged.read(&mut buf), if open => match r {
               Ok(n) if n > 0 => {
-                  output.append(&out_buf[..n]);
+                  output.append(&buf[..n]);
                   throttle.maybe_emit(&mut output);
               }
-              _ => out_open = false,
-          },
-          r = stderr.read(&mut err_buf), if err_open => match r {
-              Ok(n) if n > 0 => {
-                  output.append(&err_buf[..n]);
-                  throttle.maybe_emit(&mut output);
-              }
-              _ => err_open = false,
+              _ => open = false,
           },
           status = child.wait(), if exit.is_none() => {
               exit = Some(status?);
@@ -1287,6 +1288,21 @@ mod bash_tests {
     assert_eq!(err.0, "out\nerr\n\n\nCommand exited with code 3");
     assert_eq!(run(&tool(), "true", None).await.unwrap(), "(no output)");
     assert_eq!(run(&tool(), "printf hi", None).await.unwrap(), "hi");
+  }
+
+  #[tokio::test]
+  async fn the_two_streams_are_read_in_the_order_they_were_written() {
+    // Both go down one pipe, so the kernel keeps the order the command wrote
+    // in. Read from a pipe each, this would be whichever happened to be
+    // polled first — and it was, about one run in eight.
+    let interleaved = run(&tool(), "echo a; echo b 1>&2; echo c; echo d 1>&2", None)
+      .await
+      .unwrap();
+    assert_eq!(interleaved, "a\nb\nc\nd\n");
+    // Starting on the error stream, which a rule as simple as "take stdout
+    // first" would put the wrong way round.
+    let error_first = run(&tool(), "echo first 1>&2; echo second", None).await.unwrap();
+    assert_eq!(error_first, "first\nsecond\n");
   }
 
   #[tokio::test]

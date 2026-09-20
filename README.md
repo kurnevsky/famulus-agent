@@ -285,11 +285,16 @@ mouse usually requires holding `Shift`.
   limits (2000 lines / 50 KB), continuation notes, and error messages. Paths
   are resolved like pi (`~`, leading `@`, `file://`, Unicode spaces; reads also
   try NFD and curly-apostrophe name variants). `read` returns images (jpg,
-  png, gif, webp, bmp) as attachments and decodes text leniently. `bash` follows pi's executor: stdout and stderr interleaved,
-  live output streamed to the UI, the last 2000 lines / 50 KB kept with the
-  full output spilled to a temp file, the whole process group killed on
-  timeout or abort, and pi's exit-code and timeout messages. `edit` is a port of
-  pi's edit engine (`src/edit.rs`): BOM and CRLF preserved, exact match first
+  png, gif, webp, bmp) as attachments and decodes text leniently. `bash`
+  follows pi's executor: stdout and stderr interleaved, live output streamed
+  to the UI, the last 2000 lines / 50 KB kept with the full output spilled to
+  a temp file, the whole process group killed on timeout or abort, and pi's
+  exit-code and timeout messages. The two streams share one pipe rather than
+  getting one each, so the order they are read in is the order the command
+  wrote them: two pipes keep no record of which came first, and a command
+  that says something on each would be reported whichever way round they
+  happened to be polled. `edit` is a port of pi's edit engine
+  (`src/edit.rs`): BOM and CRLF preserved, exact match first
   and then pi's fuzzy normalization (trailing whitespace, smart quotes, dashes,
   Unicode spaces) with untouched lines kept verbatim, pi's error messages, and
   a pi-style numbered diff shown in the UI instead of the result text.
