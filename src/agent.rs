@@ -38,6 +38,9 @@ pub enum AgentEvent {
     /// The call, so its output and result find it again even when several
     /// tools are in flight at once.
     call: String,
+    /// The same call as the stream named it while the model wrote it, which
+    /// is the id the half-written line is keyed by.
+    internal: String,
   },
   /// A tool call being written, before it is run. `args` is the JSON as far
   /// as it has arrived, which is usually not yet parseable; `name` is empty
@@ -132,6 +135,7 @@ impl AgentHook for UiHook {
       name: event.tool_name.to_string(),
       args: args.clone(),
       call: call_id(event.tool_call_id),
+      internal: event.internal_call_id.to_string(),
     });
     // A command reports its output while it runs, and nothing in rig tells a
     // tool which call it is. Rewriting the arguments is the one channel from

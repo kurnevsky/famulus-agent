@@ -882,16 +882,9 @@ impl App {
     }
   }
 
-  /// Freeze a live tool output entry when its command was killed.
+  /// Freeze every live tool output when the run was killed.
   fn finish_running_tool(&mut self) {
-    if let Some(Entry::ToolResult {
-      running, took, started, ..
-    }) = self.entries.last_mut()
-      && *running
-    {
-      *running = false;
-      *took = Some(started.elapsed());
-    }
+    finish_running(&mut self.entries);
   }
 
   /// The run never reached its final response, so rig did not hand back the
@@ -936,13 +929,15 @@ impl App {
         Some(writing) => (writing.name, writing.args) = (name, args),
         None => self.writing.push(Writing { id, name, args }),
       },
-      AgentEvent::ToolCall { name, args, call } => {
-        // The oldest call still being written is this one: calls are run in
-        // the order they were written, so it stops being a line the model is
-        // typing and becomes one the transcript keeps.
-        if !self.writing.is_empty() {
-          self.writing.remove(0);
-        }
+      AgentEvent::ToolCall {
+        name,
+        args,
+        call,
+        internal,
+      } => {
+        // This call has stopped being a line the model is typing and become
+        // one the transcript keeps — whichever of the pending lines it is.
+        self.writing.retain(|writing| writing.id != internal);
         let summary = summarize_args(&name, &args);
         self.entries.push(Entry::ToolCall {
           name,
@@ -1450,15 +1445,50 @@ impl App {
     }
     // Calls the model is still writing, drawn like the entry each will
     // become so that nothing moves when it does.
+    let cursor = || Span::styled("▌", Style::default().fg(Color::Yellow));
     for writing in &self.writing {
       lines.push(Line::default());
-      lines.push(Line::from(vec![
+      // Every line of every block, each knowing how it is marked.
+      let body: Vec<(&str, String)> = writing_body(&writing.name, &writing.args)
+        .into_iter()
+        .flat_map(|(mark, text)| {
+          // Split rather than `lines`, so a body ending in a newline keeps
+          // the empty line the model is about to write into.
+          text
+            .split('\n')
+            .map(|line| (mark, line.to_string()))
+            .collect::<Vec<_>>()
+        })
+        .collect();
+      let mut header = vec![
         Span::styled("⚙ ", Style::default().fg(Color::Yellow)),
         Span::styled(writing.name.clone(), Style::default().fg(Color::Yellow).bold()),
         Span::raw(" "),
         Span::styled(writing_summary(&writing.name, &writing.args), dim),
-        Span::styled("▌", Style::default().fg(Color::Yellow)),
-      ]));
+      ];
+      // The cursor follows the model: on the first line until there is a body
+      // to write into, then at the end of what has arrived.
+      if body.is_empty() {
+        header.push(cursor());
+      }
+      lines.push(Line::from(header));
+      // The tail is what is being written; what came before is already said.
+      let hidden = body.len().saturating_sub(TOOL_OUTPUT_LINES);
+      if hidden > 0 {
+        lines.push(Line::styled(format!("  │ … {hidden} earlier lines"), dim));
+      }
+      for (i, (mark, text)) in body.iter().enumerate().skip(hidden) {
+        let style = match *mark {
+          "+" => Style::default().fg(Color::Green),
+          "-" => Style::default().fg(Color::Red),
+          _ => dim,
+        };
+        let mut spans = vec![Span::styled(format!("  {mark} {text}"), style)];
+        if i + 1 == body.len() {
+          spans.push(cursor());
+        }
+        lines.push(Line::from(spans));
+      }
     }
     self.markdown = live;
     lines
@@ -1513,6 +1543,22 @@ fn filter_commands(matcher: &mut Matcher, query: &str) -> Vec<Match> {
     .collect();
   scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.index.cmp(&b.1.index)));
   scored.into_iter().map(|(_, m)| m).collect()
+}
+
+/// Stop the clock on every command still drawing output, because the run
+/// they belonged to is over. Every one of them, since more than one can be in
+/// flight and an abort takes them all.
+fn finish_running(entries: &mut [Entry]) {
+  for entry in entries {
+    if let Entry::ToolResult {
+      running, took, started, ..
+    } = entry
+      && *running
+    {
+      *running = false;
+      *took = Some(started.elapsed());
+    }
+  }
 }
 
 /// Where the call `call` was announced.
@@ -1950,6 +1996,54 @@ fn writing_summary(name: &str, args: &str) -> String {
   partial_str(args, key).map(|text| first_line(&text)).unwrap_or_default()
 }
 
+/// The text a call is carrying in its arguments, as far as it has arrived,
+/// in blocks with the mark each is drawn under.
+///
+/// `bash` says all it has to say on its one line, but `write` and `edit` put
+/// a file's worth of text in their arguments — the slow part of the call, and
+/// the part worth watching arrive. An edit's two halves are marked the way
+/// the diff it becomes will mark them.
+fn writing_body(name: &str, args: &str) -> Vec<(&'static str, String)> {
+  // Once the arguments parse, read them as arguments. Scanning the text is
+  // only for what is still half-written, and that has to assume the halves of
+  // an edit arrive in the order they were written — which stops being true
+  // the moment anything re-serializes them, since that sorts the keys.
+  if let Ok(value) = serde_json::from_str::<serde_json::Value>(args) {
+    let text = |value: &serde_json::Value, key| value.get(key).and_then(|v| v.as_str()).map(str::to_string);
+    return match name {
+      "write" => text(&value, "content").map(|body| ("│", body)).into_iter().collect(),
+      "edit" => value
+        .get("edits")
+        .and_then(|edits| edits.as_array()?.last())
+        .map(|edit| {
+          [
+            text(edit, "oldText").map(|t| ("-", t)),
+            text(edit, "newText").map(|t| ("+", t)),
+          ]
+          .into_iter()
+          .flatten()
+          .collect()
+        })
+        .unwrap_or_default(),
+      _ => Vec::new(),
+    };
+  }
+  let block = |mark: &'static str, at: Option<usize>| at.and_then(|at| value_after(args, at)).map(|text| (mark, text));
+  match name {
+    "write" => block("│", args.find("\"content\"").map(|at| at + 9))
+      .into_iter()
+      .collect(),
+    "edit" => {
+      let removed = last_key(args, "oldText");
+      // A replacement's new text only belongs with its own old text, so it
+      // counts only once the one being written has got that far.
+      let added = last_key(args, "newText").filter(|at| removed.is_none_or(|removed| *at > removed));
+      [block("-", removed), block("+", added)].into_iter().flatten().collect()
+    }
+    _ => Vec::new(),
+  }
+}
+
 /// The value of a string field in a JSON object that is still being written,
 /// including one whose closing quote has not arrived yet.
 ///
@@ -1957,8 +2051,19 @@ fn writing_summary(name: &str, args: &str) -> String {
 /// parseable yet. A tool argument that itself contained `"command":` would
 /// fool it, which costs a wrong half-drawn line and nothing else.
 fn partial_str(json: &str, key: &str) -> Option<String> {
-  let at = json.find(&format!("\"{key}\""))? + key.len() + 2;
-  let rest = json[at..].trim_start().strip_prefix(':')?.trim_start();
+  value_after(json, json.find(&format!("\"{key}\""))? + key.len() + 2)
+}
+
+/// Where the last mention of `key` leaves off, for a call that carries the
+/// same key more than once — an `edit` with several replacements, whose last
+/// one is the one being written now.
+fn last_key(json: &str, key: &str) -> Option<usize> {
+  json.rfind(&format!("\"{key}\"")).map(|at| at + key.len() + 2)
+}
+
+/// Reads the string value that follows a key, from `at`.
+fn value_after(json: &str, at: usize) -> Option<String> {
+  let rest = json.get(at..)?.trim_start().strip_prefix(':')?.trim_start();
   let mut chars = rest.strip_prefix('"')?.chars();
   let mut out = String::new();
   while let Some(c) = chars.next() {
@@ -2143,6 +2248,82 @@ mod tests {
   }
 
   #[test]
+  fn a_file_being_written_shows_up_as_it_arrives() {
+    let whole = r#"{"path":"a.rs","content":"fn main() {\n    body();\n}"}"#;
+    // The path is on the first line from early on; the content grows under it.
+    let at = |n: usize| {
+      (
+        writing_summary("write", &whole[..n]),
+        writing_body("write", &whole[..n]),
+      )
+    };
+    assert_eq!(at(whole.find("\"content\"").unwrap()).1, []);
+    // Cut in the middle of the second line, where the model has got to.
+    let (path, body) = at(whole.find("body();").unwrap() + 4);
+    assert_eq!(path, "a.rs");
+    assert_eq!(body, [("│", "fn main() {\n    body".to_string())]);
+    assert_eq!(at(whole.len()).1, [("│", "fn main() {\n    body();\n}".to_string())]);
+    // Every prefix is a prefix of the whole, so the block only ever grows.
+    let full = writing_body("write", whole)[0].1.clone();
+    for n in 0..=whole.len() {
+      if let [(_, text)] = writing_body("write", &whole[..n]).as_slice() {
+        assert!(full.starts_with(text), "{text:?}");
+      }
+    }
+  }
+
+  #[test]
+  fn an_edit_shows_its_two_halves_marked_as_the_diff_will_mark_them() {
+    let one = r#"{"path":"a.rs","edits":[{"oldText":"was","newText":"is"#;
+    assert_eq!(
+      writing_body("edit", one),
+      [("-", "was".to_string()), ("+", "is".to_string())]
+    );
+    // Before the new text arrives there is only the old.
+    let half = r#"{"path":"a.rs","edits":[{"oldText":"wa"#;
+    assert_eq!(writing_body("edit", half), [("-", "wa".to_string())]);
+  }
+
+  #[test]
+  fn a_second_edit_does_not_show_the_first_ones_replacement() {
+    // Two replacements, the second only part-written: pairing the newest old
+    // text with the newest new text would show one from each.
+    let two = r#"{"edits":[{"oldText":"one","newText":"1"},{"oldText":"tw"#;
+    assert_eq!(writing_body("edit", two), [("-", "tw".to_string())]);
+    // Once its own replacement starts, both halves are its own.
+    let two = format!("{two}o\",\"newText\":\"2");
+    assert_eq!(
+      writing_body("edit", &two),
+      [("-", "two".to_string()), ("+", "2".to_string())]
+    );
+  }
+
+  #[test]
+  fn a_finished_edit_keeps_both_halves_whatever_order_the_keys_are_in() {
+    // Arguments that have been through a serializer come back with their
+    // keys sorted, putting `newText` before `oldText` — which the scan that
+    // reads half-written text has to treat as a replacement of its own.
+    let sorted = r#"{"edits":[{"newText":"is","oldText":"was"}],"path":"a.rs"}"#;
+    assert_eq!(
+      writing_body("edit", sorted),
+      [("-", "was".to_string()), ("+", "is".to_string())]
+    );
+    // And the last edit is the one shown, as while it was being written.
+    let two = r#"{"edits":[{"newText":"1","oldText":"one"},{"newText":"2","oldText":"two"}]}"#;
+    assert_eq!(
+      writing_body("edit", two),
+      [("-", "two".to_string()), ("+", "2".to_string())]
+    );
+  }
+
+  #[test]
+  fn a_command_has_nothing_to_show_below_its_line() {
+    // Everything bash has to say fits on the one line; the block is for the
+    // tools that carry a file in their arguments.
+    assert_eq!(writing_body("bash", r#"{"command":"ls -la"#), []);
+  }
+
+  #[test]
   fn a_written_call_reads_the_same_as_the_finished_one() {
     // The live line and the entry it becomes must agree, or the transcript
     // jumps when the call starts running.
@@ -2280,6 +2461,24 @@ mod tests {
       })
       .collect();
     assert_eq!(failed, [true, false]);
+  }
+
+  #[test]
+  fn an_abort_stops_the_clock_on_every_command_still_running() {
+    // An abort takes down the whole run, so no command it killed is left
+    // counting up forever — not just the last one to have spoken.
+    let mut entries = vec![announced("slow", "a"), announced("quick", "b")];
+    place_output(&mut entries, "a".into(), "a is talking".into());
+    place_output(&mut entries, "b".into(), "b is talking".into());
+    finish_running(&mut entries);
+    let stopped: Vec<bool> = entries
+      .iter()
+      .filter_map(|entry| match entry {
+        Entry::ToolResult { running, took, .. } => Some(!running && took.is_some()),
+        _ => None,
+      })
+      .collect();
+    assert_eq!(stopped, [true, true]);
   }
 
   #[test]

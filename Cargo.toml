@@ -62,7 +62,10 @@ ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 ratatui-textarea = "0.9"
 rig-agent = "0.42"
 rig-core = "0.42"
-schemars = "1"
+# `preserve_order` keeps a tool's arguments in the order its struct
+# declares them, rather than sorting them: the model tends to write them
+# in the order it is offered them, and the path wants to come first.
+schemars = { version = "1", features = ["preserve_order"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 similar = "3.2.0"

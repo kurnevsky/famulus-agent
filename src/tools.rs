@@ -1173,6 +1173,19 @@ fn format_output(snapshot: &Snapshot, output: &OutputAccumulator, empty_text: &s
 #[cfg(test)]
 mod bash_tests {
   #[test]
+  fn a_tool_offers_what_it_acts_on_first() {
+    // A model writes arguments in the order it is offered them, and the
+    // transcript can only show what has arrived — so a call whose path came
+    // last would be a nameless block of text until it finished. Sorting the
+    // properties (serde_json's default) put `content` before `path`.
+    let first = |schema: serde_json::Value| schema["properties"].as_object().unwrap().keys().next().unwrap().clone();
+    assert_eq!(first(schema::<WriteArgs>()), "path");
+    assert_eq!(first(schema::<EditArgs>()), "path");
+    assert_eq!(first(schema::<ReadArgs>()), "path");
+    assert_eq!(first(schema::<BashArgs>()), "command");
+  }
+
+  #[test]
   fn the_injected_call_id_is_never_offered_to_the_model() {
     // It is how a hook tells a command which call it is; the model neither
     // sends it nor should know it exists.

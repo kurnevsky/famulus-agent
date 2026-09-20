@@ -161,6 +161,20 @@ with them under a cursor.
 ⚙ bash cargo test --all --release -- --nocapture
 ```
 
+`write` and `edit` carry a file's worth of text in their arguments, which is
+the slow part of such a call, so that text is shown arriving too — under the
+line rather than on it, and for an edit marked the way the diff it becomes
+will mark it. A tool offers the model what it acts on first (`path`, or
+`command`), since arguments tend to be written in the order they are offered
+and a file's name is worth having before its contents:
+
+```
+⚙ write new.rs              ⚙ edit existing.rs
+  │ fn main() {               -     println!("old");
+  │     let x = 1;            +     println!("new");
+  │     println!▌             +     done();▌
+```
+
 Everything in the transcript is bound to its tool call by the call's own id,
 not by where it happens to sit: the line a command's live output goes under,
 the result that replaces it, and the pairing rebuilt on reload. Tools run one
@@ -172,10 +186,11 @@ A command's output is green when it succeeded and red when it did not, live
 and on a session reopened later alike. Other tools stay dim, since exit status
 is a thing commands have; a failed `read` or `edit` is still red.
 
-Only the part the finished line leads with is shown — the command, or the path
-— so the live line and the entry it becomes read the same and nothing moves
-when the call starts running. Until the arguments parse they are read straight
-out of the half-written JSON; after that the ordinary summary takes over. A
+The line itself shows only what the finished line leads with — the command, or
+the path — so it and the entry it becomes read the same and nothing moves when
+the call starts running. Until the arguments parse they are read straight out
+of the half-written JSON; after that they are read as arguments, which is what
+keeps an edit's two halves together once a serializer has sorted its keys. A
 call the model never finished writing leaves nothing behind.
 
 ## Compaction
