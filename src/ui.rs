@@ -1744,12 +1744,15 @@ impl App {
     let context = self
       .context_tokens
       .and_then(|tokens| (tokens * 100).checked_div(self.settings.context_window))
-      .map(|pct| format!("ctx {pct}%  "))
-      .unwrap_or_default();
-    let right = format!("{context}{}↑ {}↓", self.usage.input_tokens, self.usage.output_tokens);
-    let pad = (footer_area.width as usize).saturating_sub(Line::from(left.clone()).width() + right.chars().count());
+      .map(|pct| (format!("ctx {pct}%  "), pct));
+    let tokens = format!("{}↑ {}↓", self.usage.input_tokens, self.usage.output_tokens);
+    let width = context.as_ref().map_or(0, |(text, _)| text.chars().count()) + tokens.chars().count();
+    let pad = (footer_area.width as usize).saturating_sub(Line::from(left.clone()).width() + width);
     left.push(Span::raw(" ".repeat(pad)));
-    left.push(Span::raw(right).dim());
+    if let Some((text, percent)) = context {
+      left.push(Span::styled(text, context_style(percent)));
+    }
+    left.push(Span::raw(tokens).dim());
     f.render_widget(Paragraph::new(Line::from(left)), footer_area);
   }
 
@@ -2719,6 +2722,22 @@ fn mcp_label(servers: usize, tools: usize) -> Option<String> {
   (servers > 0).then(|| format!("{servers} mcp, {tools} tool{}", if tools == 1 { "" } else { "s" }))
 }
 
+/// How a context window `percent` full reads in the footer: out of the way
+/// while there is room, yellow once it is worth an eye, red when the next
+/// answer may not fit. pi's thresholds.
+///
+/// Red is rare on a session that compacts — the summary comes at around 87%
+/// and takes the figure back down with it — so seeing it means the window is
+/// filling with nothing being done about it: compaction turned off, or a
+/// single turn too big to summarize.
+fn context_style(percent: u64) -> Style {
+  match percent {
+    90.. => Style::default().fg(Color::Red),
+    70.. => Style::default().fg(Color::Yellow),
+    _ => Style::default().add_modifier(Modifier::DIM),
+  }
+}
+
 fn first_line(text: &str) -> String {
   let mut it = text.lines();
   let first = it.next().unwrap_or_default().to_string();
@@ -2977,6 +2996,21 @@ mod tests {
     assert_eq!(mcp_label(2, 14).as_deref(), Some("2 mcp, 14 tools"));
     // A server that came up with nothing to offer still came up.
     assert_eq!(mcp_label(1, 0).as_deref(), Some("1 mcp, 0 tools"));
+  }
+
+  #[test]
+  fn a_filling_context_window_is_yellow_before_it_is_red() {
+    let colour = |percent| context_style(percent).fg;
+    // Room to work in: the figure keeps out of the way.
+    assert_eq!(colour(0), None);
+    assert_eq!(colour(69), None);
+    assert!(context_style(69).add_modifier.contains(Modifier::DIM));
+    // Worth an eye, then worth acting on.
+    assert_eq!(colour(70), Some(Color::Yellow));
+    assert_eq!(colour(89), Some(Color::Yellow));
+    assert_eq!(colour(90), Some(Color::Red));
+    // A request bigger than the window at all is as red as it gets.
+    assert_eq!(colour(400), Some(Color::Red));
   }
 
   #[test]

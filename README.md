@@ -504,10 +504,14 @@ for the same summary, so it says so and leaves the next move to `/continue`.
 `/compact` does all of this on demand, without waiting for the window to
 fill.
 
-The footer shows the current context usage as `ctx N%`, and what the
-conversation has cost as `N↑ M↓`. Both move as each call comes back rather
-than when the run ends, so a run of twenty turns counts twenty times — and a
-run that ends in an error or an abort still says what it spent.
+The footer shows the current context usage as `ctx N%` — dim while there is
+room, yellow past 70%, red past 90%, which on a session that compacts means
+the window is filling with nothing being done about it. Beside it is what the
+conversation has cost, as `N↑ M↓`: a running total of every call's tokens, so
+it passes the size of the window early and keeps going. Both move as each
+call comes back rather than when the run ends, so a run of twenty turns
+counts twenty times — and a run that ends in an error or an abort still says
+what it spent.
 
 ## Keys
 

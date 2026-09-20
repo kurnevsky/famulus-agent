@@ -650,6 +650,8 @@ fn a_command_is_written_then_run_and_its_output_lands_under_it() {
 /// they follow whatever palette the terminal is wearing.
 const GREEN_BG: &str = "\u{1b}[48;5;2m";
 const RED_BG: &str = "\u{1b}[48;5;1m";
+/// Red text, as against red behind text.
+const RED: &str = "\u{1b}[38;5;1m";
 
 #[test]
 fn a_failed_command_is_red_and_a_finished_one_green() {
@@ -1204,6 +1206,37 @@ fn what_a_call_cost_is_counted_when_it_comes_back_not_when_the_run_ends() {
   assert!(
     screen.contains(&format!("{}↓", SPENT * 2)),
     "the second call adds to the first: {screen}"
+  );
+}
+
+/// A window filling up is worth seeing before it is full, so the footer's
+/// share of it is coloured rather than dim once there is little left.
+#[test]
+fn a_context_window_with_little_left_in_it_says_so_in_colour() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![Turn::Echo]);
+  // Nothing makes room here, so the figure stays where the first answer put
+  // it: a window of 100 tokens and a message that will not fit in it.
+  let term = Term::start(
+    "ctx-colour",
+    &provider,
+    &["--no-session", "--no-compaction", "--context-window", "100"],
+  );
+  let screen = term.screen();
+  assert!(
+    !screen.contains("ctx "),
+    "nothing to say before the first answer: {screen}"
+  );
+
+  term.submit(&format!("remember the kumquat {}", "x".repeat(600)));
+  term.wait_for("ctx ");
+  let screen = term.coloured();
+  let footer = screen.lines().find(|line| line.contains("ctx ")).expect("a footer");
+  assert!(
+    footer.contains(&format!("{RED}ctx ")),
+    "a window this far past full is red: {footer:?}"
   );
 }
 
