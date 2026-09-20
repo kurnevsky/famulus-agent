@@ -78,8 +78,14 @@ resumed later. Unlike pi, all sessions live in one global directory
 so the picker shows each session's working directory. The file is created on
 the first message, so empty sessions leave nothing behind. Records are the
 header, each transcript message, compaction checkpoints (summary plus the kept
-tail), the moves `/tree` makes, and renames. Aborted turns keep the prompt and
-any partial answer. Because entries name their parent, one file holds every
+tail), the moves `/tree` makes, and renames. A run only hands back its
+transcript when it reaches the end, so an aborted one keeps its turns as they
+happen: the prompt, every call and result it got through, and the half-written
+answer it was on. The files its tools changed stay changed either way, and the
+conversation should not be the only thing that forgets. Calls it was stopped in the middle of are
+answered as interrupted — matched by the id each result carries, so every one
+of them is answered however many were in flight, since a call left hanging is
+a transcript no provider will take back. Because entries name their parent, one file holds every
 branch the conversation took, not only the one it is on.
 
 - `src/session.rs` – store, session file, listing, and replay. Tool results
