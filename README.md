@@ -357,6 +357,41 @@ of the half-written JSON; after that they are read as arguments, which is what
 keeps an edit's two halves together once a serializer has sorted its keys. A
 call the model never finished writing leaves nothing behind.
 
+## Images
+
+An image a tool answered with is drawn where it was read rather than described
+as `[image]`. Every cell is `▄`: the upper pixel is its background and the
+lower one its foreground, so a cell carries one pixel across and two down —
+which is the shape of a terminal cell, and what keeps the picture's own
+proportions. The colours are the terminal's own 24-bit ones, and a transparent
+pixel is left without a colour at all, so an icon with no background of its own
+sits on whatever the terminal is wearing.
+
+```
+⚙ read diagram.png
+    Read image file [image/png]
+   ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+   ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+```
+
+The picture is drawn at the width the transcript has, which is as much detail
+as a terminal can hold, and folded at sixteen lines like every other block of a
+tool's output — so `Ctrl+O` shows the rest of it rather than a larger copy of
+it, and nothing already on screen moves when it does. Scaling it to fit a
+preview instead would cost the detail everywhere to save the scrolling in one
+place. It is never enlarged: a 16x16 icon is the eight lines it is, not blown
+up to the width of the transcript. Eighty lines is the ceiling on a drawn one,
+which binds only for the very tall and narrow.
+
+A drawn image is kept by its bytes and the width it was drawn at, the way
+rendered markdown is, because scaling one is more work than a frame has. The
+fold is not part of that: unfolding shows more of the same drawing rather than
+making another.
+
+That is what the transcript shows; what the model gets is the image itself. So
+`--no-vision` is a session with neither — `read` sends no image, and there is
+nothing left to draw.
+
 ## Compaction
 
 After each turn the agent compares the provider-reported context size of the

@@ -606,6 +606,103 @@ fn a_failed_command_is_red_and_a_finished_one_green() {
 }
 
 #[test]
+fn an_image_a_tool_read_is_drawn_where_it_was_read() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "",
+      tool: "read",
+      args: serde_json::json!({ "path": "red.png" }),
+    },
+    Turn::Say("A red square."),
+  ]);
+  let term = Term::start("image", &provider, &["--no-session"]);
+  let red = image::ImageBuffer::from_pixel(16, 16, image::Rgb([220u8, 20, 60]));
+  image::DynamicImage::ImageRgb8(red)
+    .save(term.dir.join("red.png"))
+    .expect("an image to read");
+  term.submit("look at red.png");
+  term.wait_for("A red square.");
+
+  // Sixteen pixels down is eight lines of half-blocks, sixteen cells across
+  // — the image at its own size, since the transcript is wider than it is.
+  let screen = term.screen();
+  let drawn: Vec<&str> = screen.lines().filter(|line| line.contains('▄')).collect();
+  assert_eq!(drawn.len(), 8, "the image is drawn as half-blocks:\n{screen}");
+  assert!(
+    drawn.iter().all(|line| line.matches('▄').count() == 16),
+    "each line is the image's own width:\n{screen}"
+  );
+  // And drawn in colour, whatever the terminal rounds it to.
+  let coloured = term.coloured();
+  assert!(
+    coloured
+      .lines()
+      .any(|line| line.contains('▄') && line.contains("\u{1b}[38;")),
+    "the blocks carry the image's colours:\n{coloured:?}"
+  );
+}
+
+#[test]
+fn a_tall_image_folds_like_any_other_output_and_ctrl_o_unfolds_it() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "",
+      tool: "read",
+      args: serde_json::json!({ "path": "tall.png" }),
+    },
+    Turn::Say("A tall one."),
+  ]);
+  let term = Term::start("tall-image", &provider, &["--no-session"]);
+  // Twenty-four across and sixty down: thirty lines drawn, of which the
+  // preview keeps sixteen.
+  let tall = image::ImageBuffer::from_pixel(24, 60, image::Rgb([30u8, 90, 200]));
+  image::DynamicImage::ImageRgb8(tall)
+    .save(term.dir.join("tall.png"))
+    .expect("an image to read");
+  term.submit("look at tall.png");
+  term.wait_for("A tall one.");
+
+  let screen = term.wait_for("14 more lines (ctrl+o)");
+  let folded = screen.lines().filter(|line| line.contains('▄')).count();
+  assert_eq!(folded, 16, "the preview keeps the top of the image:\n{screen}");
+
+  // And ctrl+o shows the rest of it, the same drawing rather than a bigger
+  // one — so the lines already on screen are the lines still on screen.
+  term.type_in("C-o");
+  let unfolded = poll(|| {
+    let screen = term.screen();
+    (!screen.contains("more lines (ctrl+o)")).then_some(screen)
+  });
+  let shown = unfolded.lines().filter(|line| line.contains('▄')).count();
+  assert!(shown > folded, "ctrl+o unfolds the image:\n{unfolded}");
+  assert!(
+    unfolded
+      .lines()
+      .all(|line| !line.contains('▄') || line.matches('▄').count() == 24),
+    "unfolding does not redraw it wider:\n{unfolded}"
+  );
+}
+
+/// Wait for the screen to say something the `wait_for` needle cannot — that
+/// a fold note has gone, say.
+fn poll(mut ready: impl FnMut() -> Option<String>) -> String {
+  let deadline = Instant::now() + Duration::from_secs(15);
+  while Instant::now() < deadline {
+    if let Some(screen) = ready() {
+      return screen;
+    }
+    std::thread::sleep(Duration::from_millis(50));
+  }
+  panic!("waited for the screen to settle");
+}
+
+#[test]
 fn an_aborted_run_keeps_its_work_and_can_carry_on() {
   if !have_tmux() {
     return;

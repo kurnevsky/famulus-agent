@@ -15,7 +15,7 @@ use rig_agent::agent::{
 use rig_agent::client::AgentClientExt;
 use rig_agent::completion::PromptError;
 use rig_agent::streaming::StreamingPrompt;
-use rig_agent::tool::{Tool, ToolOutput};
+use rig_agent::tool::Tool;
 use rig_core::client::completion::CompletionClient;
 use rig_core::completion::{
   CompletionError, CompletionModel, CompletionRequest, CompletionResponse, Message, ProviderCapabilities, Usage,
@@ -62,6 +62,8 @@ pub enum AgentEvent {
   ToolResult {
     name: String,
     output: String,
+    /// Images the tool answered with, drawn under its output.
+    images: Vec<Vec<u8>>,
     is_error: bool,
     /// The call this answers, as the transcript will name it. Whether a tool
     /// failed is not something a transcript records — a failed result looks
@@ -192,11 +194,13 @@ impl AgentHook for UiHook {
   }
 
   async fn on_tool_result(&self, _ctx: &HookContext, event: ToolResultEvent<'_>) -> ToolResultAction {
+    let (output, images) = crate::images::split(event.presentation.as_content());
     let _ = self.tx.send(AgentEvent::ToolResult {
       name: event.tool_name.to_string(),
       call: call_id(event.tool_call_id),
       diff: event.tool_context.result::<EditDiff>().map(|d| d.diff.clone()),
-      output: render_output(event.presentation),
+      output,
+      images,
       is_error: event.raw_result.is_error() || event.raw_result.is_refused(),
     });
     ToolResultAction::Keep
@@ -277,20 +281,6 @@ pub fn build_agents(
     summarizer: Arc::new(summarizer),
     waiting,
   })
-}
-
-/// Text shown in the UI for a tool result; images become a placeholder.
-fn render_output(output: &ToolOutput) -> String {
-  output
-    .as_content()
-    .iter()
-    .map(|c| match c {
-      ToolResultContent::Text(t) => t.text.clone(),
-      ToolResultContent::Json { value } => value.to_string(),
-      ToolResultContent::Image(_) => "[image]".to_string(),
-    })
-    .collect::<Vec<_>>()
-    .join("\n")
 }
 
 /// The OpenAI chat completions API only accepts text in tool messages, so this

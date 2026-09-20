@@ -29,11 +29,19 @@ const MAX_INPUT_LINES: usize = 8;
 const TOOL_OUTPUT_LINES: usize = 10;
 const DIFF_LINES: usize = 30;
 const REASONING_LINES: usize = 6;
+/// Lines of an image shown before it folds, as every other block of a tool's
+/// output folds.
+const IMAGE_LINES: usize = 16;
+/// The ceiling on a drawn image, which binds only for the very tall and
+/// narrow — an image is drawn at the width it is given, and a 100x5000 one
+/// would otherwise be a thousand lines for `Ctrl+O` to unfold.
+const IMAGE_MAX_LINES: u16 = 80;
 /// Reasoning text is indented under its `· thinking…` header.
 const REASONING_INDENT: &str = "  ";
 /// Cache tags, so two entry kinds holding the same text stay apart.
 const ASSISTANT_KIND: u8 = 0;
 const REASONING_KIND: u8 = 1;
+const IMAGE_KIND: u8 = 2;
 /// Transcript lines moved per mouse wheel notch.
 const WHEEL_LINES: usize = 3;
 /// How long the `auto` scrollbar stays visible after the last scroll.
@@ -299,6 +307,10 @@ enum Entry {
   ToolResult {
     name: String,
     output: String,
+    /// Images the tool answered with, drawn under its output as half-blocks.
+    /// The bytes as the tool produced them, since what they are drawn as
+    /// depends on how wide the transcript is when they are drawn.
+    images: Vec<Vec<u8>>,
     is_error: bool,
     call: String,
     /// Still streaming; `output` is a live snapshot.
@@ -1109,6 +1121,7 @@ impl App {
       AgentEvent::ToolResult {
         name,
         output,
+        images,
         is_error,
         call,
         diff,
@@ -1127,7 +1140,17 @@ impl App {
             },
           );
         }
-        place_result(&mut self.entries, name, output, is_error, call, diff);
+        place_result(
+          &mut self.entries,
+          Finished {
+            name,
+            output,
+            images,
+            is_error,
+            call,
+            diff,
+          },
+        );
       }
       AgentEvent::Error(err) => {
         self.entries.push(Entry::Error(err));
@@ -1531,6 +1554,7 @@ impl App {
         Entry::ToolResult {
           name,
           output,
+          images,
           is_error,
           call,
           running,
@@ -1559,15 +1583,52 @@ impl App {
               None => (marked_lines(output, false), TOOL_OUTPUT_LINES, name == "bash"),
             },
           };
-          Preview {
-            body,
-            gutter: gutter(*running, *is_error),
-            cap,
-            expanded: self.expand_tools,
-            from_end,
-            cursor: false,
+          let stripe = gutter(*running, *is_error);
+          // A tool that answered with a picture and nothing else gets no
+          // block of nothing above it.
+          let silent = body.iter().flatten().all(|span| span.content.trim().is_empty());
+          if !(silent && !images.is_empty()) {
+            Preview {
+              body,
+              gutter: stripe.clone(),
+              cap,
+              expanded: self.expand_tools,
+              from_end,
+              cursor: false,
+            }
+            .draw(&mut lines);
           }
-          .draw(&mut lines);
+          // The picture itself, under whatever was said about it: drawn at
+          // the width the transcript has, which is the detail a terminal can
+          // hold, and folded like any other block — so `Ctrl+O` shows the
+          // rest of it rather than a larger copy of it, and nothing already
+          // on screen moves when it does.
+          //
+          // Scaling one is far more work than a frame has, so a drawn image
+          // is kept by its bytes and the width it was drawn at, the way
+          // rendered markdown is. The fold is not part of the key: it is how
+          // much of the same drawing is shown.
+          for image in images {
+            // Two columns of indent and the gutter, as every other block of
+            // a tool's output is drawn.
+            let cols = width.saturating_sub(3);
+            let key = (hash_bytes(IMAGE_KIND, image), cols, false);
+            let drawn = match cached.remove(&key) {
+              Some(drawn) => drawn,
+              None => crate::images::blocks(image, cols, IMAGE_MAX_LINES)
+                .unwrap_or_else(|| vec![Line::styled("[image could not be drawn]", dim)]),
+            };
+            Preview {
+              body: drawn.iter().map(|line| line.spans.clone()).collect(),
+              gutter: stripe.clone(),
+              cap: IMAGE_LINES,
+              expanded: self.expand_tools,
+              from_end: false,
+              cursor: false,
+            }
+            .draw(&mut lines);
+            live.insert(key, drawn);
+          }
           if name == "bash" && (*running || took.is_some()) {
             let (label, elapsed) = match took {
               Some(took) => ("Took", *took),
@@ -1685,6 +1746,14 @@ fn hash(kind: u8, text: &str) -> u64 {
   let mut hasher = DefaultHasher::new();
   kind.hash(&mut hasher);
   text.hash(&mut hasher);
+  hasher.finish()
+}
+
+/// The same, for an image, which is bytes rather than text.
+fn hash_bytes(kind: u8, bytes: &[u8]) -> u64 {
+  let mut hasher = DefaultHasher::new();
+  kind.hash(&mut hasher);
+  bytes.hash(&mut hasher);
   hasher.finish()
 }
 
@@ -1993,6 +2062,7 @@ fn place_output(entries: &mut Vec<Entry>, call: String, text: String) {
     Entry::ToolResult {
       name,
       output: text,
+      images: Vec::new(),
       is_error: false,
       call,
       running: true,
@@ -2003,16 +2073,27 @@ fn place_output(entries: &mut Vec<Entry>, call: String, text: String) {
   );
 }
 
-/// Replace a command's live output with what it finally said, in place, or
-/// put it under the call that asked for it.
-fn place_result(
-  entries: &mut Vec<Entry>,
+/// What a tool finally said, as the transcript takes it in.
+struct Finished {
   name: String,
   output: String,
+  images: Vec<Vec<u8>>,
   is_error: bool,
   call: String,
   diff: Option<String>,
-) {
+}
+
+/// Replace a command's live output with what it finally said, in place, or
+/// put it under the call that asked for it.
+fn place_result(entries: &mut Vec<Entry>, result: Finished) {
+  let Finished {
+    name,
+    output,
+    images,
+    is_error,
+    call,
+    diff,
+  } = result;
   if let Some(i) = running_at(entries, &call) {
     entries.remove(i);
   }
@@ -2026,6 +2107,7 @@ fn place_result(
     Entry::ToolResult {
       name,
       output,
+      images,
       is_error,
       call,
       running: false,
@@ -2068,16 +2150,7 @@ impl<'a> Results<'a> {
 
   fn entry(&self, index: usize, session: &Session, now: Instant) -> Entry {
     let result = self.results[index];
-    let output = result
-      .content
-      .iter()
-      .map(|c| match c {
-        ToolResultContent::Text(t) => t.text.clone(),
-        ToolResultContent::Json { value } => value.to_string(),
-        ToolResultContent::Image(_) => "[image]".to_string(),
-      })
-      .collect::<Vec<_>>()
-      .join("\n");
+    let (output, images) = crate::images::split(&result.content);
     // A failed result reads like any other in the transcript, and the diff an
     // edit produced is not in it at all, so both are things the session
     // remembers — against this result's own call, since one message can
@@ -2086,6 +2159,7 @@ impl<'a> Results<'a> {
     Entry::ToolResult {
       name: result.name.clone(),
       output,
+      images,
       call: result.call.as_str().to_string(),
       is_error: outcome.is_some_and(|outcome| outcome.failed),
       running: false,
@@ -2873,6 +2947,17 @@ mod tests {
     }
   }
 
+  fn finished(output: &str, is_error: bool, call: &str) -> Finished {
+    Finished {
+      name: "bash".into(),
+      output: output.into(),
+      images: Vec::new(),
+      is_error,
+      call: call.into(),
+      diff: None,
+    }
+  }
+
   #[test]
   fn output_finds_its_own_call_when_two_are_in_flight() {
     // Both commands announced, then output arriving in the other order —
@@ -2904,22 +2989,8 @@ mod tests {
 
     // And the finished results land in the same places, in whatever order
     // the two commands happen to end.
-    place_result(
-      &mut entries,
-      "bash".into(),
-      "quick done".into(),
-      false,
-      "b".into(),
-      None,
-    );
-    place_result(
-      &mut entries,
-      "bash".into(),
-      "slow failed".into(),
-      true,
-      "a".into(),
-      None,
-    );
+    place_result(&mut entries, finished("quick done", false, "b"));
+    place_result(&mut entries, finished("slow failed", true, "a"));
     assert_eq!(
       shapes(&entries),
       [
@@ -2969,6 +3040,7 @@ mod tests {
       Entry::ToolResult {
         name: "bash".into(),
         output: "old output".into(),
+        images: Vec::new(),
         is_error: false,
         call: "call_1".into(),
         running: false,
@@ -2979,14 +3051,7 @@ mod tests {
       announced("new command", "call_1"),
     ];
     place_output(&mut entries, "call_1".into(), "new output".into());
-    place_result(
-      &mut entries,
-      "bash".into(),
-      "new output".into(),
-      false,
-      "call_1".into(),
-      None,
-    );
+    place_result(&mut entries, finished("new output", false, "call_1"));
     assert_eq!(
       shapes(&entries),
       [
