@@ -37,6 +37,27 @@ impl ToolError {
   }
 }
 
+/// The parts of a tool that are the same for every one of them.
+///
+/// Declaring the argument type here is what keeps the schema from drifting
+/// from it: `parameters` is generated from the same type rather than naming
+/// it a second time. `map_error` forwards what the tool actually said — rig's
+/// default redacts it, and fa's messages are written for the model to read.
+macro_rules! tool_args {
+  ($args:ty) => {
+    type Args = $args;
+    type Error = ToolError;
+
+    fn parameters(&self) -> serde_json::Value {
+      schema::<$args>()
+    }
+
+    fn map_error(&self, error: ToolError) -> ToolExecutionError {
+      error.into_execution_error()
+    }
+  };
+}
+
 /// JSON schema for a tool's arguments, stripped of metadata that some
 /// OpenAI-compatible servers reject (`$schema`, `title`, integer `format`).
 fn schema<T: JsonSchema>() -> serde_json::Value {
@@ -133,9 +154,8 @@ pub struct ReadArgs {
 
 impl Tool for ReadTool {
   const NAME: &'static str = "read";
-  type Args = ReadArgs;
   type Output = Vec<ToolResultContent>;
-  type Error = ToolError;
+  tool_args!(ReadArgs);
 
   fn description(&self) -> String {
     format!(
@@ -145,14 +165,6 @@ impl Tool for ReadTool {
              full file, continue with offset until complete.",
       MAX_BYTES / 1024
     )
-  }
-
-  fn parameters(&self) -> serde_json::Value {
-    schema::<ReadArgs>()
-  }
-
-  fn map_error(&self, error: ToolError) -> ToolExecutionError {
-    error.into_execution_error()
   }
 
   async fn call(&self, _ctx: &mut ToolContext, args: ReadArgs) -> Result<Vec<ToolResultContent>, ToolError> {
@@ -436,9 +448,8 @@ pub struct WriteArgs {
 
 impl Tool for WriteTool {
   const NAME: &'static str = "write";
-  type Args = WriteArgs;
   type Output = String;
-  type Error = ToolError;
+  tool_args!(WriteArgs);
 
   fn description(&self) -> String {
     "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. \
@@ -446,32 +457,41 @@ impl Tool for WriteTool {
       .into()
   }
 
-  fn parameters(&self) -> serde_json::Value {
-    schema::<WriteArgs>()
-  }
-
-  fn map_error(&self, error: ToolError) -> ToolExecutionError {
-    error.into_execution_error()
-  }
-
-  async fn call(&self, _ctx: &mut ToolContext, args: WriteArgs) -> Result<String, ToolError> {
+  async fn call(&self, ctx: &mut ToolContext, args: WriteArgs) -> Result<String, ToolError> {
     let path = resolve(&self.cwd, &args.path);
     let _guard = lock_file(&path).await;
     if let Some(parent) = path.parent() {
       tokio::fs::create_dir_all(parent).await?;
     }
+    // What the file said before, so the UI can show what changed rather than
+    // a sentence saying that something did. A new file simply had nothing.
+    let before = tokio::fs::read_to_string(&path).await.unwrap_or_default();
     tokio::fs::write(&path, &args.content).await?;
+    attach_diff(ctx, &before, &args.content);
     Ok(format!("Successfully wrote to {}", args.path))
   }
 }
 
 // ---------------------------------------------------------------- edit
 
-/// Host-only detail attached to a successful edit: the numbered diff for the
-/// UI. It is never sent to the model.
+/// Host-only detail attached to a file a tool changed: the numbered diff for
+/// the UI. It is never sent to the model.
 #[derive(Clone, Debug)]
 pub struct EditDiff {
   pub diff: String,
+}
+
+/// Leave the change behind for the UI to draw, so a file's own before and
+/// after is what the transcript shows rather than a sentence saying that
+/// something happened.
+///
+/// A change of nothing leaves nothing: there is no diff to draw, and the
+/// tool's own words are the whole story.
+fn attach_diff(ctx: &mut ToolContext, before: &str, after: &str) {
+  let diff = edit::generate_diff_string(before, after, 4);
+  if !diff.text.trim().is_empty() {
+    ctx.insert_result(EditDiff { diff: diff.text });
+  }
 }
 
 /// Per-file locks so concurrent edits/writes to one path are serialized.
@@ -528,9 +548,8 @@ pub struct EditArgs {
 
 impl Tool for EditTool {
   const NAME: &'static str = "edit";
-  type Args = EditArgs;
   type Output = String;
-  type Error = ToolError;
+  tool_args!(EditArgs);
 
   fn description(&self) -> String {
     "Edit a single file using exact text replacement. Every edits[].oldText must match a \
@@ -538,14 +557,6 @@ impl Tool for EditTool {
          block or nearby lines, merge them into one edit instead of emitting overlapping edits. \
          Do not include large unchanged regions just to connect distant changes."
       .into()
-  }
-
-  fn parameters(&self) -> serde_json::Value {
-    schema::<EditArgs>()
-  }
-
-  fn map_error(&self, error: ToolError) -> ToolExecutionError {
-    error.into_execution_error()
   }
 
   async fn call(&self, ctx: &mut ToolContext, args: EditArgs) -> Result<String, ToolError> {
@@ -590,13 +601,57 @@ impl Tool for EditTool {
     let final_content = format!("{bom}{}", edit::restore_line_endings(&applied.new, ending));
     tokio::fs::write(&path, final_content).await?;
 
-    let diff = edit::generate_diff_string(&applied.base, &applied.new, 4);
-    ctx.insert_result(EditDiff { diff: diff.text });
+    attach_diff(ctx, &applied.base, &applied.new);
     Ok(format!(
       "Successfully replaced {} block(s) in {}.",
       edits.len(),
       args.path
     ))
+  }
+}
+
+#[cfg(test)]
+mod write_tests {
+  use super::*;
+
+  async fn write(dir: &Path, content: &str) -> (Result<String, ToolError>, ToolContext) {
+    let mut ctx = ToolContext::new();
+    let result = WriteTool { cwd: dir.to_path_buf() }
+      .call(
+        &mut ctx,
+        WriteArgs {
+          path: "f.txt".into(),
+          content: content.into(),
+        },
+      )
+      .await;
+    (result, ctx)
+  }
+
+  #[tokio::test]
+  async fn a_write_shows_what_changed_rather_than_that_something_did() {
+    let dir = std::env::temp_dir().join(format!("fa-write-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // A new file is all new lines.
+    let (result, ctx) = write(&dir, "one\ntwo\n").await;
+    assert!(result.is_ok());
+    let diff = &ctx.result::<EditDiff>().expect("a new file is a change").diff;
+    assert!(diff.contains("+1 one") && diff.contains("+2 two"), "{diff}");
+
+    // Rewriting it differently is the difference, not the whole file.
+    let (_, ctx) = write(&dir, "one\ntwo!\n").await;
+    let diff = &ctx.result::<EditDiff>().expect("a rewrite is a change").diff;
+    assert!(diff.contains("-2 two") && diff.contains("+2 two!"), "{diff}");
+    assert!(!diff.contains("-1 one"), "the line that did not change: {diff}");
+
+    // Writing what is already there changed nothing, and there is no diff to
+    // show — the transcript falls back to the tool saying it wrote the file.
+    let (result, ctx) = write(&dir, "one\ntwo!\n").await;
+    assert_eq!(result.unwrap(), "Successfully wrote to f.txt");
+    assert!(ctx.result::<EditDiff>().is_none(), "nothing changed, nothing to show");
+    std::fs::remove_dir_all(&dir).unwrap();
   }
 }
 
@@ -724,9 +779,8 @@ pub struct BashArgs {
 
 impl Tool for BashTool {
   const NAME: &'static str = "bash";
-  type Args = BashArgs;
   type Output = String;
-  type Error = ToolError;
+  tool_args!(BashArgs);
 
   fn description(&self) -> String {
     format!(
@@ -735,14 +789,6 @@ impl Tool for BashTool {
              If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.",
       MAX_BYTES / 1024
     )
-  }
-
-  fn parameters(&self) -> serde_json::Value {
-    schema::<BashArgs>()
-  }
-
-  fn map_error(&self, error: ToolError) -> ToolExecutionError {
-    error.into_execution_error()
   }
 
   async fn call(&self, _ctx: &mut ToolContext, args: BashArgs) -> Result<String, ToolError> {

@@ -182,6 +182,16 @@ at a time (rig's `tool_concurrency` defaults to 1 and fa leaves it there), but
 were that raised, two commands in flight would still each keep their own
 output.
 
+Every tool shows a preview of what it has to say rather than all of it, the
+way a thinking block does, with a line saying how much is folded away;
+`Ctrl+O` swaps between the preview and the whole thing, including for a call
+still being written, so a long file can be watched arriving in full or kept to
+its last lines. A command keeps the
+end of its output and a file the start of its contents, since that is the end
+that matters in each. `write` and `edit` show what changed as a diff — what a
+file says now is worth seeing, where "Successfully wrote to it" only repeats
+the line above.
+
 A finished tool's output carries a stripe down its side saying how it went —
 green when it worked, red when it did not — in place of the `│` gutter it has
 while it is still running, which is not yet a verdict. The same for every
@@ -229,6 +239,8 @@ shows the current context usage as `ctx N%`.
 | `PageUp` / `PageDown`, mouse wheel | Scroll transcript |
 | `Ctrl+C` | Abort if running, otherwise quit |
 | `Ctrl+D` | Quit (empty input) |
+| `Ctrl+T` | Thinking in full, or only its last lines |
+| `Ctrl+O` | Tool output in full, or only its preview |
 | `/compact` | Summarize older history now |
 | `/continue` | Run the model again with no new message |
 | `/new` | Start a new session |

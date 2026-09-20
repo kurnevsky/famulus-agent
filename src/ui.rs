@@ -254,6 +254,8 @@ pub struct App {
   view: (usize, usize),
   /// Ctrl+T shows reasoning blocks in full instead of their last few lines.
   expand_thinking: bool,
+  /// Ctrl+O shows tool output in full instead of the preview.
+  expand_tools: bool,
   /// Rendered markdown, keyed by message text and width rather than by entry,
   /// so reloading a session or compacting cannot serve another entry's lines.
   /// Rebuilt each draw by moving live entries across, which evicts the rest.
@@ -311,6 +313,7 @@ impl App {
       anchor: None,
       view: (0, 0),
       expand_thinking: false,
+      expand_tools: false,
       markdown: HashMap::new(),
       usage: Usage::new(),
       context_tokens: None,
@@ -410,6 +413,10 @@ impl App {
         self.expand_thinking = !self.expand_thinking;
         // Expanding moves everything below the block, so keep the view
         // pinned rather than leaving the reader mid-paragraph.
+        self.reset_view();
+      }
+      (KeyCode::Char('o'), true) => {
+        self.expand_tools = !self.expand_tools;
         self.reset_view();
       }
       (KeyCode::Esc, _) if self.run.is_some() => self.abort(),
@@ -1383,43 +1390,40 @@ impl App {
               Span::styled(text, style),
             ]));
           };
-          if let Some(diff) = diff {
-            // An edit is shown as a diff: removed red, added green, context
-            // dim, capped like other tool output.
-            let all: Vec<&str> = diff.lines().collect();
-            let shown = all.len().min(DIFF_LINES);
-            for l in &all[..shown] {
-              let style = match l.chars().next() {
-                Some('+') => Style::default().fg(Color::Green),
-                Some('-') => Style::default().fg(Color::Red),
-                _ => dim,
-              };
-              block(l.to_string(), style);
-            }
-            if all.len() > shown {
-              block(format!(" … {} more lines", all.len() - shown), dim);
-            }
-            continue;
-          }
-          let all: Vec<&str> = output.lines().collect();
-          let shown = all.len().min(TOOL_OUTPUT_LINES);
-          let hidden = all.len() - shown;
-          // Command output is most useful at its end; file contents at the
-          // start.
-          if name == "bash" {
-            if hidden > 0 {
-              block(format!(" … {hidden} earlier lines"), dim);
-            }
-            for l in &all[hidden..] {
-              block(format!(" {l}"), dim);
-            }
+          // What every tool has to show, and how it reads. A diff is what
+          // changed; anything else is what the tool said.
+          // A diff of nothing is not worth a block of nothing: a write that
+          // changed the file not at all falls back to saying so.
+          let diff = diff.as_deref().filter(|diff| !diff.trim().is_empty());
+          let (body, cap, from_end) = match diff {
+            Some(diff) => (diff, DIFF_LINES, false),
+            // A command's output is most useful at its end and a file's at
+            // its start, so each keeps the end that matters.
+            None => (output.as_str(), TOOL_OUTPUT_LINES, name == "bash"),
+          };
+          let all: Vec<&str> = body.lines().collect();
+          let shown = if self.expand_tools {
+            all.len()
           } else {
-            for l in &all[..shown] {
-              block(format!(" {l}"), dim);
-            }
-            if hidden > 0 {
-              block(format!(" … {hidden} more lines"), dim);
-            }
+            all.len().min(cap)
+          };
+          let hidden = all.len() - shown;
+          if hidden > 0 && from_end {
+            block(fold_note(hidden, true), dim);
+          }
+          let kept = if from_end { &all[hidden..] } else { &all[..shown] };
+          for l in kept {
+            // A diff says what it is with its first character; everything
+            // else is the tool talking, and stays out of the way.
+            let style = match diff.is_some().then(|| l.chars().next()).flatten() {
+              Some('+') => Style::default().fg(Color::Green),
+              Some('-') => Style::default().fg(Color::Red),
+              _ => dim,
+            };
+            block(format!(" {l}"), style);
+          }
+          if hidden > 0 && !from_end {
+            block(fold_note(hidden, false), dim);
           }
           if name == "bash" && (*running || took.is_some()) {
             let (label, elapsed) = match took {
@@ -1490,9 +1494,12 @@ impl App {
       }
       lines.push(Line::from(header));
       // The tail is what is being written; what came before is already said.
-      let hidden = body.len().saturating_sub(TOOL_OUTPUT_LINES);
+      let hidden = match self.expand_tools {
+        true => 0,
+        false => body.len().saturating_sub(TOOL_OUTPUT_LINES),
+      };
       if hidden > 0 {
-        lines.push(Line::styled(format!("  │ … {hidden} earlier lines"), dim));
+        lines.push(Line::styled(format!("  │{}", fold_note(hidden, true)), dim));
       }
       for (i, (mark, text)) in body.iter().enumerate().skip(hidden) {
         let style = match *mark {
@@ -1575,6 +1582,16 @@ fn finish_running(entries: &mut [Entry]) {
       *running = false;
       *took = Some(started.elapsed());
     }
+  }
+}
+
+/// How much of a block is folded away, and which way — with the key that
+/// unfolds it, since a fold nobody knows how to open is just a truncation.
+fn fold_note(hidden: usize, earlier: bool) -> String {
+  let which = if earlier { "earlier" } else { "more" };
+  match hidden {
+    1 => format!(" … 1 {which} line (ctrl+o)"),
+    n => format!(" … {n} {which} lines (ctrl+o)"),
   }
 }
 
@@ -2062,35 +2079,65 @@ fn writing_body(name: &str, args: &str) -> Vec<(&'static str, String)> {
     let text = |value: &serde_json::Value, key| value.get(key).and_then(|v| v.as_str()).map(str::to_string);
     return match name {
       "write" => text(&value, "content").map(|body| ("│", body)).into_iter().collect(),
+      // Every replacement the call makes, not only the one it is on: a call
+      // is the whole set of them, and the ones already written are still
+      // part of what it will do.
       "edit" => value
         .get("edits")
-        .and_then(|edits| edits.as_array()?.last())
-        .map(|edit| {
-          [
-            text(edit, "oldText").map(|t| ("-", t)),
-            text(edit, "newText").map(|t| ("+", t)),
-          ]
-          .into_iter()
-          .flatten()
-          .collect()
+        .and_then(|edits| edits.as_array())
+        .map(|edits| {
+          edits
+            .iter()
+            .flat_map(|edit| {
+              [
+                text(edit, "oldText").map(|t| ("-", t)),
+                text(edit, "newText").map(|t| ("+", t)),
+              ]
+            })
+            .flatten()
+            .collect()
         })
         .unwrap_or_default(),
       _ => Vec::new(),
     };
   }
-  let block = |mark: &'static str, at: Option<usize>| at.and_then(|at| value_after(args, at)).map(|text| (mark, text));
   match name {
-    "write" => block("│", args.find("\"content\"").map(|at| at + 9))
+    "write" => args
+      .find("\"content\"")
+      .and_then(|at| value_after(args, at + 9))
+      .map(|body| ("│", body))
       .into_iter()
       .collect(),
-    "edit" => {
-      let removed = last_key(args, "oldText");
-      // A replacement's new text only belongs with its own old text, so it
-      // counts only once the one being written has got that far.
-      let added = last_key(args, "newText").filter(|at| removed.is_none_or(|removed| *at > removed));
-      [block("-", removed), block("+", added)].into_iter().flatten().collect()
-    }
+    "edit" => replacements(args),
     _ => Vec::new(),
+  }
+}
+
+/// The replacements written so far, in the order they were written, the last
+/// of them as far as it has got.
+///
+/// Read by scanning because there is nothing parseable yet. A replacement
+/// whose own text contained `"newText":` would fool it, which costs a wrongly
+/// drawn line until the call finishes and is read properly.
+fn replacements(args: &str) -> Vec<(&'static str, String)> {
+  let mut out = Vec::new();
+  let mut from = 0;
+  loop {
+    let next = [("-", "oldText"), ("+", "newText")]
+      .into_iter()
+      .filter_map(|(mark, key)| {
+        let at = args[from..].find(&format!("\"{key}\""))? + from;
+        Some((at, mark, key.len()))
+      })
+      .min_by_key(|(at, ..)| *at);
+    let Some((at, mark, len)) = next else { return out };
+    from = at + len + 2;
+    // A value that has not opened yet, or a key with nothing after it, is
+    // where the writing has got to.
+    let Some(text) = value_after(args, from) else {
+      return out;
+    };
+    out.push((mark, text));
   }
 }
 
@@ -2102,13 +2149,6 @@ fn writing_body(name: &str, args: &str) -> Vec<(&'static str, String)> {
 /// fool it, which costs a wrong half-drawn line and nothing else.
 fn partial_str(json: &str, key: &str) -> Option<String> {
   value_after(json, json.find(&format!("\"{key}\""))? + key.len() + 2)
-}
-
-/// Where the last mention of `key` leaves off, for a call that carries the
-/// same key more than once — an `edit` with several replacements, whose last
-/// one is the one being written now.
-fn last_key(json: &str, key: &str) -> Option<usize> {
-  json.rfind(&format!("\"{key}\"")).map(|at| at + key.len() + 2)
 }
 
 /// Reads the string value that follows a key, from `at`.
@@ -2335,34 +2375,30 @@ mod tests {
   }
 
   #[test]
-  fn a_second_edit_does_not_show_the_first_ones_replacement() {
-    // Two replacements, the second only part-written: pairing the newest old
-    // text with the newest new text would show one from each.
+  fn an_edit_shows_every_replacement_it_has_written_so_far() {
+    // A call is the whole set of replacements, so the ones already written
+    // stay on screen while the next is being typed — they are still part of
+    // what the call will do.
     let two = r#"{"edits":[{"oldText":"one","newText":"1"},{"oldText":"tw"#;
-    assert_eq!(writing_body("edit", two), [("-", "tw".to_string())]);
-    // Once its own replacement starts, both halves are its own.
+    assert_eq!(
+      writing_body("edit", two),
+      [
+        ("-", "one".to_string()),
+        ("+", "1".to_string()),
+        ("-", "tw".to_string()),
+      ]
+    );
+    // And the replacement being written grows in place rather than
+    // displacing the ones before it.
     let two = format!("{two}o\",\"newText\":\"2");
     assert_eq!(
       writing_body("edit", &two),
-      [("-", "two".to_string()), ("+", "2".to_string())]
-    );
-  }
-
-  #[test]
-  fn a_finished_edit_keeps_both_halves_whatever_order_the_keys_are_in() {
-    // Arguments that have been through a serializer come back with their
-    // keys sorted, putting `newText` before `oldText` — which the scan that
-    // reads half-written text has to treat as a replacement of its own.
-    let sorted = r#"{"edits":[{"newText":"is","oldText":"was"}],"path":"a.rs"}"#;
-    assert_eq!(
-      writing_body("edit", sorted),
-      [("-", "was".to_string()), ("+", "is".to_string())]
-    );
-    // And the last edit is the one shown, as while it was being written.
-    let two = r#"{"edits":[{"newText":"1","oldText":"one"},{"newText":"2","oldText":"two"}]}"#;
-    assert_eq!(
-      writing_body("edit", two),
-      [("-", "two".to_string()), ("+", "2".to_string())]
+      [
+        ("-", "one".to_string()),
+        ("+", "1".to_string()),
+        ("-", "two".to_string()),
+        ("+", "2".to_string()),
+      ]
     );
   }
 
