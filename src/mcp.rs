@@ -200,6 +200,14 @@ impl Servers {
     &self.notes
   }
 
+  /// How many servers came up, and how many tools they brought between them.
+  pub fn count(&self) -> (usize, usize) {
+    #[cfg(feature = "mcp")]
+    return (self.tools.len(), self.tools.iter().map(|(tools, ..)| tools.len()).sum());
+    #[cfg(not(feature = "mcp"))]
+    (0, 0)
+  }
+
   /// Every tool the session's servers brought, for a list that names tools
   /// without knowing where each came from.
   pub fn tool_names(&self) -> Vec<String> {

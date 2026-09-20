@@ -228,6 +228,7 @@ async fn main() -> Result<()> {
       store,
       start,
       notes,
+      mcp: servers.count(),
     },
   );
 

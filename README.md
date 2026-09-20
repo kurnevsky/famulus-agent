@@ -135,7 +135,9 @@ a file whose name depends on where fa was started from.
 
 Servers come up before the terminal does, and what happened is the first thing
 the transcript says: which server offered how many tools, and what went wrong
-with the rest. A server that fails, or takes more than 20 seconds to say what
+with the rest. The footer keeps a count of both — `2 mcp, 14 tools` — since a
+session with servers is a session with more than the four tools fa was built
+with. A session with no servers says nothing about MCP anywhere. A server that fails, or takes more than 20 seconds to say what
 it offers, is a note rather than a failure — the session still has its own four
 tools, which beats refusing to start. A tool named like one of those four is
 left alone: the model is told about `read`, `write`, `edit` and `bash` in the

@@ -80,6 +80,8 @@ pub struct Options {
   /// and what went wrong with the rest — said in the transcript, since there
   /// is nowhere else left to say it.
   pub notes: Vec<String>,
+  /// How many MCP servers came up, and how many tools they brought.
+  pub mcp: (usize, usize),
 }
 
 /// Slash commands offered by the `/` popup: name, description, takes an argument.
@@ -321,6 +323,9 @@ pub struct App {
   model: String,
   cwd: PathBuf,
   store: Option<Store>,
+  /// How many MCP servers came up, and how many tools they brought, for the
+  /// footer to say a session has more than the four it was built with.
+  mcp: (usize, usize),
   /// The conversation: history plus its on-disk file.
   session: Session,
   overlay: Option<Overlay>,
@@ -377,6 +382,7 @@ impl App {
       store,
       start,
       notes,
+      mcp,
     } = options;
     let mut input = TextArea::default();
     input.set_cursor_line_style(Style::default());
@@ -394,6 +400,7 @@ impl App {
       scrollbar,
       last_scroll: None,
       model,
+      mcp,
       cwd,
       store,
       session,
@@ -1404,6 +1411,10 @@ impl App {
       Span::raw("  "),
       Span::raw(self.model.clone()).dim(),
     ];
+    if let Some(label) = mcp_label(self.mcp.0, self.mcp.1) {
+      left.push(Span::raw("  "));
+      left.push(Span::raw(label).dim());
+    }
     if self.run.is_some() {
       left.push(Span::raw("  "));
       let verb = if self.compacting { "compacting" } else { "working" };
@@ -2285,6 +2296,13 @@ fn messages(n: usize) -> String {
   }
 }
 
+/// What the footer says about this session's MCP servers, or nothing at all
+/// when it has none: a session that never asked for a server should not be
+/// told it has no servers.
+fn mcp_label(servers: usize, tools: usize) -> Option<String> {
+  (servers > 0).then(|| format!("{servers} mcp, {tools} tool{}", if tools == 1 { "" } else { "s" }))
+}
+
 fn first_line(text: &str) -> String {
   let mut it = text.lines();
   let first = it.next().unwrap_or_default().to_string();
@@ -2468,6 +2486,16 @@ mod tests {
 
   fn names(matches: &[Match]) -> Vec<&'static str> {
     matches.iter().map(|m| COMMANDS[m.index].0).collect()
+  }
+
+  #[test]
+  fn the_footer_says_what_the_servers_brought_and_nothing_when_there_are_none() {
+    // A session that never asked for a server should not be told it has none.
+    assert_eq!(mcp_label(0, 0), None);
+    assert_eq!(mcp_label(1, 1).as_deref(), Some("1 mcp, 1 tool"));
+    assert_eq!(mcp_label(2, 14).as_deref(), Some("2 mcp, 14 tools"));
+    // A server that came up with nothing to offer still came up.
+    assert_eq!(mcp_label(1, 0).as_deref(), Some("1 mcp, 0 tools"));
   }
 
   #[test]

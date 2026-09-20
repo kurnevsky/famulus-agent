@@ -986,8 +986,10 @@ fn a_tool_from_an_mcp_server_is_offered_called_and_drawn_like_any_other() {
   let term = Term::start("mcp", &provider, &["--no-session", "--mcp-config", &shell(&config)]);
 
   // What came up is said before anything else, since there is nowhere else
-  // to say it: the terminal did not exist yet.
+  // to say it: the terminal did not exist yet. The footer keeps saying it,
+  // since a session with servers is a session with more than four tools.
   term.wait_for("MCP weather: 1 tool");
+  term.wait_for("1 mcp, 1 tool");
   term.submit("what is the weather in Berlin");
   term.wait_for("Take a coat.");
 
@@ -1031,7 +1033,9 @@ fn a_session_can_be_held_to_some_of_its_tools() {
     &provider,
     &["--no-session", "--no-tools", "write,edit,bash"],
   );
-  term.wait_for("Tools this session: read.");
+  let screen = term.wait_for("Tools this session: read.");
+  // And nothing about MCP in the footer of a session that has no servers.
+  assert!(!screen.contains("mcp"), "no servers, nothing said:\n{screen}");
   term.submit("what is here");
   term.wait_for("Answer to what is here.");
 
