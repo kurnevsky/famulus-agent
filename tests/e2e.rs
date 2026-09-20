@@ -1150,7 +1150,7 @@ fn a_compacted_conversation_reaches_the_model_as_its_summary() {
   term.wait_for("Answer to and the pomelo.");
 
   term.submit("/compact");
-  term.wait_for("Compacted 2 messages into a summary; kept the last 2.");
+  term.wait_for("Compacted 2 messages into a summary; kept the last 2 messages.");
   let screen = term.screen();
   assert!(
     screen.contains("▤ Context summary") && screen.contains("Fruit was discussed."),
@@ -1173,6 +1173,44 @@ fn a_compacted_conversation_reaches_the_model_as_its_summary() {
   assert!(
     request.contains("and the pomelo"),
     "while the recent turn stays verbatim: {request}"
+  );
+}
+
+/// A summary is what the conversation before it now *is*, so it has to
+/// survive the session being closed: what is on disk is a checkpoint, and
+/// what comes back out of it is the message the model was given.
+#[test]
+fn a_compacted_session_still_reaches_the_model_as_its_summary_when_reopened() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![Turn::Echo]);
+  let term = Term::start("compact-reopen", &provider, &[]);
+  term.submit("remember the kumquat");
+  term.wait_for("Answer to remember the kumquat.");
+  term.submit("and the pomelo");
+  term.wait_for("Answer to and the pomelo.");
+  term.submit("/compact");
+  term.wait_for("Compacted 2 messages into a summary; kept the last 2 messages.");
+
+  // Closed and opened again on the same session.
+  let term = term.reopen(&provider, &["--continue"]);
+  let screen = term.wait_for("Resumed session");
+  assert!(
+    screen.contains("▤ Context summary") && screen.contains("Fruit was discussed."),
+    "the checkpoint is drawn as one again:\n{screen}"
+  );
+
+  term.submit("what now");
+  term.wait_for("Answer to what now.");
+  let request = provider.request("what now");
+  assert!(
+    request.contains("Fruit was discussed."),
+    "and is what the model is given: {request}"
+  );
+  assert!(
+    !request.contains("kumquat"),
+    "in place of what it stands for: {request}"
   );
 }
 
@@ -1275,18 +1313,25 @@ fn a_run_that_fills_the_context_window_compacts_and_picks_itself_back_up() {
   );
   term.submit(&format!("remember the kumquat {}", "x".repeat(1600)));
 
-  // The run stops at the turn after the one that overflowed, everything
-  // behind it becomes the summary, and it goes on where it stopped without
-  // anything being typed at it.
-  let screen = term.wait_for("Compacted 3 messages into a summary; kept the last 0.");
+  // The run stops at the turn after the one that overflowed. What was asked
+  // becomes the summary; the call it led to and what came back stay, so the
+  // run has its own work in front of it when it goes on — which it does,
+  // without anything being typed at it.
+  term.wait_for("Compacted 1 message into a summary; kept the last 2 messages.");
+  let screen = term.wait_for("all done");
+  let at = |needle: &str| {
+    screen
+      .lines()
+      .position(|line| line.contains(needle))
+      .unwrap_or_else(|| panic!("{needle:?} on screen:\n{screen}"))
+  };
   assert!(
-    !screen.contains("all done"),
-    "the run stopped short of its answer to make the room first: {screen}"
+    at("Compacted 1 message") < at("all done"),
+    "the room was made before the answer, not after it:\n{screen}"
   );
-  term.wait_for("all done");
 
   // The turn it finished on was asked over the summary, not over what the
-  // summary stands for.
+  // summary stands for — and over the work it was in the middle of.
   let bodies = provider.bodies();
   let last = bodies
     .iter()
@@ -1295,6 +1340,10 @@ fn a_run_that_fills_the_context_window_compacts_and_picks_itself_back_up() {
   assert!(
     last.contains("Fruit was discussed.") && !last.contains("kumquat"),
     "the run carried on over the compacted history: {last}"
+  );
+  assert!(
+    last.contains("tool_call_id"),
+    "with the call it had made still in front of it: {last}"
   );
 }
 

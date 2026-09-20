@@ -496,6 +496,25 @@ chars/4 and nothing else — it needs a size per message, and no provider
 reports one. A later compaction updates the existing summary instead of
 nesting it.
 
+The tail starts wherever the budget runs out, at the nearest message the
+model can carry on from: a user turn, or a turn of its own. So a turn may be
+split — a run long enough to fill the window on its own, which is the run
+compaction is for, keeps the budget it was promised rather than the little
+that happens to come after its last user message. Never a tool result,
+though, which belongs to the call above it: the cut moves on past the pair
+rather than landing between them.
+
+When the budget runs out with nothing after it to keep from — one tool result
+worth more than the whole of it — the tail starts at the last such message
+instead: the call the model made and what came back. Keeping nothing would
+hand it a summary and no work, which is the state compaction is there to
+rescue it from.
+
+pi writes a second, smaller summary for the part of a split turn it drops,
+with a prompt of its own; here that part goes into the one summary. pi also
+appends the list of files read and written to every summary, which this does
+not: what the summarizer says about them is all there is.
+
 With the room made, the run picks itself back up where it stopped — unless
 something was typed while it ran, which goes first, as it would have anyway.
 A context full of a single turn is where it ends instead: there is nothing

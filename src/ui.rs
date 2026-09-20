@@ -1472,8 +1472,9 @@ impl App {
             self.report(result);
             self.context_tokens = None;
             self.entries.push(Entry::Info(format!(
-              "Compacted {} messages into a summary; kept the last {}.",
-              compacted.summarized, compacted.kept
+              "Compacted {} into a summary; kept the last {}.",
+              messages(compacted.summarized),
+              messages(compacted.kept)
             )));
             self.entries.push(Entry::Summary(compacted.summary));
             // What was cut short to make this room carries on where it

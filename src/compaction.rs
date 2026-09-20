@@ -146,10 +146,28 @@ fn tool_result_chars(content: &ToolResultContent) -> usize {
   }
 }
 
-/// A message may start a kept tail only if it begins a user turn, so tool
-/// call/result pairs are never split.
+/// Whether a message begins a user turn, which is where the tail starts when
+/// the whole conversation fits the budget.
 fn starts_turn(message: &Message) -> bool {
   matches!(message, Message::User { content } if content.iter().any(|c| matches!(c, UserContent::Text(_))))
+}
+
+/// Whether a kept tail may start here: somewhere the model can be asked to
+/// carry on from, which is a user turn or a turn of its own. Never a tool
+/// result, which belongs to the call above it — so a call and its answer are
+/// never parted, whichever of these the cut lands on.
+///
+/// A turn may be: the model's own messages are cut points too, so a run long
+/// enough to fill the window on its own — which is the run compaction is for
+/// — keeps the budget it was promised rather than the little that happens to
+/// come after its last user message. What is cut off is what the summary is
+/// for.
+fn can_follow(message: &Message) -> bool {
+  match message {
+    Message::Assistant { .. } => true,
+    Message::User { .. } => starts_turn(message),
+    Message::System { .. } => false,
+  }
 }
 
 fn previous_summary(message: &Message) -> Option<&str> {
@@ -166,11 +184,12 @@ fn previous_summary(message: &Message) -> Option<&str> {
 }
 
 /// Index of the first message to keep verbatim. Walks back from the end until
-/// roughly `keep_recent_tokens` are accumulated, then snaps forward to the next
-/// turn boundary. Returns `None` when there is nothing worth summarizing.
+/// roughly `keep_recent_tokens` are accumulated, then forward to the nearest
+/// place the model can carry on from. Returns `None` when there is nothing
+/// worth summarizing.
 pub fn cut_point(history: &[Message], keep_recent_tokens: u64) -> Option<usize> {
   let first = usize::from(history.first().is_some_and(previous_summary_present));
-  let turn_starts: Vec<usize> = (first..history.len()).filter(|&i| starts_turn(&history[i])).collect();
+  let cuts: Vec<usize> = (first..history.len()).filter(|&i| can_follow(&history[i])).collect();
 
   let mut accumulated = 0u64;
   let mut exceeded_at = None;
@@ -181,18 +200,24 @@ pub fn cut_point(history: &[Message], keep_recent_tokens: u64) -> Option<usize> 
       break;
     }
   }
-  let last_turn = turn_starts.last().copied();
   let cut = match exceeded_at {
     // Everything fits in the budget: keep the most recent turn verbatim
     // and summarize whatever came before it.
-    None => last_turn,
-    // Keep from the first turn boundary at or after the overflow. If the
-    // overflow sits inside the last turn, keep that whole turn; if it sits
-    // inside the only turn, the turn itself is too big: summarize it all.
-    Some(i) => match turn_starts.iter().copied().find(|&c| c >= i).or(last_turn) {
-      Some(c) if c > first => Some(c),
-      _ => Some(history.len()),
-    },
+    None => (first..history.len()).rfind(|&i| starts_turn(&history[i])),
+    // Keep from the nearest cut at or after the overflow, which is as much
+    // of the budget as can be kept without parting a call from its answer.
+    Some(i) => cuts
+      .iter()
+      .copied()
+      .find(|&c| c >= i)
+      .filter(|&c| c > first)
+      // Nothing after the overflow to keep from — the tail is one tool
+      // result worth more than the whole budget, or the overflow is the
+      // oldest message there is. Keep from the last cut instead: the call
+      // the model made and what came back. Keeping nothing at all would
+      // leave it a summary and no work to carry on with, which is the one
+      // thing a compaction must not do.
+      .or_else(|| cuts.last().copied()),
   };
   cut.filter(|&c| c > first)
 }
@@ -365,7 +390,7 @@ mod tests {
   }
 
   #[test]
-  fn cut_lands_on_turn_start_and_never_splits_tool_pairs() {
+  fn cut_keeps_what_the_budget_allows_and_never_splits_tool_pairs() {
     let (call, result) = tool_turn();
     let history = vec![
       user(&"x".repeat(400)),
@@ -375,17 +400,58 @@ mod tests {
       user("second"),
       assistant("done"),
     ];
-    // Budget of 10 tokens is exceeded by the 400-char assistant reply at index 3,
-    // so the tail must start at the next turn start: index 4.
-    assert_eq!(cut_point(&history, 10), Some(4));
+    // Budget of 10 tokens is exceeded by the 400-char assistant reply at
+    // index 3, and the tail starts there: an answer of the model's own is
+    // somewhere it can carry on from, so the budget is kept rather than
+    // given up as far as the next thing the user said.
+    assert_eq!(cut_point(&history, 10), Some(3));
     // Large budget: nothing exceeds it, fall back to keeping the last turn.
     assert_eq!(cut_point(&history, 1_000_000), Some(4));
-    // Overflow inside the first turn with a single turn only: summarize everything.
-    let single = vec![user(&"x".repeat(400)), assistant(&"y".repeat(400))];
-    assert_eq!(cut_point(&single, 10), Some(2));
     // Nothing to summarize.
     assert_eq!(cut_point(&[], 10), None);
     assert_eq!(cut_point(&[summary_message("s"), user("q")], 10), None);
+
+    // A budget that runs out inside a tool result keeps neither it nor the
+    // call it answers: the cut moves on past the pair rather than landing
+    // between them, where the result would answer a call nobody made.
+    let (call, _) = tool_turn();
+    let answered = Message::User {
+      content: vec![UserContent::tool_result(
+        "c",
+        "bash",
+        vec![ToolResultContent::text("z".repeat(2000))],
+      )],
+    };
+    let big = vec![user("go"), call, answered, assistant("done")];
+    assert_eq!(cut_point(&big, 100), Some(3));
+  }
+
+  /// One turn too big for the budget has no boundary to keep from. Summarizing
+  /// it whole would hand the model a summary and nothing to carry on with —
+  /// which is the state a compaction is supposed to rescue it from, not put it
+  /// in. So the tail starts at the last thing the model can follow.
+  #[test]
+  fn a_turn_too_big_to_keep_still_leaves_the_work_in_progress_behind() {
+    let (call, result) = tool_turn();
+    let asked = user(&"x".repeat(4000));
+    // The user's request is summarized; the call it led to and what came
+    // back stay, so the run picking this up has its own work in front of it.
+    let history = vec![asked.clone(), call.clone(), result.clone()];
+    assert_eq!(cut_point(&history, 10), Some(1));
+
+    // The same with a summary already in front: it is not summarized twice,
+    // and the request that followed it goes into the updated one.
+    let history = vec![summary_message("old"), asked.clone(), call.clone(), result.clone()];
+    assert_eq!(cut_point(&history, 10), Some(2));
+
+    // But when the summary is all that is in front of the turn, there is
+    // nothing left to summarize and nothing to be gained by trying.
+    assert_eq!(cut_point(&[summary_message("old"), call, result], 10), None);
+
+    // A turn of two messages splits the same way: what was asked is
+    // summarized, the answer to it stays.
+    let single = vec![asked, assistant(&"y".repeat(400))];
+    assert_eq!(cut_point(&single, 10), Some(1));
   }
 
   #[test]
