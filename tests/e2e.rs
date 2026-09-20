@@ -42,9 +42,16 @@ enum Turn {
 /// summary is told from a turn of the conversation.
 const SUMMARIZING: &str = "context summarization assistant";
 
+/// A phrase from the prompt the beginning of a split turn is asked for with,
+/// which is how the second summarization request is told from the first.
+const SUMMARIZING_TURN: &str = "This is the PREFIX of a turn";
+
 /// What the mock always summarizes a conversation into. Distinctive enough to
 /// find again in a later request, and it says nothing the conversation said.
 const SUMMARY: &str = "## Goal\\nFruit was discussed.";
+
+/// And what it summarizes the beginning of a split turn into.
+const TURN_SUMMARY: &str = "## Original Request\\nSomething about fruit.";
 
 /// A scripted OpenAI-compatible server.
 ///
@@ -124,9 +131,15 @@ fn serve(mut stream: TcpStream, script: &[Turn], seen: &Mutex<Vec<String>>) -> s
   // A request for a summary is not a turn of the conversation at all: it is
   // the summarizer, asking with a preamble of its own.
   let done = body.matches("\"tool_call_id\"").count();
-  let turn = match body.contains(SUMMARIZING) {
-    true => Turn::Say(SUMMARY),
-    false => script.get(done).cloned().unwrap_or(Turn::Say("Nothing left to do.")),
+  let turn = if body.contains(SUMMARIZING_TURN) {
+    // Both summarizations speak with the summarizer's preamble, so the one
+    // for a split turn is known by what it asks for, and answered with
+    // something the other would never say.
+    Turn::Say(TURN_SUMMARY)
+  } else if body.contains(SUMMARIZING) {
+    Turn::Say(SUMMARY)
+  } else {
+    script.get(done).cloned().unwrap_or(Turn::Say("Nothing left to do."))
   };
 
   // Only the conversation is streamed; the summarizer asks outright, and an
@@ -1156,6 +1169,15 @@ fn a_compacted_conversation_reaches_the_model_as_its_summary() {
     screen.contains("▤ Context summary") && screen.contains("Fruit was discussed."),
     "the summary is shown as one:\n{screen}"
   );
+  // The kept turn is kept whole, so there is no beginning of one left over
+  // to summarize: one summarization request, and nothing joined onto it.
+  let summarizing = provider
+    .bodies()
+    .iter()
+    .filter(|body| body.contains(SUMMARIZING))
+    .count();
+  assert_eq!(summarizing, 1, "a whole turn is summarized once");
+  assert!(!screen.contains("Turn Context"), "with nothing about a split turn");
 
   // What the model is given next is the summary in place of what it stands
   // for — the point of compacting at all.
@@ -1174,6 +1196,69 @@ fn a_compacted_conversation_reaches_the_model_as_its_summary() {
     request.contains("and the pomelo"),
     "while the recent turn stays verbatim: {request}"
   );
+}
+
+/// The cut can fall inside a turn, and then the half of it that is dropped is
+/// summarized a second time — in terms of the half still there, rather than of
+/// the conversation, which is what pi does. Unless the session says not to.
+#[test]
+fn the_start_of_a_split_turn_is_summarized_on_its_own() {
+  if !have_tmux() {
+    return;
+  }
+  // A budget of one token keeps only the last answer, so the cut falls on it
+  // — inside the turn that asked for it, whose question is left over.
+  let compacted = |turn_summary: bool| -> (String, Vec<String>) {
+    let provider = Provider::start(vec![Turn::Echo]);
+    let mut args = vec!["--no-session", "--keep-recent-tokens", "1"];
+    if !turn_summary {
+      args.push("--no-turn-summary");
+    }
+    let term = Term::start(if turn_summary { "split" } else { "unsplit" }, &provider, &args);
+    term.submit("remember the kumquat");
+    term.wait_for("Answer to remember the kumquat.");
+    term.submit("and the pomelo");
+    term.wait_for("Answer to and the pomelo.");
+    term.submit("/compact");
+    let screen = term.wait_for("Compacted 3 messages into a summary; kept the last 1 message.");
+    let asked = provider
+      .bodies()
+      .into_iter()
+      .filter(|body| body.contains(SUMMARIZING))
+      .collect();
+    (screen, asked)
+  };
+
+  let (screen, asked) = compacted(true);
+  assert_eq!(asked.len(), 2, "the conversation, then the turn: {asked:?}");
+  assert!(
+    asked[0].contains("remember the kumquat") && !asked[0].contains("and the pomelo"),
+    "the first asks about the turns before the one being split: {}",
+    asked[0]
+  );
+  assert!(
+    asked[1].contains(SUMMARIZING_TURN) && asked[1].contains("and the pomelo"),
+    "the second about the beginning of that turn, by its own prompt: {}",
+    asked[1]
+  );
+  // Both come back as the one message the conversation keeps.
+  assert!(
+    screen.contains("Fruit was discussed.")
+      && screen.contains("**Turn Context (split turn):**")
+      && screen.contains("Something about fruit."),
+    "joined into one summary:\n{screen}"
+  );
+
+  // Told not to, it is one request again and the turn's beginning goes into
+  // the checkpoint with everything else.
+  let (screen, asked) = compacted(false);
+  assert_eq!(asked.len(), 1, "one summarization only: {asked:?}");
+  assert!(
+    asked[0].contains("remember the kumquat") && asked[0].contains("and the pomelo"),
+    "covering everything before the cut: {}",
+    asked[0]
+  );
+  assert!(!screen.contains("Turn Context"), "and nothing joined on:\n{screen}");
 }
 
 /// A summary is what the conversation before it now *is*, so it has to
@@ -1332,13 +1417,17 @@ fn a_run_that_fills_the_context_window_compacts_and_picks_itself_back_up() {
 
   // The turn it finished on was asked over the summary, not over what the
   // summary stands for — and over the work it was in the middle of.
+  //
+  // The cut fell inside the only turn there was, so the summary is the
+  // beginning of that turn and nothing else: there was no conversation in
+  // front of it to make a checkpoint of.
   let bodies = provider.bodies();
   let last = bodies
     .iter()
     .rfind(|body| !body.contains(SUMMARIZING))
     .expect("a request that was not the summarizer's");
   assert!(
-    last.contains("Fruit was discussed.") && !last.contains("kumquat"),
+    last.contains("No prior history.") && last.contains("Something about fruit.") && !last.contains("kumquat"),
     "the run carried on over the compacted history: {last}"
   );
   assert!(

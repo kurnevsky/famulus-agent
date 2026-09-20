@@ -69,6 +69,12 @@ struct Cli {
   #[arg(long)]
   no_compaction: bool,
 
+  /// Do not summarize the start of a split turn separately when compacting:
+  /// one summarizer call rather than two, and what the turn was for goes into
+  /// the checkpoint with everything else
+  #[arg(long)]
+  no_turn_summary: bool,
+
   /// The model cannot take images: `read` describes image files but omits their data
   #[arg(long, env = "FA_NO_VISION")]
   no_vision: bool,
@@ -152,6 +158,7 @@ async fn main() -> Result<()> {
       context_window: cli.context_window,
       reserve_tokens: cli.reserve_tokens,
       keep_recent_tokens: cli.keep_recent_tokens,
+      turn_summary: !cli.no_turn_summary,
     },
   };
   let cwd = std::env::current_dir()?;

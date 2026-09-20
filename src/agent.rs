@@ -730,6 +730,7 @@ mod tests {
     context_window: 1000,
     reserve_tokens: 100,
     keep_recent_tokens: 1,
+    turn_summary: true,
   };
 
   #[tokio::test]

@@ -34,6 +34,7 @@ GEMINI_API_KEY=... ./target/release/fa --provider gemini -m gemini-2.5-pro
 | `--reserve-tokens` | | `16384` | Compact when fewer tokens than this remain |
 | `--keep-recent-tokens` | | `20000` | Recent tokens kept verbatim when compacting |
 | `--no-compaction` | | | Disable automatic compaction |
+| `--no-turn-summary` | | | One summarization request, never a second for the start of a split turn |
 | `--no-vision` | `FA_NO_VISION` | | Model cannot take images: `read` omits image data and says so |
 | `-c, --continue` | | | Continue the most recent session |
 | `-r, --resume` | | | Pick a session to resume |
@@ -510,10 +511,34 @@ instead: the call the model made and what came back. Keeping nothing would
 hand it a summary and no work, which is the state compaction is there to
 rescue it from.
 
-pi writes a second, smaller summary for the part of a split turn it drops,
-with a prompt of its own; here that part goes into the one summary. pi also
-appends the list of files read and written to every summary, which this does
-not: what the summarizer says about them is all there is.
+When the cut does fall inside a turn, the beginning of that turn is
+summarized a second time, by pi's prompt for it: where the checkpoint
+describes a conversation that is over, this one is written for the half of
+the turn still on screen — *"This is the PREFIX of a turn that was too large
+to keep. The SUFFIX (recent work) is retained"*, and asks for the original
+request, how far it got, and what the kept half needs to be read by. The two
+come back as one message:
+
+```
+## Goal
+…the checkpoint…
+
+---
+
+**Turn Context (split turn):**
+
+## Original Request
+…
+```
+
+A turn kept whole has no beginning left over, so that is one request as
+before; and when the split turn is all there was to summarize, the
+checkpoint is the previous summary, or pi's `No prior history.` when there
+is none. `--no-turn-summary` turns the second request off altogether: what
+the turn was for then goes into the checkpoint with everything else.
+
+pi also appends the list of files read and written to every summary, which
+this does not: what the summarizer says about them is all there is.
 
 With the room made, the run picks itself back up where it stopped — unless
 something was typed while it ran, which goes first, as it would have anyway.

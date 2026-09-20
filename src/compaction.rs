@@ -14,6 +14,10 @@ pub struct Settings {
   pub context_window: u64,
   pub reserve_tokens: u64,
   pub keep_recent_tokens: u64,
+  /// Whether the beginning of a turn the cut falls inside gets a summary of
+  /// its own, written to serve the rest of that turn — which is still there,
+  /// verbatim, underneath it.
+  pub turn_summary: bool,
 }
 
 #[derive(Debug)]
@@ -102,6 +106,30 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.";
 
+/// pi's prompt for the other half of a split turn, word for word.
+const TURN_PREFIX_SUMMARIZATION_PROMPT: &str =
+  "This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.
+
+Summarize the prefix to provide context for the retained suffix:
+
+## Original Request
+[What did the user ask for in this turn?]
+
+## Early Progress
+- [Key decisions and work done in the prefix]
+
+## Context for Suffix
+- [Information needed to understand the retained recent work]
+
+Be concise. Focus on what's needed to understand the kept suffix.";
+
+/// What stands in for the checkpoint when the split turn is all there was to
+/// summarize — pi's words.
+const NO_PRIOR_HISTORY: &str = "No prior history.";
+
+/// How the two are joined into the one message the conversation keeps.
+const TURN_SUMMARY_HEADING: &str = "**Turn Context (split turn):**";
+
 const TOOL_RESULT_MAX_CHARS: usize = 2000;
 const ESTIMATED_IMAGE_CHARS: usize = 4800;
 
@@ -168,6 +196,20 @@ fn can_follow(message: &Message) -> bool {
     Message::User { .. } => starts_turn(message),
     Message::System { .. } => false,
   }
+}
+
+/// The turn the cut falls inside, when it falls inside one rather than
+/// between two: the index of the user message that began it.
+///
+/// What is kept from that turn is the work the model was in the middle of,
+/// and what is cut off is the request that set it going — which the one
+/// checkpoint would describe as finished business among everything else.
+/// Summarized on its own instead, it can be written for the half still there.
+fn split_turn(history: &[Message], cut: usize, first: usize) -> Option<usize> {
+  if starts_turn(history.get(cut)?) {
+    return None;
+  }
+  (first..cut).rfind(|&i| starts_turn(&history[i]))
 }
 
 fn previous_summary(message: &Message) -> Option<&str> {
@@ -312,8 +354,55 @@ pub fn summary_message(summary: &str) -> Message {
   Message::user(format!("{SUMMARY_PREFIX}{}{SUMMARY_SUFFIX}", summary.trim()))
 }
 
+/// The checkpoint for a stretch of conversation, updating `previous` when a
+/// compaction has already been through it.
+///
+/// Block order: conversation, previous summary, instructions.
+async fn summarize(summarizer: &Agent, messages: &[Message], previous: Option<&str>) -> Result<String, PromptError> {
+  let conversation = serialize(messages);
+  let mut prompt = format!("<conversation>\n{conversation}\n</conversation>\n\n");
+  if let Some(previous) = previous {
+    prompt.push_str(&format!("<previous-summary>\n{previous}\n</previous-summary>\n\n"));
+  }
+  prompt.push_str(if previous.is_some() {
+    UPDATE_SUMMARIZATION_PROMPT
+  } else {
+    SUMMARIZATION_PROMPT
+  });
+  answer(summarizer, prompt).await
+}
+
+/// The same for the beginning of a split turn, which is asked for in terms of
+/// the rest of that turn rather than of the conversation: what was asked for,
+/// how far it got, and what the half still on screen needs to be read by.
+async fn summarize_turn(summarizer: &Agent, messages: &[Message]) -> Result<String, PromptError> {
+  let conversation = serialize(messages);
+  answer(
+    summarizer,
+    format!("<conversation>\n{conversation}\n</conversation>\n\n{TURN_PREFIX_SUMMARIZATION_PROMPT}"),
+  )
+  .await
+}
+
+/// What the summarizer said, which may not be nothing: an empty checkpoint
+/// stands for the conversation every bit as much as a full one does, and
+/// there would be no telling afterwards what it was standing for.
+async fn answer(summarizer: &Agent, prompt: String) -> Result<String, PromptError> {
+  let summary = summarizer.prompt(prompt).await?.trim().to_string();
+  if summary.is_empty() {
+    return Err(PromptError::CompletionError(
+      rig_core::completion::CompletionError::ResponseError("summarizer returned an empty summary".into()),
+    ));
+  }
+  Ok(summary)
+}
+
 /// Summarize everything before the cut point and rebuild the history as
 /// `[summary, kept tail...]`. Returns `None` when there is nothing to compact.
+///
+/// One summarizer call, or two when the cut falls inside a turn and
+/// `turn_summary` is on: the conversation before that turn, and the beginning
+/// of the turn itself, joined into the one message the history keeps.
 pub async fn compact(
   summarizer: &Agent,
   history: Vec<Message>,
@@ -324,25 +413,25 @@ pub async fn compact(
   };
   let previous = history.first().and_then(previous_summary).map(str::to_string);
   let start = usize::from(previous.is_some());
-  let conversation = serialize(&history[start..cut]);
+  let split = settings
+    .turn_summary
+    .then(|| split_turn(&history, cut, start))
+    .flatten();
 
-  // Block order: conversation, previous summary, instructions.
-  let mut prompt = format!("<conversation>\n{conversation}\n</conversation>\n\n");
-  if let Some(previous) = &previous {
-    prompt.push_str(&format!("<previous-summary>\n{previous}\n</previous-summary>\n\n"));
-  }
-  prompt.push_str(if previous.is_some() {
-    UPDATE_SUMMARIZATION_PROMPT
-  } else {
-    SUMMARIZATION_PROMPT
-  });
-  let summary = summarizer.prompt(prompt).await?;
-  let summary = summary.trim().to_string();
-  if summary.is_empty() {
-    return Err(PromptError::CompletionError(
-      rig_core::completion::CompletionError::ResponseError("summarizer returned an empty summary".into()),
-    ));
-  }
+  let summary = match split {
+    Some(turn) => {
+      // The checkpoint stops where the split turn begins. When the turn is
+      // all there was to summarize it has nothing new to say, and the last
+      // compaction's summary — or pi's words for having none — stands.
+      let checkpoint = match turn > start {
+        true => summarize(summarizer, &history[start..turn], previous.as_deref()).await?,
+        false => previous.clone().unwrap_or_else(|| NO_PRIOR_HISTORY.to_string()),
+      };
+      let prefix = summarize_turn(summarizer, &history[turn..cut]).await?;
+      format!("{checkpoint}\n\n---\n\n{TURN_SUMMARY_HEADING}\n\n{prefix}")
+    }
+    None => summarize(summarizer, &history[start..cut], previous.as_deref()).await?,
+  };
 
   let kept = history.len() - cut;
   let mut new_history = Vec::with_capacity(kept + 1);
@@ -426,6 +515,36 @@ mod tests {
     assert_eq!(cut_point(&big, 100), Some(3));
   }
 
+  /// A turn kept whole is not summarized twice: only the turn the cut falls
+  /// inside has a beginning left over to say anything about.
+  #[test]
+  fn only_a_turn_the_cut_falls_inside_has_a_prefix_to_summarize() {
+    let (call, result) = tool_turn();
+    let history = vec![
+      user("first"),
+      call.clone(),
+      result.clone(),
+      assistant("done"),
+      user("second"),
+      assistant("answered"),
+    ];
+    // The cut is where the second turn begins, so that turn is kept whole
+    // and there is nothing of it to summarize apart from the rest.
+    assert_eq!(split_turn(&history, 4, 0), None);
+    // Inside the first turn, wherever: the turn began at 0.
+    assert_eq!(split_turn(&history, 1, 0), Some(0));
+    assert_eq!(split_turn(&history, 3, 0), Some(0));
+    // A turn that began before the last compaction: its own start is inside
+    // that summary already, and there is nothing this side of it to ask
+    // about. What the cut drops of it goes into the summary it came from.
+    let carried = vec![summary_message("old"), call.clone(), result.clone(), assistant("x")];
+    assert_eq!(split_turn(&carried, 3, 1), None);
+    // The summary is not itself the start of a turn to be summarized again,
+    // where a turn of this side of it would have been.
+    let asked_again = vec![summary_message("old"), user("carry on"), call, result, assistant("x")];
+    assert_eq!(split_turn(&asked_again, 4, 1), Some(1));
+  }
+
   /// One turn too big for the budget has no boundary to keep from. Summarizing
   /// it whole would hand the model a summary and nothing to carry on with —
   /// which is the state a compaction is supposed to rescue it from, not put it
@@ -484,6 +603,7 @@ mod tests {
       context_window: 100,
       reserve_tokens: 20,
       keep_recent_tokens: 10,
+      turn_summary: true,
     };
     assert!(!should_compact(80, &s));
     assert!(should_compact(81, &s));
