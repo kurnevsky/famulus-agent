@@ -90,6 +90,16 @@ pub enum AgentEvent {
   Done {
     messages: Vec<Message>,
   },
+  /// A turn is about to be asked for, and `history` is what this run has
+  /// added to the conversation so far — rig's own copy, the same one the
+  /// request about to go out carries.
+  ///
+  /// Sent so that a run nothing can ask for its messages afterwards, because
+  /// the task running it was dropped where it stood, still leaves the turns
+  /// behind the one it was dropped in exactly as the model gave them.
+  Turn {
+    history: Vec<Message>,
+  },
   /// The `ask` tool wants the user to answer something. The dialog the UI
   /// opens sends what they said back down `reply`; dropping it instead is a
   /// decline, which is what an aborted run leaves behind.
@@ -199,6 +209,10 @@ struct Tally {
   /// How many the request in flight carries, to become `counted` once it is
   /// answered.
   sent: usize,
+  /// How much of the conversation this run was handed rather than made —
+  /// everything before its own first message. Taken at the first call, whose
+  /// history is exactly that and nothing else.
+  carried: usize,
   /// What the context last weighed, for the turn to report when the provider
   /// will not say.
   estimated: u64,
@@ -227,6 +241,12 @@ impl AgentHook for UiHook {
     // request carrying it is the one that would be refused.
     let context = self.weigh_request(event.history, event.prompt, event.turn);
     self.weigh(context);
+    // Where the turns behind this one are said once in rig's own words, so
+    // that an abort — which leaves nothing to ask afterwards — has something
+    // better to keep than what the screen showed.
+    let _ = self.tx.send(AgentEvent::Turn {
+      history: self.made(event.history, event.prompt),
+    });
     if event.turn > 1 {
       // The reason is rig's to carry, not anything this program reads: the
       // stop comes back as a `PromptCancelled` and `start_run` knows it by
@@ -315,7 +335,10 @@ impl UiHook {
     // run's figure was counted against: compacting rewrites it, and so does
     // moving the session to another point of itself.
     if turn == 1 {
-      *tally = Tally::default();
+      *tally = Tally {
+        carried: history.len(),
+        ..Tally::default()
+      };
     }
     let counted = tally.counted.min(history.len());
     let context = tally.reported
@@ -324,6 +347,25 @@ impl UiHook {
     tally.sent = history.len() + 1;
     tally.estimated = context;
     context
+  }
+
+  /// This run's own messages out of the conversation a turn is about to be
+  /// asked for: rig's record of everything it has added, prompt first.
+  ///
+  /// The two the hook is handed are the request itself — the history and the
+  /// message it ends on — so together they are the conversation as the next
+  /// answer will see it, which is the copy the run would hand back had it
+  /// been let finish.
+  fn made(&self, history: &[Message], prompt: &Message) -> Vec<Message> {
+    let carried = self
+      .tally
+      .lock()
+      .expect("a tally nobody panicked holding")
+      .carried
+      .min(history.len());
+    let mut made = history[carried..].to_vec();
+    made.push(prompt.clone());
+    made
   }
 
   /// Take the provider's word for what the answered request held, and say
@@ -817,6 +859,7 @@ mod tests {
           format!("result:{}", if *is_error { "err" } else { "ok" })
         }
         AgentEvent::Done { .. } => "done".into(),
+        AgentEvent::Turn { .. } => "turn".into(),
         AgentEvent::Usage { .. } => "usage".into(),
         AgentEvent::Error(e) => format!("error:{e}"),
         AgentEvent::Ended { .. } => "ended".into(),

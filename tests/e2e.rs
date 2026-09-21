@@ -968,6 +968,72 @@ fn an_aborted_run_keeps_its_work_and_can_carry_on() {
   );
 }
 
+/// Esc keeps the conversation as it stood up to the turn it landed in.
+///
+/// Nothing can ask a killed run what it got through — the task running it is
+/// gone — so the turn Esc lands in is this side's reckoning of it, pieced
+/// back together from what went past on screen. The turns behind that one
+/// were finished and asked about, though, and the run said what they came to
+/// in its own words each time it asked. Keeping those is the difference
+/// between carrying on from an abort and re-reading the conversation from the
+/// top to do it.
+#[test]
+fn an_abort_leaves_the_turns_behind_it_as_the_model_gave_them() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![
+    Turn::ThinkCall {
+      thought: "Count them first.",
+      say: "First. ",
+      tool: "bash",
+      args: serde_json::json!({ "command": "echo one" }),
+    },
+    Turn::ThinkCall {
+      thought: "Now the slow one.",
+      say: "Second. ",
+      tool: "bash",
+      args: serde_json::json!({ "command": "sleep 60" }),
+    },
+    Turn::Say("Carried on."),
+  ]);
+  let term = Term::start("abort-prefix", &provider, &["--no-session"]);
+  term.submit("do two things");
+  // The second turn is under way, so the first is behind the abort.
+  term.wait_for("⚙ bash sleep 60");
+  let asked = wait_bodies(&provider, 2).last().expect("the second request").clone();
+  term.type_in("Escape");
+  term.wait_for("Aborted.");
+  term.settle();
+  term.submit("never mind, carry on");
+  term.wait_for("Carried on.");
+  term.settle();
+
+  let messages = |body: &str| -> Vec<serde_json::Value> {
+    let body: serde_json::Value = serde_json::from_str(body).expect("a JSON request");
+    body["messages"].as_array().expect("messages").clone()
+  };
+  let (asked, after) = (messages(&asked), messages(&provider.request("never mind")));
+  assert!(after.len() > asked.len(), "the abort left the turn it landed in behind");
+  for (at, (before, now)) in asked.iter().zip(&after).enumerate() {
+    assert_eq!(
+      before,
+      now,
+      "message {at} of {} was rewritten by the abort",
+      asked.len()
+    );
+  }
+
+  // The turn it landed in is kept too — with the call it was in the middle
+  // of answered, or the conversation is one no provider would take back.
+  let added: Vec<&serde_json::Value> = after.iter().skip(asked.len()).collect();
+  assert!(
+    added.iter().any(|m| m.to_string().contains("Aborted by the user.")),
+    "the interrupted call is answered: {:?}",
+    added.iter().map(|m| &m["role"]).collect::<Vec<_>>()
+  );
+}
+
 #[test]
 fn a_message_typed_mid_run_waits_at_the_bottom_and_goes_at_the_next_turn() {
   if !have_tmux() {
