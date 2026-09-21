@@ -19,10 +19,14 @@ use futures::StreamExt;
 use futures::future::BoxFuture;
 use rig_agent::tool::ToolContext;
 use rig_agent::tool::server::{ToolServer, ToolServerHandle};
+use rig_core::client::Nothing;
 use rig_core::client::completion::CompletionClient;
 use rig_core::completion::{CompletionError, CompletionModel, CompletionRequest, Message, ToolDefinition, Usage};
 use rig_core::message::{AssistantContent, Reasoning, ToolCall, ToolResultContent, UserContent};
-use rig_core::providers::{gemini, openai};
+use rig_core::providers::{
+  anthropic, cohere, deepseek, doubleword, gemini, groq, hyperbolic, llamafile, mira, mistral, ollama, openai,
+  openrouter, perplexity, together, venice, xai,
+};
 use rig_core::streaming::{StreamedAssistantContent, StreamingCompletionResponse, ToolCallDeltaContent};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -281,12 +285,15 @@ pub struct Runtime {
   /// Chat completions will not carry an image inside a tool message, so a
   /// `read` that answers with a screenshot has it relayed after the result.
   relay_images: bool,
+  /// Cap on one answer, left to the provider when `None`.
+  max_tokens: Option<u64>,
 }
 
 /// The tool-less model compaction summarizes with.
 pub struct Summarizer {
   model: Arc<dyn Model>,
   preamble: String,
+  max_tokens: Option<u64>,
 }
 
 impl Summarizer {
@@ -301,7 +308,7 @@ impl Summarizer {
         documents: Vec::new(),
         tools: Vec::new(),
         temperature: None,
-        max_tokens: None,
+        max_tokens: self.max_tokens,
         tool_choice: None,
         additional_params: None,
         output_schema: None,
@@ -315,8 +322,27 @@ impl Summarizer {
 pub enum Provider {
   /// OpenAI Chat Completions and compatible servers.
   OpenAi,
+  /// OpenRouter (chat completions, with its own key and model names).
+  OpenRouter,
+  /// Ollama's own API, on `http://localhost:11434` unless told otherwise.
+  Ollama,
   /// Google Gemini (generateContent API).
   Gemini,
+  /// Anthropic's Messages API.
+  Anthropic,
+  Cohere,
+  DeepSeek,
+  Doubleword,
+  Groq,
+  Hyperbolic,
+  /// A llamafile server, on `http://localhost:8080` unless told otherwise.
+  Llamafile,
+  Mira,
+  Mistral,
+  Perplexity,
+  Together,
+  Venice,
+  XAi,
 }
 
 pub struct Config {
@@ -326,6 +352,8 @@ pub struct Config {
   pub api_key: String,
   pub model: String,
   pub system_prompt: Option<String>,
+  /// Cap on what one answer may come to, or `None` for the provider's own.
+  pub max_tokens: Option<u64>,
   pub compaction: Settings,
   /// Whether the model accepts image input.
   pub vision: bool,
@@ -345,28 +373,61 @@ pub fn build_agents(
   };
   let base_url = cfg.base_url.as_deref().map(|u| u.trim_end_matches('/'));
 
-  // The two providers differ in the client, and in one thing about the
-  // wire: Gemini takes images inside a function response and chat
-  // completions does not. Summarizing asks the same model the same way, so
-  // it is the same handle — what makes that call a summary is the preamble
-  // it carries, which belongs to the request rather than to the model.
+  // Each builder is a type of its own, so the key and the optional base URL
+  // are spelled once here rather than once per provider below. The key is
+  // the configured one unless an arm passes its own — llamafile's client
+  // takes no key at all, and says so in its type.
+  macro_rules! model {
+    ($builder:expr, $what:literal) => {
+      model!($builder, $what, cfg.api_key.as_str())
+    };
+    ($builder:expr, $what:literal, $key:expr) => {{
+      let mut builder = $builder.api_key($key);
+      if let Some(url) = base_url {
+        builder = builder.base_url(url);
+      }
+      let client = builder.build().context(concat!("failed to build ", $what, " client"))?;
+      Arc::new(client.completion_model(cfg.model.clone())) as Arc<dyn Model>
+    }};
+  }
+
+  // The providers differ in the client, and in one thing about the wire:
+  // Gemini takes images inside a function response and Anthropic inside a
+  // tool result, while the rest refuse them there and have them relayed.
+  // Summarizing asks the same model the same way, so it is the same handle —
+  // what makes that call a summary is the preamble it carries, which belongs
+  // to the request rather than to the model.
   let (model, relay_images): (Arc<dyn Model>, bool) = match cfg.provider {
-    Provider::OpenAi => {
-      let mut builder = openai::CompletionsClient::builder().api_key(cfg.api_key.as_str());
+    Provider::OpenAi => (model!(openai::CompletionsClient::builder(), "OpenAI-compatible"), true),
+    Provider::OpenRouter => (model!(openrouter::Client::builder(), "OpenRouter"), true),
+    Provider::Ollama => (model!(ollama::Client::builder(), "Ollama"), true),
+    Provider::Gemini => (model!(gemini::Client::builder(), "Gemini"), false),
+    // Anthropic refuses a request that names no `max_tokens`, so the model is
+    // built through `with_model` rather than `completion_model`: it fills in
+    // what the named model allows, and falls back to a small cap for one it
+    // does not know — which is what `--max-tokens` is for, since a figure on
+    // the request wins over the model's own.
+    Provider::Anthropic => {
+      let mut builder = anthropic::Client::builder().api_key(cfg.api_key.as_str());
       if let Some(url) = base_url {
         builder = builder.base_url(url);
       }
-      let client = builder.build().context("failed to build OpenAI-compatible client")?;
-      (Arc::new(client.completion_model(cfg.model.clone())), true)
+      let client = builder.build().context("failed to build Anthropic client")?;
+      let model = anthropic::completion::CompletionModel::with_model(client, &cfg.model);
+      (Arc::new(model) as Arc<dyn Model>, false)
     }
-    Provider::Gemini => {
-      let mut builder = gemini::Client::builder().api_key(cfg.api_key.as_str());
-      if let Some(url) = base_url {
-        builder = builder.base_url(url);
-      }
-      let client = builder.build().context("failed to build Gemini client")?;
-      (Arc::new(client.completion_model(cfg.model.clone())), false)
-    }
+    Provider::Cohere => (model!(cohere::Client::builder(), "Cohere"), true),
+    Provider::DeepSeek => (model!(deepseek::Client::builder(), "DeepSeek"), true),
+    Provider::Doubleword => (model!(doubleword::Client::builder(), "Doubleword"), true),
+    Provider::Groq => (model!(groq::Client::builder(), "Groq"), true),
+    Provider::Hyperbolic => (model!(hyperbolic::Client::builder(), "Hyperbolic"), true),
+    Provider::Llamafile => (model!(llamafile::Client::builder(), "llamafile", Nothing), true),
+    Provider::Mira => (model!(mira::Client::builder(), "Mira"), true),
+    Provider::Mistral => (model!(mistral::Client::builder(), "Mistral"), true),
+    Provider::Perplexity => (model!(perplexity::Client::builder(), "Perplexity"), true),
+    Provider::Together => (model!(together::Client::builder(), "Together"), true),
+    Provider::Venice => (model!(venice::Client::builder(), "Venice"), true),
+    Provider::XAi => (model!(xai::Client::builder(), "xAI"), true),
   };
 
   let tools = ToolServer::new()
@@ -394,10 +455,12 @@ pub fn build_agents(
       compaction: cfg.compaction,
       allowed: cfg.tools.clone(),
       relay_images,
+      max_tokens: cfg.max_tokens,
     }),
     summarizer: Arc::new(Summarizer {
       model,
       preamble: compaction::SYSTEM_PROMPT.to_string(),
+      max_tokens: cfg.max_tokens,
     }),
     control: Control::default(),
   })
@@ -546,7 +609,7 @@ async fn run(
       documents: Vec::new(),
       tools: definitions.clone(),
       temperature: None,
-      max_tokens: None,
+      max_tokens: rt.max_tokens,
       tool_choice: None,
       additional_params: None,
       output_schema: None,
@@ -1063,6 +1126,7 @@ mod tests {
       compaction: TEST_SETTINGS,
       allowed: None,
       relay_images: false,
+      max_tokens: None,
     })
   }
 
@@ -1252,6 +1316,7 @@ mod tests {
       api_key: "test".into(),
       model: "mock".into(),
       system_prompt: None,
+      max_tokens: None,
       compaction: TEST_SETTINGS,
       vision: true,
       tools: None,
@@ -1396,6 +1461,7 @@ mod tests {
       api_key: "test".into(),
       model: "mock".into(),
       system_prompt: None,
+      max_tokens: None,
       compaction: TEST_SETTINGS,
       vision: true,
       tools: None,
@@ -1593,6 +1659,97 @@ mod tests {
     assert_eq!(plain, before);
   }
 
+  /// A cap travels with the run's requests and the summarizer's alike —
+  /// Anthropic refuses a request that names none, so it has to reach both.
+  #[tokio::test]
+  async fn a_token_cap_is_carried_on_every_request() {
+    #[derive(Default)]
+    struct Recording {
+      caps: Mutex<Vec<Option<u64>>>,
+    }
+
+    impl CompletionModel for Recording {
+      async fn completion(
+        &self,
+        request: CompletionRequest,
+      ) -> Result<rig_core::completion::CompletionResponse, CompletionError> {
+        self.caps.lock().unwrap().push(request.max_tokens);
+        Err(CompletionError::ResponseError("recorded, nothing to say".into()))
+      }
+
+      async fn stream(&self, request: CompletionRequest) -> Result<StreamingCompletionResponse, CompletionError> {
+        self.caps.lock().unwrap().push(request.max_tokens);
+        let items = futures::stream::iter([Ok(said("done"))]);
+        Ok(StreamingCompletionResponse::stream("recording", Box::pin(items)))
+      }
+    }
+
+    let recording = Arc::new(Recording::default());
+    let runtime = Arc::new(Runtime {
+      model: recording.clone(),
+      tools: ToolServer::new().run(),
+      preamble: String::new(),
+      compaction: TEST_SETTINGS,
+      allowed: None,
+      relay_images: false,
+      max_tokens: Some(99),
+    });
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    collect(&runtime, Vec::new(), "hello", &mut rx, &tx).await;
+
+    let summarizer = Summarizer {
+      model: recording.clone(),
+      preamble: String::new(),
+      max_tokens: Some(99),
+    };
+    let _ = summarizer.ask("summarize".to_string()).await;
+
+    assert_eq!(*recording.caps.lock().unwrap(), vec![Some(99), Some(99)]);
+  }
+
+  /// Every provider builds, with a key and without one, and only the two
+  /// that take an image inside a tool result skip the relay.
+  #[test]
+  fn each_provider_builds_a_model() {
+    for (provider, relay) in [
+      (Provider::OpenAi, true),
+      (Provider::OpenRouter, true),
+      (Provider::Ollama, true),
+      (Provider::Gemini, false),
+      (Provider::Anthropic, false),
+      (Provider::Cohere, true),
+      (Provider::DeepSeek, true),
+      (Provider::Doubleword, true),
+      (Provider::Groq, true),
+      (Provider::Hyperbolic, true),
+      (Provider::Llamafile, true),
+      (Provider::Mira, true),
+      (Provider::Mistral, true),
+      (Provider::Perplexity, true),
+      (Provider::Together, true),
+      (Provider::Venice, true),
+      (Provider::XAi, true),
+    ] {
+      for (key, base_url) in [("", None), ("k", Some("http://127.0.0.1:1/v1/".to_string()))] {
+        let cfg = Config {
+          provider,
+          base_url,
+          api_key: key.into(),
+          model: "mock".into(),
+          system_prompt: None,
+          max_tokens: None,
+          compaction: TEST_SETTINGS,
+          vision: true,
+          tools: None,
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let agents = build_agents(&cfg, Path::new("/tmp"), tx, &Default::default())
+          .unwrap_or_else(|e| panic!("{provider:?} with key {key:?}: {e}"));
+        assert_eq!(agents.runtime.relay_images, relay, "{provider:?}");
+      }
+    }
+  }
+
   #[tokio::test]
   async fn mock_image_read() {
     let Ok(base_url) = std::env::var("FA_TEST_BASE_URL") else {
@@ -1609,6 +1766,7 @@ mod tests {
       api_key: "test".into(),
       model: "mock".into(),
       system_prompt: None,
+      max_tokens: None,
       compaction: TEST_SETTINGS,
       vision: true,
       tools: None,
@@ -1655,6 +1813,7 @@ mod tests {
       api_key: "test".into(),
       model: "mock".into(),
       system_prompt: None,
+      max_tokens: None,
       compaction: TEST_SETTINGS,
       vision: true,
       tools: None,

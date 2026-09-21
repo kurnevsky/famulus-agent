@@ -25,8 +25,8 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::supports_keyboard_enhancement;
 use tokio::sync::mpsc;
 
-/// famulus-agent: a minimal terminal coding agent for OpenAI-compatible APIs
-/// and Gemini.
+/// famulus-agent: a minimal terminal coding agent for OpenAI-compatible APIs,
+/// Anthropic, Gemini, and a dozen more.
 #[derive(Parser)]
 #[command(name = "fa", version)]
 struct Cli {
@@ -34,13 +34,14 @@ struct Cli {
   #[arg(long, env = "FA_PROVIDER", value_enum, default_value_t = ProviderArg::Openai)]
   provider: ProviderArg,
 
-  /// Endpoint root, e.g. http://localhost:11434/v1 for an OpenAI-compatible
+  /// Endpoint root, e.g. http://localhost:8080/v1 for an OpenAI-compatible
   /// server. Defaults to the provider's public API.
-  #[arg(long, env = "OPENAI_BASE_URL")]
+  #[arg(long, env = "FA_BASE_URL")]
   base_url: Option<String>,
 
-  /// API key. Falls back to OPENAI_API_KEY or GEMINI_API_KEY depending on the
-  /// provider; any value works for servers without auth.
+  /// API key. Falls back to the provider's own environment variable
+  /// (OPENAI_API_KEY, OPENROUTER_API_KEY, OLLAMA_API_KEY, GEMINI_API_KEY);
+  /// any value works for servers without auth.
   #[arg(long, env = "FA_API_KEY", hide_env_values = true)]
   api_key: Option<String>,
 
@@ -51,6 +52,12 @@ struct Cli {
   /// Replace the built-in system prompt
   #[arg(long, env = "FA_SYSTEM_PROMPT")]
   system_prompt: Option<String>,
+
+  /// Cap on what one answer may come to, in tokens. Left to the provider when
+  /// unset — except for Anthropic, which requires one and is given what the
+  /// named model allows, or 2048 for a model rig does not know
+  #[arg(long, env = "FA_MAX_TOKENS")]
+  max_tokens: Option<u64>,
 
   /// Context window of the model in tokens; compaction triggers near this limit
   #[arg(long, env = "FA_CONTEXT_WINDOW", default_value_t = 128_000)]
@@ -127,27 +134,111 @@ struct Cli {
 enum ProviderArg {
   /// OpenAI Chat Completions and compatible servers
   Openai,
+  /// OpenRouter
+  Openrouter,
+  /// Ollama, on http://localhost:11434 by default
+  Ollama,
   /// Google Gemini
   Gemini,
+  /// Anthropic
+  Anthropic,
+  /// Cohere
+  Cohere,
+  /// DeepSeek
+  Deepseek,
+  /// Doubleword
+  Doubleword,
+  /// Groq
+  Groq,
+  /// Hyperbolic
+  Hyperbolic,
+  /// A llamafile server, on http://localhost:8080 by default
+  Llamafile,
+  /// Mira
+  Mira,
+  /// Mistral
+  Mistral,
+  /// Perplexity
+  Perplexity,
+  /// Together AI
+  Together,
+  /// Venice
+  Venice,
+  /// xAI
+  Xai,
+}
+
+/// What a provider is called here, which variable its key is read from, and
+/// what key to use when neither the flag nor that variable says.
+struct Wire {
+  provider: agent::Provider,
+  label: &'static str,
+  /// `None` for llamafile, whose client takes no key at all, so there is no
+  /// variable worth reading.
+  key_env: Option<&'static str>,
+  /// Ollama and llamafile want no key at all — rig leaves the header off for
+  /// an empty one, which is what a local server expects — while a hosted
+  /// endpoint that ignores auth is happy with anything.
+  no_key: &'static str,
+}
+
+impl ProviderArg {
+  fn wire(self) -> Wire {
+    use agent::Provider as P;
+    let hosted = |provider, label, key_env| Wire {
+      provider,
+      label,
+      key_env: Some(key_env),
+      no_key: "none",
+    };
+    let local = |provider, label, key_env| Wire {
+      provider,
+      label,
+      key_env,
+      no_key: "",
+    };
+    match self {
+      Self::Openai => hosted(P::OpenAi, "openai", "OPENAI_API_KEY"),
+      Self::Openrouter => hosted(P::OpenRouter, "openrouter", "OPENROUTER_API_KEY"),
+      Self::Ollama => local(P::Ollama, "ollama", Some("OLLAMA_API_KEY")),
+      Self::Gemini => hosted(P::Gemini, "gemini", "GEMINI_API_KEY"),
+      Self::Anthropic => hosted(P::Anthropic, "anthropic", "ANTHROPIC_API_KEY"),
+      Self::Cohere => hosted(P::Cohere, "cohere", "COHERE_API_KEY"),
+      Self::Deepseek => hosted(P::DeepSeek, "deepseek", "DEEPSEEK_API_KEY"),
+      Self::Doubleword => hosted(P::Doubleword, "doubleword", "DOUBLEWORD_API_KEY"),
+      Self::Groq => hosted(P::Groq, "groq", "GROQ_API_KEY"),
+      Self::Hyperbolic => hosted(P::Hyperbolic, "hyperbolic", "HYPERBOLIC_API_KEY"),
+      Self::Llamafile => local(P::Llamafile, "llamafile", None),
+      Self::Mira => hosted(P::Mira, "mira", "MIRA_API_KEY"),
+      Self::Mistral => hosted(P::Mistral, "mistral", "MISTRAL_API_KEY"),
+      Self::Perplexity => hosted(P::Perplexity, "perplexity", "PERPLEXITY_API_KEY"),
+      Self::Together => hosted(P::Together, "together", "TOGETHER_API_KEY"),
+      Self::Venice => hosted(P::Venice, "venice", "VENICE_API_KEY"),
+      Self::Xai => hosted(P::XAi, "xai", "XAI_API_KEY"),
+    }
+  }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
   let cli = Cli::parse();
-  let (provider, key_env) = match cli.provider {
-    ProviderArg::Openai => (agent::Provider::OpenAi, "OPENAI_API_KEY"),
-    ProviderArg::Gemini => (agent::Provider::Gemini, "GEMINI_API_KEY"),
-  };
+  let wire = cli.provider.wire();
   let api_key = cli
     .api_key
-    .or_else(|| std::env::var(key_env).ok().filter(|k| !k.is_empty()))
-    .unwrap_or_else(|| "none".to_string());
+    .or_else(|| {
+      wire
+        .key_env
+        .and_then(|env| std::env::var(env).ok())
+        .filter(|k| !k.is_empty())
+    })
+    .unwrap_or_else(|| wire.no_key.to_string());
   let mut cfg = agent::Config {
-    provider,
+    provider: wire.provider,
     base_url: cli.base_url,
     api_key,
     model: cli.model,
     system_prompt: cli.system_prompt,
+    max_tokens: cli.max_tokens,
     vision: !cli.no_vision,
     // Worked out below, once the MCP servers have said what they brought.
     tools: None,
@@ -179,14 +270,7 @@ async fn main() -> Result<()> {
   } else {
     ui::SessionStart::New
   };
-  let model_label = format!(
-    "{}/{}",
-    match cli.provider {
-      ProviderArg::Openai => "openai",
-      ProviderArg::Gemini => "gemini",
-    },
-    cfg.model
-  );
+  let model_label = format!("{}/{}", wire.label, cfg.model);
 
   // The servers come up before the terminal does, and stay up as long as this
   // binding: a stdio server is a child process of ours, and closing the

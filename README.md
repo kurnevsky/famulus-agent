@@ -7,30 +7,71 @@ name used for it throughout this file — is `fa`.
 Built on [rig](https://crates.io/crates/rig-core) for the LLM loop and
 [ratatui](https://ratatui.rs) + [ratatui-textarea](https://crates.io/crates/ratatui-textarea)
 for the interface. Talks to any OpenAI-compatible chat completions endpoint,
-or to Google Gemini.
+and to seventeen providers by name — Anthropic, Gemini, OpenRouter, Ollama and
+the rest of the table below.
 
 ## Usage
 
 ```sh
 cargo build --release
 
-# Local server (llama.cpp, vLLM, Ollama, LM Studio, ...)
+# Local server (llama.cpp, vLLM, LM Studio, ...)
 ./target/release/fa --base-url http://localhost:8080/v1 --model qwen2.5-coder
 
 # Hosted OpenAI-compatible API
-OPENAI_BASE_URL=https://api.example.com/v1 OPENAI_API_KEY=sk-... ./target/release/fa -m gpt-5.2
+FA_BASE_URL=https://api.example.com/v1 OPENAI_API_KEY=sk-... ./target/release/fa -m gpt-5.2
+
+# OpenRouter
+OPENROUTER_API_KEY=sk-or-... ./target/release/fa --provider openrouter -m anthropic/claude-sonnet-4.5
+
+# Ollama, on http://localhost:11434 unless --base-url says otherwise
+./target/release/fa --provider ollama -m qwen2.5-coder
 
 # Google Gemini
 GEMINI_API_KEY=... ./target/release/fa --provider gemini -m gemini-2.5-pro
+
+# Anthropic
+ANTHROPIC_API_KEY=sk-ant-... ./target/release/fa --provider anthropic -m claude-sonnet-4-5
 ```
+
+`--provider` picks which API to speak, and with it the endpoint and the key
+variable it falls back to:
+
+| `--provider` | Default endpoint | Key from |
+|---|---|---|
+| `openai` (default) | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
+| `anthropic` | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` |
+| `gemini` | Google's generateContent API | `GEMINI_API_KEY` |
+| `openrouter` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
+| `ollama` | `http://localhost:11434` | `OLLAMA_API_KEY`, or none |
+| `llamafile` | `http://localhost:8080` | none |
+| `cohere` | `https://api.cohere.ai` | `COHERE_API_KEY` |
+| `deepseek` | `https://api.deepseek.com` | `DEEPSEEK_API_KEY` |
+| `doubleword` | `https://api.doubleword.ai/v1` | `DOUBLEWORD_API_KEY` |
+| `groq` | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` |
+| `hyperbolic` | `https://api.hyperbolic.xyz` | `HYPERBOLIC_API_KEY` |
+| `mira` | `https://api.mira.network` | `MIRA_API_KEY` |
+| `mistral` | `https://api.mistral.ai` | `MISTRAL_API_KEY` |
+| `perplexity` | `https://api.perplexity.ai` | `PERPLEXITY_API_KEY` |
+| `together` | `https://api.together.xyz` | `TOGETHER_API_KEY` |
+| `venice` | `https://api.venice.ai/api/v1` | `VENICE_API_KEY` |
+| `xai` | `https://api.x.ai` | `XAI_API_KEY` |
+
+Most of these are OpenAI-compatible and reachable through `--provider openai
+--base-url ...` as well; naming one buys the default endpoint, the right key
+variable, and whatever rig does differently on that wire. Anthropic will not
+take a request that names no `max_tokens`, so it is given what the named model
+allows — or 2048 for a model rig does not recognise, which is when
+`--max-tokens` is worth setting.
 
 | Flag | Env | Default | Meaning |
 |------|-----|---------|---------|
-| `--provider` | `FA_PROVIDER` | `openai` | `openai` (chat completions and compatible servers) or `gemini` |
-| `--base-url` | `OPENAI_BASE_URL` | provider default | Endpoint root, e.g. `http://localhost:8080/v1` |
-| `--api-key` | `FA_API_KEY` | `OPENAI_API_KEY` / `GEMINI_API_KEY`, else `none` | API key (any value for servers without auth) |
+| `--provider` | `FA_PROVIDER` | `openai` | API flavour to speak; see the table above |
+| `--base-url` | `FA_BASE_URL` | provider default | Endpoint root, e.g. `http://localhost:8080/v1` |
+| `--api-key` | `FA_API_KEY` | the provider's own variable, else `none` | API key (any value for servers without auth; Ollama and llamafile need none) |
 | `-m, --model` | `FA_MODEL` | required | Model name |
 | `--system-prompt` | `FA_SYSTEM_PROMPT` | built-in | Replace the system prompt |
+| `--max-tokens` | `FA_MAX_TOKENS` | the provider's own | Cap on what one answer may come to, in tokens |
 | `--context-window` | `FA_CONTEXT_WINDOW` | `128000` | Model context size in tokens |
 | `--reserve-tokens` | | `16384` | Compact when fewer tokens than this remain |
 | `--keep-recent-tokens` | | `20000` | Recent tokens kept verbatim when compacting |
@@ -668,7 +709,7 @@ comes back to say otherwise.
 ## Layout
 
 - `src/main.rs` – CLI flags, terminal setup.
-- `src/agent.rs` – builds the rig agent (OpenAI completions client, tools,
+- `src/agent.rs` – builds the rig agent (the provider's client, tools,
   system prompt) and runs one streaming turn per user message, forwarding
   `AgentEvent`s to the UI over a channel. Tool-call argument fragments are
   accumulated per call and sent whole, so the UI has nothing to reassemble.
@@ -681,10 +722,11 @@ comes back to say otherwise.
   before the body rather than around it, so for `bash` the hook rewrites the
   arguments to carry it — the one channel between the two. It is stripped from
   the schema, so the model is never asked for it and never sends it. On the
-  OpenAI path a `CompletionModel` wrapper moves images out of tool results into
-  a follow-up user message, since the chat completions API only accepts text
-  in tool messages (the same workaround pi's provider uses). Gemini accepts
-  images inside function responses, so it uses rig's model directly.
+  chat-completions paths images are moved out of tool results into a follow-up
+  user message, since those accept nothing but text in a tool message (the same
+  workaround pi's provider uses). Gemini takes an image inside a function
+  response and Anthropic inside a tool result, so those two are sent them where
+  they are.
 - `src/compaction.rs` – context compaction: trigger rule, cut point, transcript
   serialization, pi's summarization prompts.
 - `src/ask.rs` – the `ask` tool's questionnaire: what a question may be, the
