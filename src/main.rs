@@ -45,7 +45,8 @@ struct Cli {
   #[arg(long, env = "FA_API_KEY", hide_env_values = true)]
   api_key: Option<String>,
 
-  /// Model name to request
+  /// Model name to request. /model changes it later, and lists what the
+  /// provider has to change it to
   #[arg(short, long, env = "FA_MODEL")]
   model: String,
 
@@ -59,9 +60,12 @@ struct Cli {
   #[arg(long, env = "FA_MAX_TOKENS")]
   max_tokens: Option<u64>,
 
-  /// Context window of the model in tokens; compaction triggers near this limit
-  #[arg(long, env = "FA_CONTEXT_WINDOW", default_value_t = 128_000)]
-  context_window: u64,
+  /// Context window of the model in tokens; compaction triggers near this
+  /// limit. Given here it stands whatever the model is, and left out it is
+  /// what the provider reports for the chosen model — or 128000, for the
+  /// providers that report nothing
+  #[arg(long, env = "FA_CONTEXT_WINDOW")]
+  context_window: Option<u64>,
 
   /// Compact once fewer than this many tokens remain in the context window
   #[arg(long, default_value_t = 16_384)]
@@ -168,11 +172,10 @@ enum ProviderArg {
   Xai,
 }
 
-/// What a provider is called here, which variable its key is read from, and
-/// what key to use when neither the flag nor that variable says.
+/// Which provider an argument names, which variable its key is read from,
+/// and what key to use when neither the flag nor that variable says.
 struct Wire {
   provider: agent::Provider,
-  label: &'static str,
   /// `None` for llamafile, whose client takes no key at all, so there is no
   /// variable worth reading.
   key_env: Option<&'static str>,
@@ -185,36 +188,34 @@ struct Wire {
 impl ProviderArg {
   fn wire(self) -> Wire {
     use agent::Provider as P;
-    let hosted = |provider, label, key_env| Wire {
+    let hosted = |provider, key_env| Wire {
       provider,
-      label,
       key_env: Some(key_env),
       no_key: "none",
     };
-    let local = |provider, label, key_env| Wire {
+    let local = |provider, key_env| Wire {
       provider,
-      label,
       key_env,
       no_key: "",
     };
     match self {
-      Self::Openai => hosted(P::OpenAi, "openai", "OPENAI_API_KEY"),
-      Self::Openrouter => hosted(P::OpenRouter, "openrouter", "OPENROUTER_API_KEY"),
-      Self::Ollama => local(P::Ollama, "ollama", Some("OLLAMA_API_KEY")),
-      Self::Gemini => hosted(P::Gemini, "gemini", "GEMINI_API_KEY"),
-      Self::Anthropic => hosted(P::Anthropic, "anthropic", "ANTHROPIC_API_KEY"),
-      Self::Cohere => hosted(P::Cohere, "cohere", "COHERE_API_KEY"),
-      Self::Deepseek => hosted(P::DeepSeek, "deepseek", "DEEPSEEK_API_KEY"),
-      Self::Doubleword => hosted(P::Doubleword, "doubleword", "DOUBLEWORD_API_KEY"),
-      Self::Groq => hosted(P::Groq, "groq", "GROQ_API_KEY"),
-      Self::Hyperbolic => hosted(P::Hyperbolic, "hyperbolic", "HYPERBOLIC_API_KEY"),
-      Self::Llamafile => local(P::Llamafile, "llamafile", None),
-      Self::Mira => hosted(P::Mira, "mira", "MIRA_API_KEY"),
-      Self::Mistral => hosted(P::Mistral, "mistral", "MISTRAL_API_KEY"),
-      Self::Perplexity => hosted(P::Perplexity, "perplexity", "PERPLEXITY_API_KEY"),
-      Self::Together => hosted(P::Together, "together", "TOGETHER_API_KEY"),
-      Self::Venice => hosted(P::Venice, "venice", "VENICE_API_KEY"),
-      Self::Xai => hosted(P::XAi, "xai", "XAI_API_KEY"),
+      Self::Openai => hosted(P::OpenAi, "OPENAI_API_KEY"),
+      Self::Openrouter => hosted(P::OpenRouter, "OPENROUTER_API_KEY"),
+      Self::Ollama => local(P::Ollama, Some("OLLAMA_API_KEY")),
+      Self::Gemini => hosted(P::Gemini, "GEMINI_API_KEY"),
+      Self::Anthropic => hosted(P::Anthropic, "ANTHROPIC_API_KEY"),
+      Self::Cohere => hosted(P::Cohere, "COHERE_API_KEY"),
+      Self::Deepseek => hosted(P::DeepSeek, "DEEPSEEK_API_KEY"),
+      Self::Doubleword => hosted(P::Doubleword, "DOUBLEWORD_API_KEY"),
+      Self::Groq => hosted(P::Groq, "GROQ_API_KEY"),
+      Self::Hyperbolic => hosted(P::Hyperbolic, "HYPERBOLIC_API_KEY"),
+      Self::Llamafile => local(P::Llamafile, None),
+      Self::Mira => hosted(P::Mira, "MIRA_API_KEY"),
+      Self::Mistral => hosted(P::Mistral, "MISTRAL_API_KEY"),
+      Self::Perplexity => hosted(P::Perplexity, "PERPLEXITY_API_KEY"),
+      Self::Together => hosted(P::Together, "TOGETHER_API_KEY"),
+      Self::Venice => hosted(P::Venice, "VENICE_API_KEY"),
+      Self::Xai => hosted(P::XAi, "XAI_API_KEY"),
     }
   }
 }
@@ -244,7 +245,9 @@ async fn main() -> Result<()> {
     tools: None,
     compaction: compaction::Settings {
       enabled: !cli.no_compaction,
-      context_window: cli.context_window,
+      // What the flag says, or the fallback until the provider is asked what
+      // the chosen model holds.
+      context_window: cli.context_window.unwrap_or(compaction::DEFAULT_CONTEXT_WINDOW),
       reserve_tokens: cli.reserve_tokens,
       keep_recent_tokens: cli.keep_recent_tokens,
       turn_summary: !cli.no_turn_summary,
@@ -270,8 +273,6 @@ async fn main() -> Result<()> {
   } else {
     ui::SessionStart::New
   };
-  let model_label = format!("{}/{}", wire.label, cfg.model);
-
   // The servers come up before the terminal does, and stay up as long as this
   // binding: a stdio server is a child process of ours, and closing the
   // connection is what stops it.
@@ -313,18 +314,17 @@ async fn main() -> Result<()> {
   let agents = agent::build_agents(&cfg, &cwd, tx.clone(), &servers)?;
   let app = ui::App::new(
     agents,
+    cfg,
     tx,
     ui::Options {
-      model: model_label,
       cwd,
-      settings: cfg.compaction,
+      context_window: cli.context_window,
       scrollbar: cli.scrollbar,
       store,
       start,
       notes,
       mcp: servers.count(),
       bell: !cli.no_bell,
-      vision: !cli.no_vision,
     },
   );
 

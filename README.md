@@ -69,10 +69,10 @@ allows — or 2048 for a model rig does not recognise, which is when
 | `--provider` | `FA_PROVIDER` | `openai` | API flavour to speak; see the table above |
 | `--base-url` | `FA_BASE_URL` | provider default | Endpoint root, e.g. `http://localhost:8080/v1` |
 | `--api-key` | `FA_API_KEY` | the provider's own variable, else `none` | API key (any value for servers without auth; Ollama and llamafile need none) |
-| `-m, --model` | `FA_MODEL` | required | Model name |
+| `-m, --model` | `FA_MODEL` | required | Model name; `/model` changes it later |
 | `--system-prompt` | `FA_SYSTEM_PROMPT` | built-in | Replace the system prompt |
 | `--max-tokens` | `FA_MAX_TOKENS` | the provider's own | Cap on what one answer may come to, in tokens |
-| `--context-window` | `FA_CONTEXT_WINDOW` | `128000` | Model context size in tokens |
+| `--context-window` | `FA_CONTEXT_WINDOW` | what the provider reports once `/model` has been opened, else `128000` | Model context size in tokens; given here it stands whatever model is chosen |
 | `--reserve-tokens` | | `16384` | Compact when fewer tokens than this remain |
 | `--keep-recent-tokens` | | `20000` | Recent tokens kept verbatim when compacting |
 | `--no-compaction` | | | Disable automatic compaction |
@@ -92,6 +92,48 @@ allows — or 2048 for a model rig does not recognise, which is when
 
 The agent works in the current directory. If `AGENTS.md` (or `CLAUDE.md`)
 exists there, it is appended to the system prompt.
+
+## Which model
+
+`-m` names what a session starts on, and `/model` changes it whenever you
+like: the conversation carries on against the new one, since what a session
+holds is messages rather than a connection. Nothing is asked of the provider
+until `/model` asks it — a session that never opens the picker never lists
+anything — and the list is fetched afresh each time it does, so a model the
+provider has gained since fa started is simply there.
+
+The list is typed at rather than scrolled through, which is what four hundred
+models on OpenRouter need: letters narrow it to what they fuzzily match
+(`snt` finds `claude-sonnet-5`), `Backspace` widens it again, and the arrows
+steer what is left. The letters that matched are picked out in each row the
+way the `/` popup picks out its own, so a fuzzy match reads as the match it
+was. The filter is drawn in the list's own title, since a list being filtered
+is a list of that.
+
+`/model <id>` names one outright, listed or not: the list is what a provider
+admits to, not the whole of what it answers to, and a local server that lists
+nothing useful is still reachable by name.
+
+The list is also where the context window comes from, when the provider
+reports one. Only four of them do — Gemini, Groq, Mistral and OpenRouter —
+and a model whose window nobody reports gets the 128000 fallback, which is
+what `--context-window` is for. A figure given there stands whatever model is
+chosen afterwards, so it is the answer to a provider that reports nothing, or
+reports the wrong thing.
+
+Since the list is only fetched when `/model` asks for it, a window reported
+for the model already in use arrives the first time the picker is opened —
+even if you press Esc straight back out of it, and whether or not you picked
+anything. Until then it is the fallback: too small a figure only compacts
+sooner than it had to, and too large a one is caught by the run itself, which
+stops when the window fills, makes room, and picks itself back up. A provider
+that takes the request and never answers is given twenty seconds before fa
+stops listening.
+
+Seven providers cannot be asked at all (Cohere, Doubleword, Hyperbolic,
+llamafile, Perplexity, Together, xAI): rig speaks no listing endpoint for
+them, so `/model` on one of those says so without a request going out, and
+`/model <id>` is the way to change model there.
 
 ## Which tools
 
@@ -679,6 +721,7 @@ what it spent.
 | `↑` / `↓`, `Enter`, `Space`, `Tab`, `Esc` | Answer what `ask` put on the screen — see [Asking you](#asking-you) |
 | `/compact` | Summarize older history now |
 | `/continue` | Run the model again with no new message |
+| `/model` | Pick the model from what the provider offers, asked for afresh each time — type to filter, or `/model <id>` to name one outright |
 | `/new` | Start a new session |
 | `/resume` | Pick a saved session to resume — `Delete` removes the selected one, a second `Delete` confirms |
 | `/tree` | Move to another point in this session, on any branch |
@@ -710,7 +753,10 @@ comes back to say otherwise.
 
 - `src/main.rs` – CLI flags, terminal setup.
 - `src/agent.rs` – builds the rig agent (the provider's client, tools,
-  system prompt) and runs one streaming turn per user message, forwarding
+  system prompt), asks the provider what models it has, and rebuilds the model
+  handle when `/model` picks another — the tools and the preamble outlive it,
+  which is what lets a session change model without starting again. It runs
+  one streaming turn per user message, forwarding
   `AgentEvent`s to the UI over a channel. Tool-call argument fragments are
   accumulated per call and sent whole, so the UI has nothing to reassemble.
   Tool calls and results are reported

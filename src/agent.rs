@@ -14,13 +14,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use rig_agent::tool::ToolContext;
 use rig_agent::tool::server::{ToolServer, ToolServerHandle};
 use rig_core::client::Nothing;
 use rig_core::client::completion::CompletionClient;
+use rig_core::client::model_listing::ModelListingClient;
 use rig_core::completion::{CompletionError, CompletionModel, CompletionRequest, Message, ToolDefinition, Usage};
 use rig_core::message::{AssistantContent, Reasoning, ToolCall, ToolResultContent, UserContent};
 use rig_core::providers::{
@@ -121,16 +122,77 @@ pub enum AgentEvent {
   },
   /// Compaction finished; `None` means there was nothing to compact.
   Compacted(Option<Compacted>),
+  /// What the provider says it offers, or why it would not say. Sent by the
+  /// fetch `/model` starts, which is the only thing that asks.
+  Models(Result<Vec<ModelInfo>, String>),
   Error(String),
 }
 
 /// What a session runs on: one model with its tools, and the handle the UI
 /// stops and steers it by.
+///
+/// Everything here but the two models — the tools, the preamble, the queue —
+/// outlives whichever model is in front of it, which is what lets `/model`
+/// swap one for another mid-session.
 pub struct Agents {
   pub runtime: Arc<Runtime>,
   /// Tool-less model used to summarize history during compaction.
   pub summarizer: Arc<Summarizer>,
   pub control: Control,
+  /// Kept so a model chosen later is built into a runtime holding the same
+  /// tools this session came up with.
+  tools: ToolServerHandle,
+  preamble: String,
+  /// Whether this provider takes an image inside a tool result; fixed by the
+  /// provider rather than by the model, so it survives a change of model.
+  relay_images: bool,
+}
+
+impl Agents {
+  /// Point the session at `cfg.model`, building the handles for it.
+  ///
+  /// Neither is replaced until both are built, so a model that cannot be
+  /// reached leaves the session on the one it already had.
+  pub fn use_model(&mut self, cfg: &Config) -> Result<()> {
+    (self.runtime, self.summarizer) = handles(cfg, &self.tools, &self.preamble, self.relay_images)?;
+    Ok(())
+  }
+}
+
+/// The two handles a session runs on: the model with its tools, and the same
+/// model with the summarizer's preamble and nothing else.
+fn handles(
+  cfg: &Config,
+  tools: &ToolServerHandle,
+  preamble: &str,
+  relay_images: bool,
+) -> Result<(Arc<Runtime>, Arc<Summarizer>)> {
+  let model = build_model(cfg, &cfg.model)?;
+  let runtime = Arc::new(Runtime {
+    model: model.clone(),
+    tools: tools.clone(),
+    preamble: preamble.to_string(),
+    compaction: cfg.compaction,
+    allowed: cfg.tools.clone(),
+    relay_images,
+    max_tokens: cfg.max_tokens,
+  });
+  let summarizer = Arc::new(Summarizer {
+    model,
+    preamble: compaction::SYSTEM_PROMPT.to_string(),
+    max_tokens: cfg.max_tokens,
+  });
+  Ok((runtime, summarizer))
+}
+
+/// One model a provider offers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelInfo {
+  pub id: String,
+  /// The provider's own display name for it, when it gives one.
+  pub name: Option<String>,
+  /// The context window it reports, which most providers do not.
+  pub context_length: Option<u64>,
 }
 
 // ---------------------------------------------------------------- control
@@ -345,11 +407,38 @@ pub enum Provider {
   XAi,
 }
 
+impl Provider {
+  /// What this provider is called on screen, and in the session file.
+  pub fn label(self) -> &'static str {
+    match self {
+      Self::OpenAi => "openai",
+      Self::OpenRouter => "openrouter",
+      Self::Ollama => "ollama",
+      Self::Gemini => "gemini",
+      Self::Anthropic => "anthropic",
+      Self::Cohere => "cohere",
+      Self::DeepSeek => "deepseek",
+      Self::Doubleword => "doubleword",
+      Self::Groq => "groq",
+      Self::Hyperbolic => "hyperbolic",
+      Self::Llamafile => "llamafile",
+      Self::Mira => "mira",
+      Self::Mistral => "mistral",
+      Self::Perplexity => "perplexity",
+      Self::Together => "together",
+      Self::Venice => "venice",
+      Self::XAi => "xai",
+    }
+  }
+}
+
+#[derive(Clone)]
 pub struct Config {
   pub provider: Provider,
   /// Provider endpoint root; `None` uses the provider's default.
   pub base_url: Option<String>,
   pub api_key: String,
+  /// The model to send to, as `--model` named it or `/model` chose it.
   pub model: String,
   pub system_prompt: Option<String>,
   /// Cap on what one answer may come to, or `None` for the provider's own.
@@ -361,16 +450,20 @@ pub struct Config {
   pub tools: Option<Vec<String>>,
 }
 
-pub fn build_agents(
-  cfg: &Config,
-  cwd: &Path,
-  tx: mpsc::UnboundedSender<AgentEvent>,
-  servers: &crate::mcp::Servers,
-) -> Result<Agents> {
-  let preamble = match &cfg.system_prompt {
-    Some(p) => p.clone(),
-    None => default_system_prompt(cwd, cfg.tools.as_deref()),
-  };
+/// Whether this provider takes an image inside a tool result.
+///
+/// Gemini takes one inside a function response and Anthropic inside a tool
+/// result; the rest refuse them there and have them relayed after it.
+fn relays_images(provider: Provider) -> bool {
+  !matches!(provider, Provider::Gemini | Provider::Anthropic)
+}
+
+/// The handle one model is reached through, whichever provider offers it.
+///
+/// Summarizing asks the same model the same way, so it is the same handle —
+/// what makes that call a summary is the preamble it carries, which belongs
+/// to the request rather than to the model.
+fn build_model(cfg: &Config, model: &str) -> Result<Arc<dyn Model>> {
   let base_url = cfg.base_url.as_deref().map(|u| u.trim_end_matches('/'));
 
   // Each builder is a type of its own, so the key and the optional base URL
@@ -387,21 +480,15 @@ pub fn build_agents(
         builder = builder.base_url(url);
       }
       let client = builder.build().context(concat!("failed to build ", $what, " client"))?;
-      Arc::new(client.completion_model(cfg.model.clone())) as Arc<dyn Model>
+      Arc::new(client.completion_model(model.to_string())) as Arc<dyn Model>
     }};
   }
 
-  // The providers differ in the client, and in one thing about the wire:
-  // Gemini takes images inside a function response and Anthropic inside a
-  // tool result, while the rest refuse them there and have them relayed.
-  // Summarizing asks the same model the same way, so it is the same handle —
-  // what makes that call a summary is the preamble it carries, which belongs
-  // to the request rather than to the model.
-  let (model, relay_images): (Arc<dyn Model>, bool) = match cfg.provider {
-    Provider::OpenAi => (model!(openai::CompletionsClient::builder(), "OpenAI-compatible"), true),
-    Provider::OpenRouter => (model!(openrouter::Client::builder(), "OpenRouter"), true),
-    Provider::Ollama => (model!(ollama::Client::builder(), "Ollama"), true),
-    Provider::Gemini => (model!(gemini::Client::builder(), "Gemini"), false),
+  Ok(match cfg.provider {
+    Provider::OpenAi => model!(openai::CompletionsClient::builder(), "OpenAI-compatible"),
+    Provider::OpenRouter => model!(openrouter::Client::builder(), "OpenRouter"),
+    Provider::Ollama => model!(ollama::Client::builder(), "Ollama"),
+    Provider::Gemini => model!(gemini::Client::builder(), "Gemini"),
     // Anthropic refuses a request that names no `max_tokens`, so the model is
     // built through `with_model` rather than `completion_model`: it fills in
     // what the named model allows, and falls back to a small cap for one it
@@ -413,21 +500,89 @@ pub fn build_agents(
         builder = builder.base_url(url);
       }
       let client = builder.build().context("failed to build Anthropic client")?;
-      let model = anthropic::completion::CompletionModel::with_model(client, &cfg.model);
-      (Arc::new(model) as Arc<dyn Model>, false)
+      Arc::new(anthropic::completion::CompletionModel::with_model(client, model)) as Arc<dyn Model>
     }
-    Provider::Cohere => (model!(cohere::Client::builder(), "Cohere"), true),
-    Provider::DeepSeek => (model!(deepseek::Client::builder(), "DeepSeek"), true),
-    Provider::Doubleword => (model!(doubleword::Client::builder(), "Doubleword"), true),
-    Provider::Groq => (model!(groq::Client::builder(), "Groq"), true),
-    Provider::Hyperbolic => (model!(hyperbolic::Client::builder(), "Hyperbolic"), true),
-    Provider::Llamafile => (model!(llamafile::Client::builder(), "llamafile", Nothing), true),
-    Provider::Mira => (model!(mira::Client::builder(), "Mira"), true),
-    Provider::Mistral => (model!(mistral::Client::builder(), "Mistral"), true),
-    Provider::Perplexity => (model!(perplexity::Client::builder(), "Perplexity"), true),
-    Provider::Together => (model!(together::Client::builder(), "Together"), true),
-    Provider::Venice => (model!(venice::Client::builder(), "Venice"), true),
-    Provider::XAi => (model!(xai::Client::builder(), "xAI"), true),
+    Provider::Cohere => model!(cohere::Client::builder(), "Cohere"),
+    Provider::DeepSeek => model!(deepseek::Client::builder(), "DeepSeek"),
+    Provider::Doubleword => model!(doubleword::Client::builder(), "Doubleword"),
+    Provider::Groq => model!(groq::Client::builder(), "Groq"),
+    Provider::Hyperbolic => model!(hyperbolic::Client::builder(), "Hyperbolic"),
+    Provider::Llamafile => model!(llamafile::Client::builder(), "llamafile", Nothing),
+    Provider::Mira => model!(mira::Client::builder(), "Mira"),
+    Provider::Mistral => model!(mistral::Client::builder(), "Mistral"),
+    Provider::Perplexity => model!(perplexity::Client::builder(), "Perplexity"),
+    Provider::Together => model!(together::Client::builder(), "Together"),
+    Provider::Venice => model!(venice::Client::builder(), "Venice"),
+    Provider::XAi => model!(xai::Client::builder(), "xAI"),
+  })
+}
+
+/// Ask the provider what models it offers, alphabetically.
+///
+/// Only four of them report a context window — Gemini, Groq, Mistral and
+/// OpenRouter — and the rest answer with names alone, which is why the window
+/// a model is given falls back to the configured one.
+pub async fn list_models(cfg: &Config) -> Result<Vec<ModelInfo>> {
+  let base_url = cfg.base_url.as_deref().map(|u| u.trim_end_matches('/'));
+
+  // As in `build_model`: one client per provider, each of its own type, so
+  // the key and base URL are spelled once rather than once an arm.
+  macro_rules! list {
+    ($builder:expr, $what:literal) => {{
+      let mut builder = $builder.api_key(cfg.api_key.as_str());
+      if let Some(url) = base_url {
+        builder = builder.base_url(url);
+      }
+      let client = builder.build().context(concat!("failed to build ", $what, " client"))?;
+      client
+        .list_models()
+        .await
+        .context(concat!($what, " would not say what models it has"))?
+    }};
+  }
+
+  let models = match cfg.provider {
+    Provider::OpenAi => list!(openai::CompletionsClient::builder(), "OpenAI-compatible"),
+    Provider::OpenRouter => list!(openrouter::Client::builder(), "OpenRouter"),
+    Provider::Ollama => list!(ollama::Client::builder(), "Ollama"),
+    Provider::Gemini => list!(gemini::Client::builder(), "Gemini"),
+    Provider::Anthropic => list!(anthropic::Client::builder(), "Anthropic"),
+    Provider::DeepSeek => list!(deepseek::Client::builder(), "DeepSeek"),
+    Provider::Groq => list!(groq::Client::builder(), "Groq"),
+    Provider::Mira => list!(mira::Client::builder(), "Mira"),
+    Provider::Mistral => list!(mistral::Client::builder(), "Mistral"),
+    Provider::Venice => list!(venice::Client::builder(), "Venice"),
+    // The rest have no listing endpoint rig speaks. Refused here rather than
+    // by a second list of which providers have an arm above: this is the
+    // list, and it answers without a request going out.
+    other => bail!("{} does not list its models — name one with /model <id>", other.label()),
+  };
+
+  let mut models: Vec<ModelInfo> = models
+    .into_iter()
+    .map(|model| ModelInfo {
+      // A name that only repeats the id is no more than the id.
+      name: model.name.filter(|name| name != &model.id),
+      id: model.id,
+      context_length: model.context_length.map(u64::from),
+    })
+    .collect();
+  // A provider's own order is whatever it is — newest first, or the order
+  // they were added. One long list is easier to walk in a known one.
+  models.sort_by(|a, b| a.id.cmp(&b.id));
+  models.dedup_by(|a, b| a.id == b.id);
+  Ok(models)
+}
+
+pub fn build_agents(
+  cfg: &Config,
+  cwd: &Path,
+  tx: mpsc::UnboundedSender<AgentEvent>,
+  servers: &crate::mcp::Servers,
+) -> Result<Agents> {
+  let preamble = match &cfg.system_prompt {
+    Some(p) => p.clone(),
+    None => default_system_prompt(cwd, cfg.tools.as_deref()),
   };
 
   let tools = ToolServer::new()
@@ -447,22 +602,15 @@ pub fn build_agents(
   // brought: a tool is a tool, and the transcript draws them all the same.
   let tools = crate::mcp::attach(tools, servers).run();
 
+  let relay_images = relays_images(cfg.provider);
+  let (runtime, summarizer) = handles(cfg, &tools, &preamble, relay_images)?;
   Ok(Agents {
-    runtime: Arc::new(Runtime {
-      model: model.clone(),
-      tools,
-      preamble,
-      compaction: cfg.compaction,
-      allowed: cfg.tools.clone(),
-      relay_images,
-      max_tokens: cfg.max_tokens,
-    }),
-    summarizer: Arc::new(Summarizer {
-      model,
-      preamble: compaction::SYSTEM_PROMPT.to_string(),
-      max_tokens: cfg.max_tokens,
-    }),
+    runtime,
+    summarizer,
     control: Control::default(),
+    tools,
+    preamble,
+    relay_images,
   })
 }
 
@@ -1371,6 +1519,7 @@ mod tests {
         AgentEvent::Error(e) => format!("error:{e}"),
         AgentEvent::Ended { .. } => "ended".into(),
         AgentEvent::Compacted(_) => "compacted".into(),
+        AgentEvent::Models(_) => "models".into(),
         AgentEvent::AskUser { .. } => "asking".into(),
       })
       .collect();
@@ -1707,29 +1856,33 @@ mod tests {
     assert_eq!(*recording.caps.lock().unwrap(), vec![Some(99), Some(99)]);
   }
 
+  /// Every provider there is, and whether an image it is sent inside a tool
+  /// result has to be relayed after it instead.
+  const PROVIDERS: [(Provider, bool); 17] = [
+    (Provider::OpenAi, true),
+    (Provider::OpenRouter, true),
+    (Provider::Ollama, true),
+    (Provider::Gemini, false),
+    (Provider::Anthropic, false),
+    (Provider::Cohere, true),
+    (Provider::DeepSeek, true),
+    (Provider::Doubleword, true),
+    (Provider::Groq, true),
+    (Provider::Hyperbolic, true),
+    (Provider::Llamafile, true),
+    (Provider::Mira, true),
+    (Provider::Mistral, true),
+    (Provider::Perplexity, true),
+    (Provider::Together, true),
+    (Provider::Venice, true),
+    (Provider::XAi, true),
+  ];
+
   /// Every provider builds, with a key and without one, and only the two
   /// that take an image inside a tool result skip the relay.
   #[test]
   fn each_provider_builds_a_model() {
-    for (provider, relay) in [
-      (Provider::OpenAi, true),
-      (Provider::OpenRouter, true),
-      (Provider::Ollama, true),
-      (Provider::Gemini, false),
-      (Provider::Anthropic, false),
-      (Provider::Cohere, true),
-      (Provider::DeepSeek, true),
-      (Provider::Doubleword, true),
-      (Provider::Groq, true),
-      (Provider::Hyperbolic, true),
-      (Provider::Llamafile, true),
-      (Provider::Mira, true),
-      (Provider::Mistral, true),
-      (Provider::Perplexity, true),
-      (Provider::Together, true),
-      (Provider::Venice, true),
-      (Provider::XAi, true),
-    ] {
+    for (provider, relay) in PROVIDERS {
       for (key, base_url) in [("", None), ("k", Some("http://127.0.0.1:1/v1/".to_string()))] {
         let cfg = Config {
           provider,
@@ -1747,6 +1900,30 @@ mod tests {
           .unwrap_or_else(|e| panic!("{provider:?} with key {key:?}: {e}"));
         assert_eq!(agents.runtime.relay_images, relay, "{provider:?}");
       }
+    }
+  }
+
+  /// Every provider answers being asked for its models, with a list or with
+  /// a refusal the UI can put on screen — and none of them panics, which a
+  /// client built for an endpoint that is not there could.
+  #[tokio::test]
+  async fn every_provider_answers_being_asked_for_its_models() {
+    for (provider, _) in PROVIDERS {
+      let cfg = Config {
+        provider,
+        // Nothing is listening, so a provider with an arm fails to reach it
+        // and one without never gets that far.
+        base_url: Some("http://127.0.0.1:1/v1".to_string()),
+        api_key: "k".into(),
+        model: "mock".into(),
+        system_prompt: None,
+        max_tokens: None,
+        compaction: TEST_SETTINGS,
+        vision: true,
+        tools: None,
+      };
+      let err = list_models(&cfg).await.expect_err("nothing is listening");
+      assert!(!format!("{err:#}").is_empty(), "{provider:?} said nothing");
     }
   }
 

@@ -71,6 +71,9 @@ struct Provider {
   port: u16,
   /// Every request body, for asserting on what fa told the model.
   seen: Arc<Mutex<Vec<String>>>,
+  /// How many times fa has asked what models there are, for asserting on
+  /// what it asked for without being asked to.
+  listings: Arc<AtomicU32>,
 }
 
 impl Provider {
@@ -78,15 +81,17 @@ impl Provider {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a port to listen on");
     let port = listener.local_addr().expect("an address").port();
     let seen = Arc::new(Mutex::new(Vec::new()));
+    let listings = Arc::new(AtomicU32::new(0));
     let provider = Self {
       port,
       seen: seen.clone(),
+      listings: listings.clone(),
     };
     std::thread::spawn(move || {
       for stream in listener.incoming().flatten() {
-        let (script, seen) = (script.clone(), seen.clone());
+        let (script, seen, listings) = (script.clone(), seen.clone(), listings.clone());
         std::thread::spawn(move || {
-          let _ = serve(stream, &script, &seen);
+          let _ = serve(stream, &script, &seen, &listings);
         });
       }
     });
@@ -95,6 +100,11 @@ impl Provider {
 
   fn base_url(&self) -> String {
     format!("http://127.0.0.1:{}/v1", self.port)
+  }
+
+  /// How many times it was asked for its models.
+  fn listings(&self) -> u32 {
+    self.listings.load(Ordering::SeqCst)
   }
 
   /// Whether any request carried `needle` — what fa told the model.
@@ -119,9 +129,16 @@ impl Provider {
   }
 }
 
-fn serve(mut stream: TcpStream, script: &[Turn], seen: &Mutex<Vec<String>>) -> std::io::Result<()> {
+fn serve(
+  mut stream: TcpStream,
+  script: &[Turn],
+  seen: &Mutex<Vec<String>>,
+  listings: &AtomicU32,
+) -> std::io::Result<()> {
   let mut reader = BufReader::new(stream.try_clone()?);
   let mut length = 0;
+  let mut request_line = String::new();
+  reader.read_line(&mut request_line)?;
   loop {
     let mut line = String::new();
     if reader.read_line(&mut line)? == 0 || line == "\r\n" {
@@ -130,6 +147,33 @@ fn serve(mut stream: TcpStream, script: &[Turn], seen: &Mutex<Vec<String>>) -> s
     if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
       length = value.trim().parse().unwrap_or(0);
     }
+  }
+  // What `/model` asks for, and nothing else does: fa comes up on the model
+  // the command line named and leaves the provider alone until the picker is
+  // opened. Not a turn of the conversation and not recorded as one — what the
+  // tests assert on is what fa told the model.
+  if request_line
+    .split_whitespace()
+    .nth(1)
+    .is_some_and(|path| path.ends_with("/models"))
+  {
+    listings.fetch_add(1, Ordering::SeqCst);
+    let body = serde_json::json!({
+      "object": "list",
+      "data": [
+        { "id": "mock", "object": "model", "owned_by": "fa-tests" },
+        { "id": "mock-mini", "object": "model", "owned_by": "fa-tests" },
+        { "id": "other-model", "object": "model", "owned_by": "fa-tests" },
+      ],
+    })
+    .to_string();
+    return stream.write_all(
+      format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+        body.len()
+      )
+      .as_bytes(),
+    );
   }
   let mut body = vec![0; length];
   std::io::Read::read_exact(&mut reader, &mut body)?;
@@ -2763,4 +2807,144 @@ fn the_at_popup_completes_a_path_and_a_full_path_attaches_too() {
     "the completed token is what was sent:\n{:?}",
     provider.bodies()
   );
+}
+
+/// `/model` lists what the provider has and runs the session on what is
+/// picked from it, mid-conversation.
+#[test]
+fn a_model_picked_from_the_list_is_what_the_session_runs_on() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![Turn::Say("Picked, then answered.")]);
+  let term = Term::start("model-picker", &provider, &["--no-session"]);
+
+  term.submit("/model");
+  term.wait_for("Esc cancel");
+  let (rows, _) = term.overlay();
+  assert!(
+    rows.iter().any(|row| row.contains("mock-mini")),
+    "what the provider listed is on it: {rows:?}"
+  );
+
+  term.choose("mock-mini");
+  term.wait_for("Model mock-mini");
+  term.submit("go");
+  let screen = term.wait_for("Picked, then answered.");
+  assert!(
+    screen.contains("openai/mock-mini"),
+    "the footer says what it settled on:\n{screen}"
+  );
+}
+
+/// `/model` takes a name the provider never listed: the list is what it
+/// admits to, not the whole of what it answers to.
+#[test]
+fn a_model_can_be_named_outright() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![Turn::Say("Answered anyway.")]);
+  let term = Term::start("model-named", &provider, &["--no-session"]);
+
+  term.submit("/model unlisted-model");
+  term.wait_for("Model unlisted-model");
+  term.submit("go");
+  let screen = term.wait_for("Answered anyway.");
+  assert!(
+    screen.contains("openai/unlisted-model"),
+    "named rather than picked, and used all the same:\n{screen}"
+  );
+}
+
+/// The picker is typed at: letters narrow the list to what they match, and
+/// `Enter` takes what is left standing under the cursor.
+#[test]
+fn typing_at_the_model_picker_narrows_it_to_what_was_typed() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![Turn::Say("Ran on the filtered one.")]);
+  let term = Term::start("model-filter", &provider, &["--no-session"]);
+  // The rows a list has drawn something on: the box is as tall as the
+  // screen whatever is in it, and the blank ones are not models.
+  let listed = |rows: &[String]| {
+    rows
+      .iter()
+      .filter(|row| !row.trim_matches(|c| c == '│' || c == ' ').is_empty())
+      .count()
+  };
+  term.submit("/model");
+  term.wait_for("Esc cancel");
+  let (rows, _) = term.overlay();
+  assert_eq!(listed(&rows), 3, "all three to start with: {rows:?}");
+
+  // A fuzzy match, as everywhere else in fa: "omd" is o-ther-m-o-d-el.
+  term.type_in("omd");
+  term.wait_for("Model: omd");
+  let (rows, on) = term.overlay();
+  assert_eq!(listed(&rows), 1, "only what matches is left: {rows:?}");
+  assert!(rows[on].contains("other-model"), "and it is the one meant: {rows:?}");
+
+  // The letters it matched are picked out where they are, as the `/` popup
+  // picks out its own — so the row is drawn letter by letter, and what is
+  // left unhighlighted is what sits between them.
+  let coloured = term.coloured();
+  let row = coloured.lines().find(|line| line.contains("ther-")).expect("the row");
+  // The terminal's own cyan, indexed as everything else here is, and the
+  // underline that goes with it.
+  assert!(
+    row.contains("\u{1b}[4m") && row.contains("\u{1b}[38;5;6m"),
+    "matched letters are cyan and underlined: {row:?}"
+  );
+
+  // Backspace widens it again, and a query nothing matches says so rather
+  // than leaving an empty box.
+  term.type_in("BSpace");
+  term.type_in("BSpace");
+  term.type_in("BSpace");
+  term.type_in("zzz");
+  term.wait_for("No model matches.");
+  term.type_in("BSpace");
+  term.type_in("BSpace");
+  term.type_in("BSpace");
+
+  // `q` is a letter here, not the key that closes the other lists.
+  term.type_in("mini");
+  term.wait_for("Model: mini");
+  term.type_in("Enter");
+  term.wait_for("Model mock-mini");
+  term.submit("go");
+  let screen = term.wait_for("Ran on the filtered one.");
+  assert!(
+    screen.contains("openai/mock-mini"),
+    "the one the filter left is what it runs on:\n{screen}"
+  );
+}
+
+/// The model named on the command line is the whole of what a session needs,
+/// so nothing is asked of the provider until `/model` asks it: a session that
+/// never opens the picker never lists anything.
+#[test]
+fn nothing_is_listed_until_model_asks_for_it() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![Turn::Say("Answered.")]);
+  let term = Term::start("model-unasked", &provider, &["--no-session"]);
+  term.submit("go");
+  let screen = term.wait_for("Answered.");
+  assert!(
+    screen.contains("openai/mock"),
+    "it runs on what it was told to: {screen}"
+  );
+  assert_eq!(
+    provider.listings(),
+    0,
+    "nothing was asked of the provider that the command line had not already answered"
+  );
+
+  term.submit("/model");
+  term.wait_for("Esc cancel");
+  assert_eq!(provider.listings(), 1, "asked once, when asked to");
 }

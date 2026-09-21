@@ -23,14 +23,18 @@ use rig_core::message::{AssistantContent, ToolCall, ToolResult, UserContent};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::agent::{AgentEvent, Agents, start_compaction, start_run};
+use crate::agent::{self, AgentEvent, Agents, ModelInfo, start_compaction, start_run};
 use crate::ask::{self, Dialog};
 use crate::attach::{self, Prompt, Token};
-use crate::compaction::{SUMMARY_PREFIX, SUMMARY_SUFFIX, Settings};
+use crate::compaction::{DEFAULT_CONTEXT_WINDOW, SUMMARY_PREFIX, SUMMARY_SUFFIX};
 use crate::session::{Node, NodeKind, Outcome, Session, SessionInfo, Store};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
+/// How long a provider is given to say what models it has. Long enough for a
+/// slow endpoint, short enough that a silent one is answered rather than
+/// waited on.
+const LISTING_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_INPUT_LINES: usize = 8;
 const TOOL_OUTPUT_LINES: usize = 10;
 const DIFF_LINES: usize = 30;
@@ -165,9 +169,11 @@ pub enum SessionStart {
 
 /// Startup configuration for the UI.
 pub struct Options {
-  pub model: String,
   pub cwd: PathBuf,
-  pub settings: Settings,
+  /// `--context-window`, when it was given: a figure the user named stands
+  /// whatever model is chosen, and only its absence leaves the window to
+  /// what the provider says the model holds.
+  pub context_window: Option<u64>,
   pub scrollbar: ScrollbarMode,
   pub store: Option<Store>,
   pub start: SessionStart,
@@ -179,9 +185,6 @@ pub struct Options {
   pub mcp: (usize, usize),
   /// Whether a question the model asks rings the terminal.
   pub bell: bool,
-  /// Whether the model can be sent images, which is what decides if an
-  /// `@image` in the input box is attached or refused.
-  pub vision: bool,
 }
 
 /// Slash commands offered by the `/` popup: name, description, takes an argument.
@@ -189,6 +192,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
   ("compact", "Manually compact the session context", false),
   ("continue", "Resume the loop without a new message", false),
   ("fork", "Start a new session from an earlier message", false),
+  ("model", "Choose the model, or name one: /model <id>", true),
   ("name", "Set session display name", true),
   ("new", "Start a new session", false),
   ("resume", "Resume a different session", false),
@@ -252,6 +256,20 @@ enum OverlayList {
   Tree(Vec<Point>),
   /// `/fork`: the prompts, to start a new session from one of them.
   Fork(Vec<Point>),
+  /// `/model`: what the provider last said it offers, and what has been
+  /// typed to narrow it down.
+  Models {
+    models: Vec<ModelInfo>,
+    /// The filter, which is typed at the list rather than into a field of
+    /// its own: a picker of four hundred models is one you type at.
+    query: String,
+    /// Which of `models` the query leaves, best match first, and which
+    /// letters of each the query matched — for drawing them picked out, as
+    /// the `/` popup picks out its own. Worked out when the query changes
+    /// rather than while drawing, because matching is what the matcher does
+    /// and drawing does not get to borrow it.
+    shown: Vec<(usize, Vec<u32>)>,
+  },
   /// What the `ask` tool put to the user, and the channel the answer goes
   /// back down. The dialog keeps its own cursor, so `Overlay::selected` says
   /// nothing about this one.
@@ -285,29 +303,36 @@ impl Overlay {
   fn points(&self) -> &[Point] {
     match &self.list {
       OverlayList::Tree(points) | OverlayList::Fork(points) => points,
-      OverlayList::Sessions { .. } | OverlayList::Question { .. } => &[],
+      OverlayList::Sessions { .. } | OverlayList::Models { .. } | OverlayList::Question { .. } => &[],
     }
   }
 
   fn len(&self) -> usize {
     match &self.list {
       OverlayList::Sessions { sessions, .. } => sessions.len(),
+      OverlayList::Models { shown, .. } => shown.len(),
       OverlayList::Question { .. } => 0,
       _ => self.points().len(),
     }
   }
 
-  fn title(&self) -> &'static str {
+  fn title(&self) -> String {
     match &self.list {
       // A deletion waiting to be confirmed says so where the keys are said,
       // since the keys it is waiting for are not the usual ones.
-      OverlayList::Sessions { confirming: true, .. } => " Delete session? — Del confirm · Esc cancel ",
-      OverlayList::Sessions { .. } => " Resume session — ↑↓ select · Enter resume · Del delete · Esc cancel ",
-      OverlayList::Tree(_) => " Tree — ↑↓ PgUp/PgDn select · Enter go there · Esc cancel ",
-      OverlayList::Fork(_) => " Fork — ↑↓ PgUp/PgDn select · Enter fork · Esc cancel ",
+      OverlayList::Sessions { confirming: true, .. } => " Delete session? — Del confirm · Esc cancel ".into(),
+      OverlayList::Sessions { .. } => " Resume session — ↑↓ select · Enter resume · Del delete · Esc cancel ".into(),
+      OverlayList::Tree(_) => " Tree — ↑↓ PgUp/PgDn select · Enter go there · Esc cancel ".into(),
+      OverlayList::Fork(_) => " Fork — ↑↓ PgUp/PgDn select · Enter fork · Esc cancel ".into(),
+      // The filter is drawn where the title is, since that is where the list
+      // says what it is a list of — and with a query it is a list of that.
+      OverlayList::Models { query, .. } => match query.is_empty() {
+        true => " Model — type to filter · ↑↓ select · Enter use · Esc cancel ".into(),
+        false => format!(" Model: {query}▏ — ↑↓ select · Enter use · Esc cancel "),
+      },
       // The dialog says which keys do what along its own bottom, where the
       // answer to that changes with the question.
-      OverlayList::Question { .. } => " The model is asking ",
+      OverlayList::Question { .. } => " The model is asking ".into(),
     }
   }
 
@@ -467,11 +492,24 @@ impl Prompts {
 
 pub struct App {
   agents: Agents,
-  settings: Settings,
+  /// What the session runs on, model included — the one copy of it, so that
+  /// `/model` rebuilding the agents and the footer drawing what they are
+  /// cannot come apart.
+  cfg: agent::Config,
+  /// `--context-window` as it was given, which outranks anything a provider
+  /// says about a model. `None` leaves the window to the provider, and to
+  /// the default when it reports none.
+  context_window: Option<u64>,
+  /// What the provider last said it offers, for `/model` to list. Empty
+  /// until the answer arrives, or when it never does.
+  models: Vec<ModelInfo>,
+  /// Whether a fetch of that list is on its way. Every one of them was asked
+  /// for by somebody wanting to pick from it, so its arrival is what opens
+  /// the picker.
+  listing: bool,
   scrollbar: ScrollbarMode,
   /// When the transcript was last scrolled, for the `auto` scrollbar.
   last_scroll: Option<Instant>,
-  model: String,
   cwd: PathBuf,
   store: Option<Store>,
   /// How many MCP servers came up, and how many tools they brought, for the
@@ -493,8 +531,6 @@ pub struct App {
   /// The `@path` tokens standing in the input box, resolved as they are
   /// typed so the box can say what it found before Enter is pressed.
   attachments: Vec<Token>,
-  /// Whether the model takes images at all.
-  vision: bool,
   /// What `Up` and `Down` walk back through from the input box.
   prompts: Prompts,
   tx: mpsc::UnboundedSender<AgentEvent>,
@@ -552,18 +588,16 @@ pub struct App {
 }
 
 impl App {
-  pub fn new(agents: Agents, tx: mpsc::UnboundedSender<AgentEvent>, options: Options) -> Self {
+  pub fn new(agents: Agents, cfg: agent::Config, tx: mpsc::UnboundedSender<AgentEvent>, options: Options) -> Self {
     let Options {
-      model,
       cwd,
-      settings,
+      context_window,
       scrollbar,
       store,
       start,
       notes,
       mcp,
       bell,
-      vision,
     } = options;
     let mut input = TextArea::default();
     input.set_cursor_line_style(Style::default());
@@ -576,13 +610,15 @@ impl App {
     // terminals ignore and others render as the text colour proper.
     input.set_placeholder_style(Style::default().fg(Color::DarkGray));
     input.set_wrap_mode(WrapMode::WordOrGlyph);
-    let session = Session::new(store.as_ref(), &cwd, &model);
+    let session = Session::new(store.as_ref(), &cwd, &model_label(&cfg));
     let mut app = Self {
       agents,
-      settings,
+      cfg,
+      context_window,
+      models: Vec::new(),
+      listing: false,
       scrollbar,
       last_scroll: None,
-      model,
       mcp,
       bell,
       cwd,
@@ -596,7 +632,6 @@ impl App {
       entries: Vec::new(),
       input,
       attachments: Vec::new(),
-      vision,
       prompts: Prompts::default(),
       tx,
       run: None,
@@ -1072,6 +1107,12 @@ impl App {
     if !ctrl && self.handle_delete_key(code) {
       return;
     }
+    // The model picker is typed at, so letters narrow it rather than meaning
+    // what a letter means in the other lists — `q` closes those, and is the
+    // start of a model name here.
+    if !ctrl && self.handle_filter_key(code) {
+      return;
+    }
     match code {
       KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
       KeyCode::Char('c') if ctrl => self.quit = true,
@@ -1118,11 +1159,48 @@ impl App {
           }
           OverlayList::Tree(mut points) if selected < points.len() => self.go_to(points.remove(selected)),
           OverlayList::Fork(mut points) if selected < points.len() => self.fork_to(points.remove(selected)),
+          // The row taken is the one the filter left there, which is an
+          // index into the whole list rather than a place in it.
+          OverlayList::Models { models, shown, .. } => {
+            if let Some(model) = shown.get(selected).and_then(|(at, _)| models.get(*at)) {
+              self.set_model(model.id.clone());
+            }
+          }
           _ => {}
         }
       }
       _ => {}
     }
+  }
+
+  /// A key typed at the model picker's filter, answering whether it was one.
+  ///
+  /// Only letters and `Backspace`: there is no cursor in the query, because
+  /// the arrows belong to the list under it — which is what is being looked
+  /// for, and the thing worth steering.
+  fn handle_filter_key(&mut self, code: KeyCode) -> bool {
+    // Taken as two borrows of two fields rather than through a method, so
+    // the matcher is free while the overlay is held.
+    let Some(Overlay { list, selected }) = &mut self.overlay else {
+      return false;
+    };
+    let OverlayList::Models { models, query, shown } = list else {
+      return false;
+    };
+    match code {
+      KeyCode::Char(c) => query.push(c),
+      KeyCode::Backspace if !query.is_empty() => {
+        query.pop();
+      }
+      // An empty query has nothing to delete, so `Backspace` is not a key
+      // this list answers to and the overlay's own handling gets it.
+      _ => return false,
+    }
+    *shown = filter_models(&mut self.matcher, models, query);
+    // The best match is the one wanted, and the rows under it have been
+    // reordered anyway — a cursor left where it stood would mean nothing.
+    *selected = 0;
+    true
   }
 
   /// The keys that delete a session from the picker, answering whether this
@@ -1414,7 +1492,11 @@ impl App {
     // run works through the queue ahead of it.
     let prompt = self.attach(&text);
 
-    if self.run.is_some() && !matches!(text.as_str(), "/quit" | "/new") {
+    // What a run makes of what is typed at it is a message, which is what
+    // was meant by all but these: they were typed at fa, and are answered
+    // here whether or not a run has the floor.
+    let for_us = matches!(text.as_str(), "/quit" | "/new" | "/model") || text.starts_with("/model ");
+    if self.run.is_some() && !for_us {
       // Handed to the run, which reads it at the top of its next turn
       // rather than after the whole answer. It is kept there and nowhere
       // else, so whoever gets to it first is the only one who can.
@@ -1427,7 +1509,7 @@ impl App {
   /// Load the images the prompt's `@tokens` name, saying in the transcript
   /// what could not be sent and why.
   fn attach(&mut self, text: &str) -> Prompt {
-    let (prompt, notes) = attach_images(text, &self.cwd, self.vision);
+    let (prompt, notes) = attach_images(text, &self.cwd, self.cfg.vision);
     self.entries.extend(notes.into_iter().map(Entry::Info));
     prompt
   }
@@ -1459,6 +1541,16 @@ impl App {
         }
       }
       "/session" => self.session_info(),
+      t if t == "/model" || t.starts_with("/model ") => {
+        let named = t["/model".len()..].trim().to_string();
+        match named.is_empty() {
+          true => self.open_models(),
+          // A model named here is used whether or not the provider listed
+          // it: the list is what the provider admits to, not the whole of
+          // what it will answer to.
+          false => self.set_model(named),
+        }
+      }
       t if t == "/name" || t.starts_with("/name ") => {
         let name = t["/name".len()..].trim();
         if name.is_empty() {
@@ -1475,6 +1567,147 @@ impl App {
       }
       _ => self.start(prompt),
     }
+  }
+
+  // -------------------------------------------------------------- models
+
+  /// Ask the provider what it offers, in the background: the answer comes
+  /// back as an `AgentEvent`, like everything else the UI waits on, and
+  /// opens the picker when it does.
+  fn list_models(&mut self) {
+    // One is already on its way, and it is the same list: `/model` pressed
+    // while a session that came up without a model is still waiting for it
+    // is answered by the request already out.
+    if self.listing {
+      return;
+    }
+    self.listing = true;
+    let cfg = self.cfg.clone();
+    let tx = self.tx.clone();
+    tokio::spawn(async move {
+      // An endpoint that takes the request and never answers it would
+      // otherwise leave this session waiting on a list forever, with
+      // `/model` waiting behind it for the same one.
+      let models = match tokio::time::timeout(LISTING_TIMEOUT, agent::list_models(&cfg)).await {
+        Ok(models) => models.map_err(|err| format!("{err:#}")),
+        Err(_) => Err(format!(
+          "{} did not answer for its models within {} seconds",
+          cfg.provider.label(),
+          LISTING_TIMEOUT.as_secs()
+        )),
+      };
+      let _ = tx.send(AgentEvent::Models(models));
+    });
+  }
+
+  /// What the fetch came back with.
+  fn take_models(&mut self, models: Result<Vec<ModelInfo>, String>) {
+    self.listing = false;
+    let models = match models {
+      Ok(models) => models,
+      Err(err) => {
+        self.entries.push(Entry::Error(err));
+        return;
+      }
+    };
+    self.models = models;
+    // The provider has just said what the model in use holds, which is where
+    // its context window comes from — so a session that opened `/model` and
+    // thought better of it still leaves knowing how big its own model is.
+    // Not while a run is going: it reads the window it was built with, and
+    // is not to be rebuilt underneath it.
+    if self.run.is_none() {
+      self.set_model(self.cfg.model.clone());
+    }
+    self.show_models();
+  }
+
+  /// `/model` with nothing after it: ask the provider what it has, and pick
+  /// from the answer.
+  ///
+  /// Asked every time rather than kept: a list fetched when it is wanted is
+  /// one that cannot be out of date, and a provider that has gained a model
+  /// since fa started has it here without being asked twice.
+  fn open_models(&mut self) {
+    if self.run.is_some() {
+      self.entries.push(Entry::Info(
+        "Finish or abort the current run before changing model.".into(),
+      ));
+      return;
+    }
+    self
+      .entries
+      .push(Entry::Info("Asking the provider for its models…".into()));
+    self.list_models();
+  }
+
+  /// Open the picker on the list as it stands, at the model in use.
+  fn show_models(&mut self) {
+    if self.models.is_empty() {
+      self.entries.push(Entry::Info(
+        "The provider offered no models — name one with /model <id>.".into(),
+      ));
+      return;
+    }
+    let selected = self
+      .models
+      .iter()
+      .position(|model| model.id == self.cfg.model)
+      .unwrap_or(0);
+    self.overlay = Some(Overlay {
+      list: OverlayList::Models {
+        // Nothing typed yet, so every model is shown, in the order they were
+        // listed in, with nothing picked out in any of them.
+        shown: (0..self.models.len()).map(|at| (at, Vec::new())).collect(),
+        models: self.models.clone(),
+        query: String::new(),
+      },
+      selected,
+    });
+  }
+
+  /// Point the session at `id` and rebuild the agents around it.
+  ///
+  /// The window it is held to is the one `--context-window` named, or the one
+  /// the provider reports for this model, or the fallback — in that order, so
+  /// a figure the user gave stands whatever is chosen afterwards.
+  ///
+  /// A model named rather than picked is used whether or not the provider
+  /// listed it: the list is what the provider admits to, not the whole of
+  /// what it answers to.
+  fn set_model(&mut self, id: String) {
+    let reported = self
+      .models
+      .iter()
+      .find(|model| model.id == id)
+      .and_then(|model| model.context_length);
+    let window = self.context_window.or(reported).unwrap_or(DEFAULT_CONTEXT_WINDOW);
+    // Nothing to do, and nothing to say: this is the model already in use,
+    // held to the window it is already held to.
+    if self.cfg.model == id && self.cfg.compaction.context_window == window {
+      return;
+    }
+    if self.run.is_some() {
+      self.entries.push(Entry::Info(
+        "Finish or abort the current run before changing model.".into(),
+      ));
+      return;
+    }
+    let mut cfg = self.cfg.clone();
+    cfg.model = id.clone();
+    cfg.compaction.context_window = window;
+    // The runtime carries a copy of both, so the model and the window it is
+    // compacted at only take effect once it has been built again.
+    if let Err(err) = self.agents.use_model(&cfg) {
+      self.entries.push(Entry::Error(format!("Could not use {id}: {err:#}")));
+      return;
+    }
+    self.cfg = cfg;
+    let result = self.session.set_model(&model_label(&self.cfg));
+    self.report(result);
+    self
+      .entries
+      .push(Entry::Info(format!("Model {id}, context window {window} tokens.")));
   }
 
   // ------------------------------------------------------------ sessions
@@ -1500,7 +1733,7 @@ impl App {
 
   fn new_session(&mut self) {
     self.abort();
-    self.session = Session::new(self.store.as_ref(), &self.cwd, &self.model);
+    self.session = Session::new(self.store.as_ref(), &self.cwd, &model_label(&self.cfg));
     self.entries.clear();
     self.prompts = Prompts::default();
     self.reset_conversation();
@@ -1690,7 +1923,7 @@ impl App {
     self.run = Some(start_compaction(
       self.agents.summarizer.clone(),
       self.session.history.clone(),
-      self.settings,
+      self.cfg.compaction,
       self.tx.clone(),
     ));
   }
@@ -1810,6 +2043,12 @@ impl App {
   // ------------------------------------------------------------ agent events
 
   fn handle_agent(&mut self, ev: AgentEvent) {
+    // Nothing to do with a run: the list was asked for by the UI, and comes
+    // back whether or not the model is busy.
+    if let AgentEvent::Models(models) = ev {
+      self.take_models(models);
+      return;
+    }
     if self.run.is_none() {
       return; // stale event from an aborted run
     }
@@ -1991,6 +2230,9 @@ impl App {
         }
         self.next_queued();
       }
+      // Answered above, before a run was looked for: the list is the UI's
+      // own errand and arrives whether or not one is going.
+      AgentEvent::Models(_) => {}
     }
   }
 
@@ -2114,7 +2356,7 @@ impl App {
 
   /// What the input box's `@tokens` resolved to, for the bottom border.
   fn attachment_strip(&self, width: u16) -> Option<Line<'static>> {
-    attachment_strip(&self.attachments, self.vision, width)
+    attachment_strip(&self.attachments, self.cfg.vision, width)
   }
 
   fn draw_completion(&self, f: &mut Frame, area: Rect) {
@@ -2217,6 +2459,18 @@ impl App {
       );
       return;
     }
+    // A filter that has narrowed the list to nothing says so, rather than
+    // leaving an empty box to be read as a provider with no models.
+    if let OverlayList::Models { shown, .. } = &overlay.list
+      && shown.is_empty()
+    {
+      let line = Line::from(Span::styled(
+        "  No model matches.",
+        Style::default().add_modifier(Modifier::DIM),
+      ));
+      f.render_widget(Paragraph::new(line), inner);
+      return;
+    }
     // The window ends at the selection, so moving down walks off the bottom
     // rather than jumping the list around.
     let first = overlay.selected.saturating_sub(height.saturating_sub(1));
@@ -2258,8 +2512,30 @@ impl App {
         .iter()
         .map(|p| (p.label.clone(), format!("keeps {}", messages(p.len))))
         .collect(),
+      // The window on the right where a session says its size: it is the
+      // one thing about a model worth choosing between, and most providers
+      // do not report it at all.
+      OverlayList::Models { models, shown, .. } => shown
+        .iter()
+        .filter_map(|(at, _)| models.get(*at))
+        .map(|model| {
+          let note = match (&model.name, model.context_length) {
+            (_, Some(window)) => format!("{} ctx", window_label(window)),
+            (Some(name), None) => name.clone(),
+            (None, None) => String::new(),
+          };
+          let here = self.cfg.model == model.id;
+          (format!("{}{}", model.id, if here { "  (in use)" } else { "" }), note)
+        })
+        .collect(),
       // Drawn above, where it draws itself.
       OverlayList::Question { .. } => Vec::new(),
+    };
+    // Only a filtered list has letters to pick out, and only the ones the
+    // filter matched — the same cyan the `/` popup underlines its own with.
+    let matched: &[(usize, Vec<u32>)] = match &overlay.list {
+      OverlayList::Models { shown, .. } => shown,
+      _ => &[],
     };
     let dim = Style::default().add_modifier(Modifier::DIM);
     let mut lines = Vec::new();
@@ -2268,22 +2544,28 @@ impl App {
       let avail = width.saturating_sub(2 + note.chars().count() + 2);
       let title: String = title.chars().take(avail).collect();
       let pad = width.saturating_sub(2 + title.chars().count() + note.chars().count());
-      lines.push(Line::from(vec![
-        Span::styled(
-          if selected { "› " } else { "  " },
-          Style::default().fg(Color::Cyan).bold(),
-        ),
-        Span::styled(
-          title,
-          if selected {
-            Style::default().bold()
-          } else {
-            Style::default()
-          },
-        ),
-        Span::raw(" ".repeat(pad)),
-        Span::styled(note, dim),
-      ]));
+      let base = match selected {
+        true => Style::default().bold(),
+        false => Style::default(),
+      };
+      let hit = base.fg(Color::Cyan).underlined();
+      let highlights = matched.get(i).map(|(_, hits)| hits.as_slice()).unwrap_or(&[]);
+      let mut spans = vec![Span::styled(
+        if selected { "› " } else { "  " },
+        Style::default().fg(Color::Cyan).bold(),
+      )];
+      // One span a letter only where there are letters to pick out: every
+      // other list is one span, as it was before there was a filter.
+      match highlights.is_empty() {
+        true => spans.push(Span::styled(title, base)),
+        false => spans.extend(title.chars().enumerate().map(|(at, ch)| {
+          let style = if highlights.contains(&(at as u32)) { hit } else { base };
+          Span::styled(ch.to_string(), style)
+        })),
+      }
+      spans.push(Span::raw(" ".repeat(pad)));
+      spans.push(Span::styled(note, dim));
+      lines.push(Line::from(spans));
     }
     f.render_widget(Paragraph::new(lines), inner);
   }
@@ -2293,7 +2575,7 @@ impl App {
     let mut left = vec![
       Span::raw(cwd).dim(),
       Span::raw("  "),
-      Span::raw(self.model.clone()).dim(),
+      Span::raw(model_label(&self.cfg)).dim(),
     ];
     if let Some(label) = mcp_label(self.mcp.0, self.mcp.1) {
       left.push(Span::raw("  "));
@@ -2314,7 +2596,7 @@ impl App {
     }
     let context = self
       .context_tokens
-      .and_then(|tokens| (tokens * 100).checked_div(self.settings.context_window))
+      .and_then(|tokens| (tokens * 100).checked_div(self.cfg.compaction.context_window))
       .map(|pct| (format!("ctx {pct}%  "), pct));
     let tokens = format!("{}↑ {}↓", self.usage.input_tokens, self.usage.output_tokens);
     let width = context.as_ref().map_or(0, |(text, _)| text.chars().count()) + tokens.chars().count();
@@ -2794,6 +3076,35 @@ fn key(item: &Match) -> String {
     Match::Command { index, .. } => COMMANDS[*index].0.to_string(),
     Match::Path { insert, .. } => insert.clone(),
   }
+}
+
+/// Which models `query` leaves, best match first: each as its index into
+/// `models` and the letters of its id the query matched.
+///
+/// The same fuzzy match the `/` popup is filtered by, over ids alone: a
+/// provider's display name is another spelling of the same thing, and
+/// matching both would rank a model twice for looking like itself.
+fn filter_models(matcher: &mut Matcher, models: &[ModelInfo], query: &str) -> Vec<(usize, Vec<u32>)> {
+  if query.is_empty() {
+    return (0..models.len()).map(|at| (at, Vec::new())).collect();
+  }
+  let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
+  let mut buf = Vec::new();
+  let mut scored: Vec<(u32, usize, Vec<u32>)> = models
+    .iter()
+    .enumerate()
+    .filter_map(|(at, model)| {
+      let mut highlights = Vec::new();
+      let score = pattern.indices(Utf32Str::new(&model.id, &mut buf), matcher, &mut highlights)?;
+      highlights.sort_unstable();
+      highlights.dedup();
+      Some((score, at, highlights))
+    })
+    .collect();
+  // Ties keep the order the list was in, which is the order it was sorted
+  // into: a query matching a whole family of models lists them as a family.
+  scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+  scored.into_iter().map(|(_, at, hits)| (at, hits)).collect()
 }
 
 fn filter_commands(matcher: &mut Matcher, query: &str) -> Vec<Match> {
@@ -3639,6 +3950,22 @@ fn messages(n: usize) -> String {
   }
 }
 
+/// A context window as a picker row says it: round, because the figures are
+/// round and the column they are drawn in is narrow.
+fn window_label(tokens: u64) -> String {
+  match tokens {
+    0..1_000 => tokens.to_string(),
+    1_000..1_000_000 => format!("{}K", tokens / 1_000),
+    _ => format!("{:.1}M", tokens as f64 / 1_000_000.0),
+  }
+}
+
+/// What a session runs on, as the footer and the session file spell it: the
+/// provider, and the model it is pointed at now.
+fn model_label(cfg: &agent::Config) -> String {
+  format!("{}/{}", cfg.provider.label(), cfg.model)
+}
+
 /// What the footer says about this session's MCP servers, or nothing at all
 /// when it has none: a session that never asked for a server should not be
 /// told it has no servers.
@@ -4000,6 +4327,37 @@ mod tests {
     assert_eq!(colour(90), Some(Color::Red));
     // A request bigger than the window at all is as red as it gets.
     assert_eq!(colour(400), Some(Color::Red));
+  }
+
+  #[test]
+  fn the_model_filter_is_fuzzy_and_keeps_a_family_together() {
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let models: Vec<ModelInfo> = ["gpt-5.2", "claude-sonnet-5", "claude-haiku-4-5"]
+      .iter()
+      .map(|id| ModelInfo {
+        id: (*id).to_string(),
+        name: None,
+        context_length: None,
+      })
+      .collect();
+    let mut ids = |query| {
+      filter_models(&mut matcher, &models, query)
+        .into_iter()
+        .map(|(at, _)| models[at].id.as_str())
+        .collect::<Vec<_>>()
+    };
+    // Nothing typed leaves the list as the provider gave it.
+    assert_eq!(ids(""), ["gpt-5.2", "claude-sonnet-5", "claude-haiku-4-5"]);
+    // Fuzzy: letters in order, not contiguous.
+    assert_eq!(ids("snt"), ["claude-sonnet-5"]);
+    // Everything one prefix matches, still in the order it was listed in.
+    assert_eq!(ids("claude"), ["claude-sonnet-5", "claude-haiku-4-5"]);
+    assert!(ids("zzz").is_empty());
+    // And the letters it matched are picked out where they are: s-o-n-net.
+    let matched = filter_models(&mut matcher, &models, "son");
+    assert_eq!(matched[0].1, [7, 8, 9]);
+    // Nothing typed, nothing picked out.
+    assert!(filter_models(&mut matcher, &models, "")[0].1.is_empty());
   }
 
   #[test]

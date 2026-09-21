@@ -20,6 +20,10 @@ pub struct Settings {
   pub turn_summary: bool,
 }
 
+/// The window a model is held to when nothing says otherwise: neither
+/// `--context-window` nor the provider, which mostly does not report one.
+pub const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
+
 #[derive(Debug)]
 pub struct Compacted {
   pub history: Vec<Message>,

@@ -60,6 +60,9 @@ enum Record {
   Leaf { id: Option<String> },
   /// The user named the session.
   Name { name: String },
+  /// The session changed model part-way through. The header keeps the one it
+  /// opened on, so what it ran on last is written where it happened.
+  Model { model: String },
 }
 
 /// How a tool result went, which its transcript does not record.
@@ -237,7 +240,8 @@ fn read_info(path: &Path) -> Result<SessionInfo> {
       }
       Record::Leaf { id } => leaf = id,
       Record::Name { name } => info.name = Some(name),
-      Record::Header { .. } => {}
+      // Neither says anything the picker shows.
+      Record::Header { .. } | Record::Model { .. } => {}
     }
   }
   let mut at = leaf;
@@ -478,6 +482,10 @@ impl Session {
           session.name = Some(name);
           continue;
         }
+        Record::Model { model } => {
+          session.model = model;
+          continue;
+        }
         Record::Header { .. } => continue,
       };
       session.remember(&id);
@@ -707,6 +715,25 @@ impl Session {
       forked.append(history)?;
     }
     Ok(forked)
+  }
+
+  /// Record that the conversation carries on against another model.
+  ///
+  /// Nothing already said is touched: what the file is for is saying what
+  /// happened, and a model chosen mid-session is something that happened.
+  pub fn set_model(&mut self, model: &str) -> Result<()> {
+    if self.model == model {
+      return Ok(());
+    }
+    self.model = model.to_string();
+    // Before the first record there is no file, and no header to disagree
+    // with: the one written when the file opens says this model already.
+    match self.file.is_some() {
+      true => self.write_all(&[Record::Model {
+        model: model.to_string(),
+      }]),
+      false => Ok(()),
+    }
   }
 
   pub fn rename(&mut self, name: &str) -> Result<()> {
