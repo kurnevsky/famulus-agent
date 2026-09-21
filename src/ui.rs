@@ -377,6 +377,10 @@ enum Entry {
     /// sentence, and the file it wrote is worth more than the sentence — so
     /// the transcript takes it from the asking, where it already is.
     wrote: Option<String>,
+    /// The file an `edit` changed, which is what says how to read the diff it
+    /// leaves behind. The summary says it too, but with the edit count after
+    /// it; this is the path on its own.
+    edited: Option<String>,
     started: Instant,
   },
   ToolResult {
@@ -2081,6 +2085,7 @@ impl App {
         let summary = summarize_args(&name, &args);
         self.entries.push(Entry::ToolCall {
           wrote: wrote_content(&name, &args),
+          edited: edited_path(&name, &args),
           name,
           summary,
           call,
@@ -2731,7 +2736,11 @@ impl App {
               let content = content.strip_suffix('\n').unwrap_or(content);
               (file_lines(path, content), TOOL_OUTPUT_LINES, false)
             }
-            (None, Some(diff)) => (marked_lines(diff, true), DIFF_LINES, false),
+            (None, Some(diff)) => (
+              diff_lines(edited_by(&self.entries[..at], call), diff),
+              DIFF_LINES,
+              false,
+            ),
             // Structure a tool answered with is worth reading as structure.
             (None, None) => match structured(name, output) {
               Some(lines) => (lines, TOOL_OUTPUT_LINES, false),
@@ -2834,26 +2843,26 @@ impl App {
         // Every line of every other block, each carrying the mark it is
         // drawn under: a replacement says which half it is, and anything
         // else says nothing, since the gutter is already saying it.
-        _ => blocks
-          .iter()
-          .flat_map(|(mark, text)| {
-            let prefix = match *mark {
-              "│" => String::new(),
-              mark => format!("{mark} "),
-            };
-            // Split rather than `lines`, so a body ending in a newline keeps
-            // the empty line the model is about to write into.
-            text
-              .split('\n')
-              .map(|line| {
-                vec![Span::styled(
-                  format!(" {prefix}{line}"),
-                  mark_style(mark.chars().next()),
-                )]
-              })
-              .collect::<Vec<_>>()
-          })
-          .collect(),
+        //
+        // An edit's halves are lines of the file it names, so they are
+        // coloured like it — the same colours the diff they become is drawn
+        // in, which is what keeps the call from recolouring as it lands.
+        _ => {
+          let path = (writing.name == "edit")
+            .then(|| writing_path(&writing.args))
+            .flatten()
+            .unwrap_or_default();
+          blocks
+            .iter()
+            .flat_map(|(mark, text)| {
+              let prefix = match *mark {
+                "│" => String::new(),
+                mark => format!("{mark} "),
+              };
+              marked_code(&prefix, mark_style(mark.chars().next()), language_of(&path), text)
+            })
+            .collect()
+        }
       };
       // Drawn and highlighted as it is typed, so nothing moves or recolours
       // under the reader when the call is finally made.
@@ -3166,6 +3175,25 @@ fn wrote_content(name: &str, args: &serde_json::Value) -> Option<String> {
     .flatten()
 }
 
+/// The file an `edit` was asked to change, from the asking.
+fn edited_path(name: &str, args: &serde_json::Value) -> Option<String> {
+  (name == "edit")
+    .then(|| args.get("path")?.as_str().map(str::to_string))
+    .flatten()
+}
+
+/// The file an edit changed, from the call that asked for it.
+fn edited_by<'a>(entries: &'a [Entry], call: &str) -> Option<&'a str> {
+  entries.iter().rev().find_map(|entry| match entry {
+    Entry::ToolCall {
+      call: at,
+      edited: Some(path),
+      ..
+    } if at == call => Some(path.as_str()),
+    _ => None,
+  })
+}
+
 /// The file a write put down, and the name that says how to read it, from the
 /// call that asked for it.
 fn wrote_by<'a>(entries: &'a [Entry], call: &str) -> Option<(&'a str, &'a str)> {
@@ -3186,11 +3214,17 @@ fn wrote_by<'a>(entries: &'a [Entry], call: &str) -> Option<(&'a str, &'a str)> 
 /// A write is not a change to be marked up — it is the file, so it is shown
 /// as the file, with none of a diff's pluses and none of its green.
 fn file_lines(path: &str, content: &str) -> Vec<Vec<Span<'static>>> {
-  let language = Path::new(path)
+  code_lines(language_of(path), content)
+}
+
+/// What a file's name says it is written in — its extension, which is all a
+/// transcript ever has to go on, and the empty string when it has not even
+/// that.
+fn language_of(path: &str) -> &str {
+  Path::new(path)
     .extension()
     .and_then(|extension| extension.to_str())
-    .unwrap_or_default();
-  code_lines(language, content)
+    .unwrap_or_default()
 }
 
 /// Lines of code in `language`, highlighted where there is a grammar for it
@@ -3230,6 +3264,140 @@ fn structured(name: &str, output: &str) -> Option<Vec<Vec<Span<'static>>>> {
   }
   let pretty = serde_json::to_string_pretty(&value).ok()?;
   Some(code_lines("json", &pretty))
+}
+
+/// A diff as the transcript shows it: `+12` still says what became of the
+/// line, and the code after it is highlighted as the file it was changed in.
+///
+/// The mark and the number keep the colour they always had, because once the
+/// code carries the grammar's colours they are the only thing left saying what
+/// changed. Context is dimmed over its highlighting, so what the edit did still
+/// comes forward. With no path, no grammar for it, or a diff this cannot take
+/// apart, it falls back to the marked-up text it has always been.
+fn diff_lines(path: Option<&str>, diff: &str) -> Vec<Vec<Span<'static>>> {
+  let Some((language, column)) = path.map(language_of).zip(code_column(diff)) else {
+    return marked_lines(diff, true);
+  };
+  // A line too short to reach that column is all numbering and no code.
+  let split: Vec<(&str, &str)> = diff
+    .lines()
+    .map(|line| line.split_at_checked(column).unwrap_or((line, "")))
+    .collect();
+
+  // Each side of the edit, put back together from the lines that belong to
+  // it: a `-` line is only in the old file and a `+` line only in the new,
+  // and everything around them is in both. Highlighting the two as files is
+  // what a string or a comment running over several lines needs — one line on
+  // its own says nothing about where it started.
+  let (mut old, mut new) = (String::new(), String::new());
+  let mut placed: Vec<Option<(bool, usize)>> = Vec::with_capacity(split.len());
+  let (mut olds, mut news) = (0, 0);
+  for (head, code) in &split {
+    let push = |side: &mut String| {
+      side.push_str(code);
+      side.push('\n');
+    };
+    match head.as_bytes().first() {
+      Some(b'+') => {
+        push(&mut new);
+        placed.push(Some((true, news)));
+        news += 1;
+      }
+      Some(b'-') => {
+        push(&mut old);
+        placed.push(Some((false, olds)));
+        olds += 1;
+      }
+      // The line where context was skipped is numbered by nothing and is part
+      // of neither file.
+      _ if !head.bytes().any(|b| b.is_ascii_digit()) => placed.push(None),
+      _ => {
+        push(&mut old);
+        push(&mut new);
+        olds += 1;
+        placed.push(Some((true, news)));
+        news += 1;
+      }
+    }
+  }
+
+  let (old, new) = (
+    crate::highlight::highlight(language, &old),
+    crate::highlight::highlight(language, &new),
+  );
+  if old.is_none() && new.is_none() {
+    return marked_lines(diff, true);
+  }
+  split
+    .iter()
+    .zip(placed)
+    .map(|((head, code), place)| {
+      let mark = head.chars().next();
+      let style = mark_style(mark);
+      let spans = place
+        .and_then(|(is_new, i)| if is_new { new.as_ref() } else { old.as_ref() }?.get(i))
+        .filter(|spans| !spans.is_empty());
+      let mut row = vec![Span::styled(format!(" {head}"), style)];
+      match spans {
+        // Context is the file as it was and as it stays; dimming it over its
+        // own colours is what keeps the changed lines the ones that read.
+        Some(spans) if mark == Some(' ') => row.extend(
+          spans
+            .iter()
+            .map(|span| Span::styled(span.content.clone(), span.style.add_modifier(Modifier::DIM))),
+        ),
+        Some(spans) => row.extend(spans.iter().cloned()),
+        None => row.push(Span::styled((*code).to_string(), style)),
+      }
+      row
+    })
+    .collect()
+}
+
+/// Lines of `text` drawn under `prefix`, highlighted as `language` where
+/// there is a grammar for it and left in `style` where there is not.
+///
+/// The prefix keeps `style` either way: it is the transcript talking about the
+/// line — the half of an edit it belongs to — not part of the line itself.
+fn marked_code(prefix: &str, style: Style, language: &str, text: &str) -> Vec<Vec<Span<'static>>> {
+  let highlighted = crate::highlight::highlight(language, text);
+  // Split rather than `lines`, so a body ending in a newline keeps the empty
+  // line the model is about to write into.
+  text
+    .split('\n')
+    .enumerate()
+    .map(|(i, line)| {
+      let mut row = vec![Span::styled(format!(" {prefix}"), style)];
+      match highlighted
+        .as_ref()
+        .and_then(|lines| lines.get(i))
+        .filter(|spans| !spans.is_empty())
+      {
+        Some(spans) => row.extend(spans.iter().cloned()),
+        None => row.push(Span::styled(line.to_string(), style)),
+      }
+      row
+    })
+    .collect()
+}
+
+/// The column a diff's own numbering gives way to the code.
+///
+/// Every line is written as a mark, a line number right-aligned to the width
+/// of the longest, and a space — so the column is the same on every line, and
+/// the narrowest number is the one that finds it: code that is itself a number
+/// can only push the guess further right, and the skipped-context line has no
+/// number to go by at all.
+fn code_column(diff: &str) -> Option<usize> {
+  diff
+    .lines()
+    .filter_map(|line| {
+      let number = line.bytes().enumerate().skip(1);
+      let digits = number.take_while(|(_, b)| b.is_ascii_digit() || *b == b' ');
+      let last = digits.filter(|(_, b)| b.is_ascii_digit()).map(|(i, _)| i).last()?;
+      Some(last + 2)
+    })
+    .min()
 }
 
 /// Lines of a tool's own text. A diff says what each line is with its first
@@ -3778,6 +3946,7 @@ fn entries_from_history(session: &Session) -> Vec<Entry> {
             AssistantContent::ToolCall(call) => {
               entries.push(Entry::ToolCall {
                 wrote: wrote_content(&call.function.name, &call.function.arguments),
+                edited: edited_path(&call.function.name, &call.function.arguments),
                 name: call.function.name.clone(),
                 summary: summarize_args(&call.function.name, &call.function.arguments),
                 call: call.id.as_str().to_string(),
@@ -4055,6 +4224,15 @@ fn writing_summary(name: &str, args: &str) -> String {
     _ => return String::new(),
   };
   partial_str(args, key).unwrap_or_default()
+}
+
+/// The file a call is writing into its arguments, as far as it has arrived —
+/// which is what says how to colour the text arriving with it.
+fn writing_path(args: &str) -> Option<String> {
+  match serde_json::from_str::<serde_json::Value>(args) {
+    Ok(value) => value.get("path").and_then(|p| p.as_str()).map(str::to_string),
+    Err(_) => partial_str(args, "path"),
+  }
 }
 
 /// The text a call is carrying in its arguments, as far as it has arrived,
@@ -4865,6 +5043,7 @@ mod tests {
       summary: summary.into(),
       call: call.into(),
       wrote: None,
+      edited: None,
       started: Instant::now(),
     }
   }
@@ -5062,12 +5241,138 @@ mod tests {
         summary: "a.rs".into(),
         call: "c1".into(),
         wrote: Some("fn main() {}".into()),
+        edited: None,
         started: Instant::now(),
       },
       announced("ls", "c2"),
     ];
     assert_eq!(wrote_by(&entries, "c1"), Some(("a.rs", "fn main() {}")));
     assert_eq!(wrote_by(&entries, "c2"), None, "a command wrote no file");
+  }
+
+  #[test]
+  fn only_an_edit_carries_the_file_it_changed() {
+    let args = serde_json::json!({ "path": "a.rs", "edits": [] });
+    assert_eq!(edited_path("edit", &args).as_deref(), Some("a.rs"));
+    assert!(edited_path("write", &args).is_none(), "a write is shown as the file");
+
+    let entries = vec![
+      Entry::ToolCall {
+        name: "edit".into(),
+        summary: "a.rs (1 edit)".into(),
+        call: "c1".into(),
+        wrote: None,
+        edited: Some("a.rs".into()),
+        started: Instant::now(),
+      },
+      announced("ls", "c2"),
+    ];
+    assert_eq!(edited_by(&entries, "c1"), Some("a.rs"));
+    assert_eq!(edited_by(&entries, "c2"), None, "a command changed no file");
+  }
+
+  #[test]
+  fn a_diffs_numbering_ends_where_its_code_begins() {
+    // The width comes from the file's length, and every line is written to
+    // it: mark, number, space.
+    assert_eq!(code_column("    ...\n  4 l4\n- 6 l6"), Some(4));
+    // Code that is a number of its own would put the column further right,
+    // which is why the narrowest line is the one believed.
+    assert_eq!(code_column("+1 42\n 2 x"), Some(3));
+    assert_eq!(code_column("nothing numbered here"), None);
+  }
+
+  #[test]
+  #[cfg(feature = "lang-rust")]
+  fn a_diff_is_highlighted_as_the_file_it_changed() {
+    let diff = " 1 fn main() {\n-2     let x = 1;\n+2     let y = \"hi\";\n 3 }";
+    let lines = diff_lines(Some("src/main.rs"), diff);
+    let spans = |i: usize| -> Vec<(String, Option<Color>, bool)> {
+      lines[i]
+        .iter()
+        .map(|span| {
+          (
+            span.content.to_string(),
+            span.style.fg,
+            span.style.add_modifier.contains(Modifier::DIM),
+          )
+        })
+        .collect()
+    };
+
+    // The mark and its number still say what became of the line.
+    assert_eq!(spans(2)[0], (" +2 ".to_string(), Some(Color::Green), false));
+    assert_eq!(spans(1)[0], (" -2 ".to_string(), Some(Color::Red), false));
+    // The code after them is the file's, in the file's colours.
+    assert!(
+      spans(2).contains(&("let".to_string(), Some(Color::Magenta), false)),
+      "{:?}",
+      spans(2)
+    );
+    assert!(
+      spans(2).contains(&("\"hi\"".to_string(), Some(Color::Green), false)),
+      "a string on the line that was added: {:?}",
+      spans(2)
+    );
+    // The line that was taken out is highlighted from the file as it was,
+    // which is the only place that line still exists.
+    assert!(
+      spans(1).contains(&("1".to_string(), Some(Color::Cyan), false)),
+      "{:?}",
+      spans(1)
+    );
+    // Context keeps its colours but stays out of the way.
+    assert!(
+      spans(0).contains(&("fn".to_string(), Some(Color::Magenta), true)),
+      "{:?}",
+      spans(0)
+    );
+    // Nothing is lost on the way: every line reads as it was written.
+    let text: Vec<String> = lines
+      .iter()
+      .map(|line| line.iter().map(|span| span.content.as_ref()).collect())
+      .collect();
+    assert_eq!(text, diff.lines().map(|line| format!(" {line}")).collect::<Vec<_>>());
+  }
+
+  #[test]
+  #[cfg(feature = "lang-rust")]
+  fn an_edit_is_coloured_the_same_while_it_is_still_being_written() {
+    // The half arriving is drawn in the file's colours, so nothing recolours
+    // under the reader when the call lands and becomes a diff.
+    let lines = marked_code("+ ", mark_style(Some('+')), "rs", "    let x = 1;\n}");
+    let spans: Vec<(String, Option<Color>)> = lines[0]
+      .iter()
+      .map(|span| (span.content.to_string(), span.style.fg))
+      .collect();
+    assert_eq!(spans[0], (" + ".to_string(), Some(Color::Green)));
+    assert!(spans.contains(&("let".to_string(), Some(Color::Magenta))), "{spans:?}");
+    // A file the call has not named yet, or one with no grammar: the text as
+    // it is, under its mark.
+    let plain = painted(&marked_code("- ", mark_style(Some('-')), "", "let x = 1;"));
+    assert_eq!(plain, [(" - let x = 1;".to_string(), vec![Some(Color::Red); 2])]);
+  }
+
+  #[test]
+  fn a_path_is_read_from_arguments_that_are_still_arriving() {
+    assert_eq!(
+      writing_path(r#"{"path":"src/main.rs","edits":[]}"#).as_deref(),
+      Some("src/main.rs")
+    );
+    assert_eq!(
+      writing_path(r#"{"path":"src/main.rs","edits":[{"oldText":"a"#).as_deref(),
+      Some("src/main.rs"),
+      "half an edit still says which file it is in"
+    );
+    assert_eq!(writing_path(r#"{"pat"#), None);
+  }
+
+  #[test]
+  fn a_diff_of_a_file_we_cannot_read_is_marked_up_as_before() {
+    let diff = " 1 hello\n-2 there\n+2 world";
+    let plain = painted(&marked_lines(diff, true));
+    assert_eq!(painted(&diff_lines(Some("notes.txt"), diff)), plain);
+    assert_eq!(painted(&diff_lines(None, diff)), plain, "a call that named no file");
   }
 
   #[test]
