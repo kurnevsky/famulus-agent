@@ -342,6 +342,18 @@ pub enum NodeKind {
   },
 }
 
+/// A chain of entries as a conversation, the checkpoints in it wearing the
+/// summary markers they travel in.
+fn messages(chain: Vec<&Node>) -> Vec<Message> {
+  chain
+    .into_iter()
+    .map(|node| match &node.kind {
+      NodeKind::Message(message) => message.clone(),
+      NodeKind::Checkpoint { summary } => compaction::summary_message(summary),
+    })
+    .collect()
+}
+
 /// The live conversation and, when persistence is on, its file.
 pub struct Session {
   pub id: String,
@@ -477,15 +489,20 @@ impl Session {
 
   /// The entries from the root down to `leaf`, oldest first.
   ///
-  /// A checkpoint ends the walk: it already carries everything above it.
-  fn ancestry(&self, leaf: Option<&str>) -> Vec<&Node> {
+  /// `whole` is what a compaction checkpoint means to the caller. The
+  /// conversation the model is given stops at one, since the checkpoint
+  /// already carries everything above it; the transcript walks past it, because
+  /// what it summarized was on screen when it happened and reopening the
+  /// session should not lose it.
+  fn ancestry(&self, leaf: Option<&str>, whole: bool) -> Vec<&Node> {
     let mut chain = Vec::new();
     let mut at = leaf;
     // A parent link that goes nowhere, or round in a circle, would otherwise
     // loop forever; the file is only as good as what last wrote it.
     while let Some(node) = at.and_then(|id| self.node(id)) {
       chain.push(node);
-      if matches!(node.kind, NodeKind::Checkpoint { .. }) || chain.len() > self.nodes.len() {
+      let stop = !whole && matches!(node.kind, NodeKind::Checkpoint { .. });
+      if stop || chain.len() > self.nodes.len() {
         break;
       }
       at = node.parent.as_deref();
@@ -495,25 +512,36 @@ impl Session {
   }
 
   /// The ids from the root down to `leaf`, oldest first.
-  pub fn lineage(&self, leaf: Option<&str>) -> Vec<&str> {
-    self.ancestry(leaf).iter().map(|node| node.id.as_str()).collect()
+  ///
+  /// `whole` as in `ancestry`: the conversation the model is sent stops at a
+  /// checkpoint, while the path the session is *on* — which is what the tree
+  /// marks and the transcript draws — carries on above it.
+  pub fn lineage(&self, leaf: Option<&str>, whole: bool) -> Vec<&str> {
+    self.ancestry(leaf, whole).iter().map(|node| node.id.as_str()).collect()
   }
 
   /// The conversation ending at `leaf`, as the model is given it.
   pub fn branch(&self, leaf: Option<&str>) -> Vec<Message> {
-    self
-      .ancestry(leaf)
-      .into_iter()
-      .map(|node| match &node.kind {
-        NodeKind::Message(message) => message.clone(),
-        NodeKind::Checkpoint { summary } => compaction::summary_message(summary),
-      })
-      .collect()
+    messages(self.ancestry(leaf, false))
+  }
+
+  /// Everything said on the way down to `leaf`, as it was on screen.
+  ///
+  /// The same walk as `branch`, except that it does not stop at a compaction
+  /// checkpoint: the turns a checkpoint stands for are still in the file, and
+  /// a resumed session shows them above the summary, where they were.
+  pub fn transcript(&self, leaf: Option<&str>) -> Vec<Message> {
+    messages(self.ancestry(leaf, true))
   }
 
   /// How long that conversation is, without building it.
   pub fn branch_len(&self, leaf: Option<&str>) -> usize {
-    self.ancestry(leaf).len()
+    self.ancestry(leaf, false).len()
+  }
+
+  /// The same for the transcript, which a compaction leaves longer.
+  pub fn transcript_len(&self, leaf: Option<&str>) -> usize {
+    self.ancestry(leaf, true).len()
   }
 
   /// A fresh id, past anything the file already holds.
@@ -709,7 +737,11 @@ mod tests {
 
   /// The ids of the branch the session is on, oldest first.
   fn ids(session: &Session) -> Vec<String> {
-    session.lineage(session.leaf()).iter().map(|s| s.to_string()).collect()
+    session
+      .lineage(session.leaf(), false)
+      .iter()
+      .map(|s| s.to_string())
+      .collect()
   }
 
   fn temp_store(name: &str) -> Store {
@@ -838,6 +870,32 @@ mod tests {
     std::fs::remove_dir_all(&store.dir).unwrap();
   }
 
+  #[test]
+  fn the_transcript_keeps_what_the_checkpoint_stands_for() {
+    let store = temp_store("transcript");
+    let mut session = Session::new(Some(&store), Path::new("/work"), "mock");
+    let old = vec![Message::user("old"), Message::assistant("older")];
+    session.append(old.clone()).unwrap();
+    let kept = vec![compaction::summary_message("summary"), Message::user("second")];
+    session.compacted(kept.clone(), "summary").unwrap();
+
+    // The model is given the summary in place of the turns above it. The
+    // transcript is given both: they were on screen when the compaction
+    // happened, and reopening the session should not lose them.
+    assert_eq!(session.branch(session.leaf()), kept);
+    assert_eq!(session.branch_len(session.leaf()), 2);
+    let whole: Vec<Message> = old.into_iter().chain(kept).collect();
+    assert_eq!(session.transcript(session.leaf()), whole);
+    assert_eq!(session.transcript_len(session.leaf()), 4);
+
+    // Which is what the file is for: it says as much when reopened.
+    let path = session.path().unwrap().to_path_buf();
+    let loaded = Session::load(&path).unwrap();
+    assert_eq!(loaded.history, session.history);
+    assert_eq!(loaded.transcript(loaded.leaf()), whole);
+    std::fs::remove_dir_all(&store.dir).unwrap();
+  }
+
   /// A tool result message, as a turn that ran `bash` would leave behind.
   fn tool_result(call: &str, output: &str) -> Message {
     use rig_core::message::ToolResultContent;
@@ -920,7 +978,7 @@ mod tests {
     assert_eq!(forked.history, [Message::user("first"), Message::assistant("two")]);
     assert_eq!(forked.nodes().len(), 2, "the path, and nothing beside it");
     // And it starts life as a straight line, with no branch to go back to.
-    assert_eq!(forked.lineage(forked.leaf()).len(), 2);
+    assert_eq!(forked.lineage(forked.leaf(), false).len(), 2);
     std::fs::remove_dir_all(&store.dir).unwrap();
   }
 

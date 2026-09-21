@@ -378,7 +378,9 @@ impl Prompts {
   /// The prompts of a session, in the order it was told them.
   fn of(session: &Session) -> Self {
     let mut prompts = Self::default();
-    for message in &session.history {
+    // Everything on screen, compacted turns included: a prompt from before a
+    // compaction is still one the user can see and ask again.
+    for message in &session.transcript(session.leaf()) {
       if let Some(text) = crate::session::user_text(message) {
         prompts.add(text);
       }
@@ -1036,10 +1038,17 @@ impl App {
         }
         self.entries = entries_from_history(&session);
         let title = session.name.clone().unwrap_or_else(|| session.id.clone());
-        self.entries.push(Entry::Info(format!(
-          "Resumed session {title} ({} messages).",
-          session.history.len()
-        )));
+        // What a compaction summarized is back on screen but not back in the
+        // context, so when the two differ both are worth saying.
+        let shown = session.transcript_len(session.leaf());
+        let context = session.history.len();
+        let counts = match shown > context {
+          true => format!("{shown} messages shown, {context} in context"),
+          false => messages(context),
+        };
+        self
+          .entries
+          .push(Entry::Info(format!("Resumed session {title} ({counts}).")));
         self.session = session;
         // The prompts of the conversation being resumed are the ones Up
         // walks back through in it.
@@ -2583,13 +2592,17 @@ fn call_ids(call: &ToolCall) -> impl Iterator<Item = String> + '_ {
 /// order the provider sent the answers back. Each result is instead put with
 /// the call it answers, which is the order the transcript had while it was
 /// live.
+///
+/// What is drawn is the session's transcript rather than the history the model
+/// is sent: a compaction leaves the turns it summarized on screen, and
+/// reopening the session is no reason to lose them.
 fn entries_from_history(session: &Session) -> Vec<Entry> {
-  let history = &session.history;
+  let history = session.transcript(session.leaf());
   let now = Instant::now();
   let mut entries = Vec::new();
-  let results = Results::collect(history);
+  let results = Results::collect(&history);
   let mut answered: HashSet<usize> = HashSet::new();
-  for message in history {
+  for message in &history {
     match message {
       Message::System { .. } => {}
       Message::User { content } => {
@@ -2729,7 +2742,9 @@ fn points(session: &Session) -> Vec<Point> {
   for node in session.nodes() {
     children.entry(node.parent.as_deref()).or_default().push(node);
   }
-  let here: HashSet<&str> = session.lineage(session.leaf()).into_iter().collect();
+  // The whole path, checkpoints included: a compaction does not stop the
+  // entries above it being the way the conversation came.
+  let here: HashSet<&str> = session.lineage(session.leaf(), true).into_iter().collect();
   let mut out = Vec::new();
   walk(session, &children, &here, None, 0, &mut out);
   out
@@ -3238,7 +3253,7 @@ mod tests {
   #[test]
   fn a_branch_is_indented_under_the_point_it_left_and_the_live_one_comes_first() {
     let mut session = session_of(vec![Message::user("first"), Message::assistant("one")]);
-    let prompt = session.lineage(session.leaf())[0].to_string();
+    let prompt = session.lineage(session.leaf(), false)[0].to_string();
     // Go back under the prompt and answer differently, which forks the tree.
     session.go_to(Some(prompt)).unwrap();
     session.append(vec![Message::assistant("two")]).unwrap();
@@ -3827,7 +3842,7 @@ mod tests {
       Message::user("second"),
       Message::assistant("two"),
     ]);
-    let answered = session.lineage(session.leaf())[1].to_string();
+    let answered = session.lineage(session.leaf(), false)[1].to_string();
     session.go_to(Some(answered)).unwrap();
 
     // The rest of the conversation is still listed, and still somewhere to

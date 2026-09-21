@@ -1108,6 +1108,20 @@ fn up_walks_back_through_the_prompts_and_a_resumed_session_brings_its_own() {
   assert_eq!(term.typed(), "pear", "the resumed session's last prompt");
 }
 
+/// Which row of an overlay says `needle`.
+fn row_at(rows: &[String], needle: &str) -> usize {
+  rows
+    .iter()
+    .position(|row| row.contains(needle))
+    .unwrap_or_else(|| panic!("a row saying {needle:?}: {rows:?}"))
+}
+
+/// How far that row is indented, which is what the tree draws its shape with.
+fn indent_of(rows: &[String], needle: &str) -> usize {
+  let row = &rows[row_at(rows, needle)];
+  row[..row.find(needle).expect("the row")].chars().count()
+}
+
 #[test]
 fn going_back_leaves_a_branch_that_can_be_walked_into_again() {
   if !have_tmux() {
@@ -1140,19 +1154,13 @@ fn going_back_leaves_a_branch_that_can_be_walked_into_again() {
   term.submit("/tree");
   term.wait_for("Esc cancel");
   let (rows, _) = term.overlay();
-  let at = |needle: &str| {
-    rows
-      .iter()
-      .position(|row| row.contains(needle))
-      .unwrap_or_else(|| panic!("a row saying {needle:?}: {rows:?}"))
-  };
-  let indent = |needle: &str| {
-    let row = &rows[at(needle)];
-    row[..row.find(needle).expect("the row")].chars().count()
-  };
-  assert!(at("❯ plum") < at("❯ pear"), "the way we are on comes first: {rows:?}");
   assert!(
-    indent("❯ plum") > indent("❯ apple") && indent("❯ pear") > indent("❯ apple"),
+    row_at(&rows, "❯ plum") < row_at(&rows, "❯ pear"),
+    "the way we are on comes first: {rows:?}"
+  );
+  assert!(
+    indent_of(&rows, "❯ plum") > indent_of(&rows, "❯ apple")
+      && indent_of(&rows, "❯ pear") > indent_of(&rows, "❯ apple"),
     "both ways are indented under where they part: {rows:?}"
   );
 
@@ -1173,6 +1181,25 @@ fn going_back_leaves_a_branch_that_can_be_walked_into_again() {
   for said in ["apple", "pear", "plum"] {
     assert!(session.contains(said), "{said:?} kept in the one file");
   }
+
+  // So reopening it brings back the tree and not just the branch it was left
+  // on: every way the conversation went is still a place it can go.
+  let term = term.reopen(&provider, &["-c"]);
+  term.wait_for("Resumed session");
+  term.submit("/tree");
+  term.wait_for("Esc cancel");
+  let (rows, _) = term.overlay();
+  for said in ["❯ apple", "❯ pear", "❯ plum"] {
+    assert!(
+      rows.iter().any(|row| row.contains(said)),
+      "{said:?} is still somewhere to go: {rows:?}"
+    );
+  }
+  assert!(
+    indent_of(&rows, "❯ plum") > indent_of(&rows, "❯ apple")
+      && indent_of(&rows, "❯ pear") > indent_of(&rows, "❯ apple"),
+    "and the shape of the tree came back with it: {rows:?}"
+  );
 }
 
 #[test]
@@ -1359,6 +1386,13 @@ fn a_compacted_session_still_reaches_the_model_as_its_summary_when_reopened() {
   assert!(
     screen.contains("▤ Context summary") && screen.contains("Fruit was discussed."),
     "the checkpoint is drawn as one again:\n{screen}"
+  );
+  // And what it stands for is still above it, as it was on screen when the
+  // compaction happened — the summary is what the model reads, not all the
+  // session has to show.
+  assert!(
+    screen.contains("remember the kumquat") && screen.contains("Answer to remember the kumquat."),
+    "the compacted turns are drawn above the summary:\n{screen}"
   );
 
   term.submit("what now");
