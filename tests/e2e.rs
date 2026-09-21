@@ -427,9 +427,8 @@ impl Term {
     // not a search at all.
     let config = dir.join("config");
     std::fs::create_dir_all(&config).expect("a configuration directory");
+    // The session's name is its socket's too: one server per terminal.
     let name = format!("fa-e2e-{}", uuid_ish());
-    let _ = Command::new("tmux").args(["kill-session", "-t", &name]).output();
-
     let command = format!(
       "cd {} && FA_SESSIONS_DIR={} XDG_CONFIG_HOME={} XDG_CONFIG_DIRS={} {} --base-url {} -m mock {}",
       shell(&dir),
@@ -443,8 +442,9 @@ impl Term {
     // A fixed size, so what wraps where does not depend on the terminal the
     // suite happens to run in. `-f /dev/null` keeps a developer's own tmux
     // configuration out of it.
-    let started = Command::new("tmux")
-      .args([
+    let started = tmux(
+      &name,
+      &[
         "-f",
         "/dev/null",
         "new-session",
@@ -456,10 +456,15 @@ impl Term {
         "-y",
         "30",
         &command,
-      ])
-      .status()
-      .expect("tmux starts");
+      ],
+    )
+    .status()
+    .expect("tmux starts");
     assert!(started.success(), "tmux could not start a session");
+    // Let OSC 52 reach a buffer of this server's, so a test can read back
+    // what was copied. Left alone, tmux passes the escape outwards to a
+    // terminal there is nobody sitting at.
+    let _ = tmux(&name, &["set-option", "-s", "set-clipboard", "on"]).status();
     let term = Self { name, dir };
     // The input box is the last thing drawn, so its border means fa is up.
     term.wait_for("╭");
@@ -467,8 +472,7 @@ impl Term {
   }
 
   fn type_in(&self, keys: &str) {
-    let sent = Command::new("tmux")
-      .args(["send-keys", "-t", &self.name, keys])
+    let sent = tmux(&self.name, &["send-keys", "-t", &self.name, keys])
       .status()
       .expect("tmux sends keys");
     assert!(sent.success(), "tmux could not send keys");
@@ -484,6 +488,72 @@ impl Term {
     }
   }
 
+  /// Hand the program bytes as though the terminal had sent them, which is
+  /// how a mouse report gets in: tmux types keys, and a mouse is not one.
+  fn send_raw(&self, bytes: &str) {
+    let sent = tmux(&self.name, &["send-keys", "-t", &self.name, "-l", bytes])
+      .status()
+      .expect("tmux sends bytes");
+    assert!(sent.success(), "tmux could not send bytes");
+  }
+
+  /// Press the left button on a cell, drag to another, and let go — the SGR
+  /// mouse reports a terminal sends for it, which is what `fa` turns mouse
+  /// capture on to read. Cells are 1-based, as they are on the wire.
+  fn drag(&self, from: (usize, usize), to: (usize, usize)) {
+    self.drag_through(&[from, to]);
+  }
+
+  /// The same, through every cell in turn: what a drag that stops at the edge
+  /// and stays there looks like on the wire.
+  fn drag_through(&self, cells: &[(usize, usize)]) {
+    self.hold_through(cells);
+    self.let_go(cells[cells.len() - 1]);
+  }
+
+  /// Press and drag without letting go, for reading the screen mid-drag —
+  /// which is the only time there is a selection on it to read.
+  fn hold_through(&self, cells: &[(usize, usize)]) {
+    let (col, row) = cells[0];
+    self.send_raw(&format!("\x1b[<0;{col};{row}M"));
+    for (col, row) in &cells[1..] {
+      self.send_raw(&format!("\x1b[<32;{col};{row}M"));
+    }
+    self.settle();
+  }
+
+  fn let_go(&self, (col, row): (usize, usize)) {
+    self.send_raw(&format!("\x1b[<0;{col};{row}m"));
+    self.settle();
+  }
+
+  /// A notch of the wheel, which is a press of a button of its own.
+  fn wheel_up(&self, (col, row): (usize, usize)) {
+    self.send_raw(&format!("\x1b[<64;{col};{row}M"));
+  }
+
+  /// Where `needle` is on screen, as the 1-based cell its first character is
+  /// drawn on.
+  fn cell_of(&self, needle: &str) -> (usize, usize) {
+    let screen = self.screen();
+    screen
+      .lines()
+      .enumerate()
+      .find_map(|(row, line)| {
+        let at = line.find(needle)?;
+        // Columns are cells, and what is before the needle may not be ascii.
+        Some((line[..at].chars().count() + 1, row + 1))
+      })
+      .unwrap_or_else(|| panic!("{needle:?} on screen:\n{screen}"))
+  }
+
+  /// What the program has put on the terminal's clipboard, which for tmux is
+  /// its most recent buffer.
+  fn clipboard(&self) -> String {
+    let out = tmux(&self.name, &["show-buffer"]).output().expect("tmux answers");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+  }
+
   /// The screen as a person would see it.
   fn screen(&self) -> String {
     self.capture(&[])
@@ -495,8 +565,7 @@ impl Term {
   }
 
   fn capture(&self, extra: &[&str]) -> String {
-    let out = Command::new("tmux")
-      .args(["capture-pane", "-p"])
+    let out = tmux(&self.name, &["capture-pane", "-p"])
       .args(extra)
       .args(["-t", &self.name])
       .output()
@@ -568,10 +637,12 @@ impl Term {
   /// keeps the flag for a window nobody is watching, which is the case a bell
   /// is rung for in the first place.
   fn rang(&self) -> bool {
-    let out = Command::new("tmux")
-      .args(["display-message", "-p", "-t", &self.name, "#{window_bell_flag}"])
-      .output()
-      .expect("tmux answers");
+    let out = tmux(
+      &self.name,
+      &["display-message", "-p", "-t", &self.name, "#{window_bell_flag}"],
+    )
+    .output()
+    .expect("tmux answers");
     String::from_utf8_lossy(&out.stdout).trim() == "1"
   }
 
@@ -619,7 +690,7 @@ impl Term {
 
 impl Term {
   fn kill(&self) {
-    let _ = Command::new("tmux").args(["kill-session", "-t", &self.name]).output();
+    let _ = tmux(&self.name, &["kill-server"]).output();
   }
 }
 
@@ -628,6 +699,17 @@ impl Drop for Term {
     self.kill();
     let _ = std::fs::remove_dir_all(&self.dir);
   }
+}
+
+/// A tmux command on `socket`, which is a server of this test's own rather
+/// than the one the developer is working in: a test sets server options and
+/// reads back the clipboard, and neither belongs in somebody's own session —
+/// or in another test's, which is why it is one server per terminal rather
+/// than one for the suite. It starts with the `new-session` and ends with it.
+fn tmux(socket: &str, args: &[&str]) -> Command {
+  let mut command = Command::new("tmux");
+  command.args(["-L", socket]).args(args);
+  command
 }
 
 /// A name no other session in this run will have.
@@ -2440,5 +2522,98 @@ fn a_reopened_session_asks_for_byte_for_byte_what_it_would_have_asked_for() {
     "the reopened session asks for something else from byte {common}:\n  unbroken: {}\n  reopened: {}",
     window(&unbroken),
     window(&reopened),
+  );
+}
+
+#[test]
+fn a_drag_over_the_transcript_selects_it_and_copies_what_it_covered() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![Turn::Say("Kiwi and quince.\n\nAlso persimmon.")]);
+  let term = Term::start("select", &provider, &["--no-session"]);
+  term.submit("fruit?");
+  term.wait_for("Also persimmon.");
+
+  // A drag across one word takes that word, ends included: at a cell's own
+  // resolution, a drag over a word means the word.
+  let (col, row) = term.cell_of("quince");
+  term.hold_through(&[(col, row), (col + 5, row)]);
+  // While the button is down it is on screen as selected, which is the
+  // terminal's own reverse video rather than a colour of ours.
+  let coloured = term.coloured();
+  let shown = coloured
+    .lines()
+    .find(|line| line.contains("quince"))
+    .expect("the line it is on");
+  assert!(
+    shown.contains("\u{1b}[7mquince\u{1b}[0m"),
+    "the word is drawn reversed and the rest of the line is not: {shown:?}"
+  );
+  // Letting go copies it and lets go of it: the highlight was the drag, and
+  // the drag is over.
+  term.let_go((col + 5, row));
+  assert_eq!(term.clipboard(), "quince");
+  let coloured = term.coloured();
+  let shown = coloured
+    .lines()
+    .find(|line| line.contains("quince"))
+    .expect("the line it is on");
+  // Reverse video where the cursor is, in the input box, is not the
+  // transcript's — the line the selection was on carries none of it.
+  assert!(!shown.contains("\u{1b}[7m"), "nothing is left selected: {shown:?}");
+
+  // A drag over several lines takes all of them, in the shape they are drawn
+  // in — including the blank line between two paragraphs.
+  let (start, first) = term.cell_of("Kiwi");
+  let (end, last) = term.cell_of("Also persimmon.");
+  term.drag((start, first), (end + 14, last));
+  assert_eq!(term.clipboard(), "Kiwi and quince.\n\nAlso persimmon.");
+
+  // A click is not a selection, and copies nothing over what was copied.
+  term.drag((start, first), (start, first));
+  assert_eq!(term.clipboard(), "Kiwi and quince.\n\nAlso persimmon.");
+}
+
+#[test]
+fn a_selection_dragged_off_the_top_scrolls_the_transcript_and_keeps_going() {
+  if !have_tmux() {
+    return;
+  }
+  // More transcript than screen, so there is something above to reach for.
+  let long: &'static str = Box::leak(
+    (1..=40)
+      .map(|i| format!("- item {i:02}\n"))
+      .collect::<String>()
+      .into_boxed_str(),
+  );
+  let provider = Provider::start(vec![Turn::Say(long)]);
+  let term = Term::start("autoscroll", &provider, &["--no-session"]);
+  term.submit("list?");
+  term.wait_for("item 40");
+
+  // Notches compose, rather than each one scrolling from where the screen
+  // still is: three of them are three notches back, drawn or not.
+  for _ in 0..3 {
+    term.wheel_up((40, 10));
+  }
+  term.settle();
+  let footer = term.screen();
+  assert!(footer.contains("↑ 9 lines"), "three notches back:\n{footer}");
+
+  // A drag that reaches the top row and stays there keeps scrolling, so the
+  // selection runs on above what was on screen when it started.
+  let (col, row) = term.cell_of("item 30");
+  let mut cells = vec![(col + 8, row)];
+  cells.extend((0..6).map(|_| (col, 1)));
+  term.drag_through(&cells);
+  let copied = term.clipboard();
+  assert!(
+    copied.ends_with("item 30"),
+    "the selection still ends where it started: {copied:?}"
+  );
+  assert!(
+    copied.lines().count() > 6,
+    "it ran further than the rows it was dragged over: {copied:?}"
   );
 }

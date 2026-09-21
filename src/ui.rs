@@ -10,10 +10,10 @@ use anyhow::Result;
 use ratatui::crossterm::event::{
   self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::{DefaultTerminal, Frame};
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 use rig_core::completion::{Message, Usage};
@@ -98,6 +98,49 @@ fn thumb_bounds(track: u16, max_scroll: usize, viewport: usize, offset: usize) -
   let len = divide(viewport * track, span).clamp(1, track);
   let start = divide(offset.min(max_scroll.saturating_sub(1)) * track, span).min(track - len);
   (start as u16, len as u16)
+}
+
+/// What the mouse has picked out of the transcript, in the coordinates of the
+/// lines the last draw wrapped it into: which line a cell is on, and which
+/// column of it.
+///
+/// `anchor` is where the press landed and `head` where the cursor has got to,
+/// in either order — a selection can be dragged upwards as well as down. Both
+/// are cells rather than the boundaries between them, so the cell under the
+/// cursor is part of what is selected: at a cell's own resolution, a drag
+/// across a word means the word.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Selection {
+  anchor: (usize, usize),
+  head: (usize, usize),
+}
+
+impl Selection {
+  /// The two ends in reading order.
+  fn ends(self) -> ((usize, usize), (usize, usize)) {
+    match self.anchor <= self.head {
+      true => (self.anchor, self.head),
+      false => (self.head, self.anchor),
+    }
+  }
+
+  /// The columns of line `at` this selection covers, end exclusive, or `None`
+  /// for a line it does not reach. Every line between its ends is covered
+  /// whole, however long it turns out to be.
+  fn columns(self, at: usize) -> Option<(usize, usize)> {
+    let ((first, from), (last, to)) = self.ends();
+    if at < first || at > last {
+      return None;
+    }
+    let from = if at == first { from } else { 0 };
+    let to = if at == last { to + 1 } else { usize::MAX };
+    Some((from, to))
+  }
+
+  /// A press that went nowhere: a click, which selects nothing.
+  fn is_empty(self) -> bool {
+    self.anchor == self.head
+  }
 }
 
 /// The scroll offset that puts the top of the thumb `start` rows down its
@@ -435,6 +478,17 @@ pub struct App {
   /// A thumb drag in flight, holding how far down the thumb it was grabbed so
   /// the cursor keeps hold of the same row of it.
   dragging: Option<u16>,
+  /// The transcript as the last draw wrapped it, one line per row on screen.
+  /// What is on screen is a window onto this, and what the mouse points at is
+  /// a cell of it.
+  rendered: Vec<Line<'static>>,
+  /// Where the last draw put that window, for the mouse to be mapped back
+  /// into the text under it.
+  content: Rect,
+  /// What the mouse is picking out, while it is: a selection lives from the
+  /// press to the release that copies it, and no longer — so nothing has to
+  /// notice that the lines under it have moved.
+  selection: Option<Selection>,
   /// Ctrl+T shows reasoning blocks in full instead of their last few lines.
   expand_thinking: bool,
   /// Ctrl+O shows tool output in full instead of the preview.
@@ -505,6 +559,9 @@ impl App {
       view: (0, 0),
       thumb: None,
       dragging: None,
+      rendered: Vec::new(),
+      content: Rect::ZERO,
+      selection: None,
       expand_thinking: false,
       expand_tools: false,
       markdown: HashMap::new(),
@@ -586,9 +643,9 @@ impl App {
         match mouse.kind {
           MouseEventKind::ScrollUp => self.scroll_by(WHEEL_LINES as isize),
           MouseEventKind::ScrollDown => self.scroll_by(-(WHEEL_LINES as isize)),
-          MouseEventKind::Down(MouseButton::Left) => self.grab_thumb(mouse.column, mouse.row),
-          MouseEventKind::Drag(MouseButton::Left) => self.drag_thumb(mouse.row),
-          MouseEventKind::Up(MouseButton::Left) => self.dragging = None,
+          MouseEventKind::Down(MouseButton::Left) => self.press(mouse.column, mouse.row),
+          MouseEventKind::Drag(MouseButton::Left) => self.drag(mouse.column, mouse.row),
+          MouseEventKind::Up(MouseButton::Left) => self.release(),
           _ => {}
         }
         return;
@@ -853,7 +910,109 @@ impl App {
   fn scroll_to(&mut self, target: usize) {
     // Reaching the bottom re-attaches to the live end of the transcript.
     self.anchor = (target < self.view.1).then_some(target);
+    // Where the view is now, which the next draw will say for itself — but
+    // several scrolls can arrive between two draws, and each of them should
+    // move on from where the last one left off rather than from where the
+    // screen still is.
+    self.view.0 = target.min(self.view.1);
     self.last_scroll = Some(Instant::now());
+  }
+
+  /// A left press. On the scrollbar it takes hold of the thumb; in the
+  /// transcript it starts a selection.
+  fn press(&mut self, column: u16, row: u16) {
+    self.grab_thumb(column, row);
+    // An overlay is a window over the transcript, not a view of it: what is
+    // under it is not what is on screen at that cell.
+    if self.dragging.is_some() || self.overlay.is_some() {
+      return;
+    }
+    if !self.content.contains(Position::new(column, row)) {
+      return;
+    }
+    let Some(cell) = self.cell_at(column, row) else {
+      return;
+    };
+    self.selection = Some(Selection {
+      anchor: cell,
+      head: cell,
+    });
+  }
+
+  /// The cursor moving with the button down: the thumb follows it, or the
+  /// selection grows to it.
+  fn drag(&mut self, column: u16, row: u16) {
+    if self.dragging.is_some() {
+      self.drag_thumb(row);
+      return;
+    }
+    if self.selection.is_none() {
+      return;
+    }
+    // Dragging along either edge scrolls the transcript under the cursor, so
+    // a selection can run further than the screen shows. The edge row itself
+    // and not past it: the transcript starts at the top of the screen, where
+    // there is no row above to reach for.
+    if row <= self.content.y {
+      self.scroll_by(1);
+    } else if row >= self.content.bottom().saturating_sub(1) {
+      self.scroll_by(-1);
+    }
+    if let Some(cell) = self.cell_at(column, row)
+      && let Some(selection) = &mut self.selection
+    {
+      selection.head = cell;
+    }
+  }
+
+  /// The button coming up, which is the end of the selection as well as of
+  /// the drag: it is copied and then let go of, rather than left highlighted
+  /// for something else to have to take it back off the screen. A press that
+  /// went nowhere was a click, and copies nothing.
+  fn release(&mut self) {
+    self.dragging = None;
+    let Some(selection) = self.selection.take().filter(|selection| !selection.is_empty()) else {
+      return;
+    };
+    let text = self.selected_text(selection);
+    // Blank cells are what the transcript pads with rather than anything the
+    // user meant to take away with them.
+    if !text.trim().is_empty()
+      && let Err(note) = crate::clipboard::copy(&text)
+    {
+      self.entries.push(Entry::Info(note));
+    }
+  }
+
+  /// The cell of the transcript under the cursor, clamped into the text — so
+  /// a drag that wanders off the side, or below the last line, still points
+  /// at the end of what it passed over. `None` when there is nothing to point
+  /// at.
+  fn cell_at(&self, column: u16, row: u16) -> Option<(usize, usize)> {
+    if self.content.height == 0 || self.rendered.is_empty() {
+      return None;
+    }
+    let row = row.clamp(self.content.y, self.content.bottom() - 1) - self.content.y;
+    let line = (self.view.0 + row as usize).min(self.rendered.len() - 1);
+    let column = column.clamp(self.content.x, self.content.right()) - self.content.x;
+    Some((line, column as usize))
+  }
+
+  /// What a selection covers, as the text it is drawn from: the lines it
+  /// touches, each cut to the columns of it that are in the selection.
+  ///
+  /// Line by line as they are on screen, so a wrapped paragraph comes back
+  /// wrapped — what was copied is what was pointed at, and a code block
+  /// stays the lines it was written on.
+  fn selected_text(&self, selection: Selection) -> String {
+    let ((first, _), (last, _)) = selection.ends();
+    (first..=last.min(self.rendered.len().saturating_sub(1)))
+      .filter_map(|at| {
+        let (from, to) = selection.columns(at)?;
+        Some(selected(&self.rendered[at], from, to))
+      })
+      .collect::<Vec<_>>()
+      .join("\n")
   }
 
   /// A left press on the scrollbar. On the thumb it takes hold of it; on the
@@ -1571,11 +1730,11 @@ impl App {
     if self.scrollbar == ScrollbarMode::Always && content_area.width > 1 {
       content_area.width -= 1;
     }
-    // Markdown arrives pre-wrapped to this width, so `Wrap` passes it through
-    // untouched and still handles the entries that stay literal.
+    // Wrapped here rather than by the `Paragraph`, which wraps as it draws
+    // and keeps where each line landed to itself: a row on screen is a line
+    // of this list, which is what lets the mouse be told what it points at.
     let lines = self.transcript_lines(content_area.width);
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let total = paragraph.line_count(content_area.width);
+    let total = lines.len();
     let viewport = content_area.height as usize;
     let max_scroll = total.saturating_sub(viewport);
     if self.anchor.is_some_and(|a| a >= max_scroll) {
@@ -1583,19 +1742,31 @@ impl App {
     }
     let offset = self.anchor.unwrap_or(max_scroll);
     self.view = (offset, max_scroll);
-    f.render_widget(
-      paragraph.scroll((offset.min(u16::MAX as usize) as u16, 0)),
-      content_area,
-    );
+    let visible: Vec<Line<'static>> = lines
+      .iter()
+      .enumerate()
+      .skip(offset)
+      .take(viewport)
+      .map(|(at, line)| match self.selection.and_then(|s| s.columns(at)) {
+        Some((from, to)) => highlight(line, from, to),
+        None => line.clone(),
+      })
+      .collect();
+    f.render_widget(Paragraph::new(visible), content_area);
+    self.rendered = lines;
+    self.content = content_area;
     let overflows = total > viewport;
     let show_scrollbar = match self.scrollbar {
       ScrollbarMode::Always => viewport > 0,
       ScrollbarMode::Auto => overflows && self.scrollbar_fading(),
       ScrollbarMode::Hidden => false,
     };
+    // A scrollbar with nothing to scroll draws neither track nor thumb, and
+    // an `auto` one that has faded draws nothing at all, so in either case
+    // there is nothing for the mouse to take hold of — the column it was on
+    // is transcript again, to be read and selected like the rest of it.
+    self.thumb = None;
     if show_scrollbar {
-      // A scrollbar with nothing to scroll draws neither track nor thumb, so
-      // there is nothing for the mouse to take hold of either.
       if max_scroll > 0 && transcript_area.width > 0 {
         let track = Rect {
           x: transcript_area.right() - 1,
@@ -2051,7 +2222,13 @@ impl App {
       }
     }
     self.markdown = live;
+    // Every entry that renders itself has already wrapped to the width; this
+    // is for the ones shown as they were written — a prompt, an error, a
+    // block unfolded — and it is what makes the list a list of rows.
     lines
+      .into_iter()
+      .flat_map(|line| crate::markdown::wrap_line(line, width))
+      .collect()
   }
 }
 
@@ -2321,6 +2498,83 @@ impl Preview {
     if hidden > 0 && !from_end {
       out.push(row(note(hidden, false), false));
     }
+  }
+}
+
+/// A line split at columns `from` and `to`: what is drawn before them, what is
+/// drawn between them, and what is drawn after. The span a cut falls inside is
+/// itself cut, and each piece keeps the styling of the span it came out of.
+///
+/// Columns as the terminal counts them, so a wide character is the two cells
+/// it is drawn on, and one straddling a cut goes to the side its first cell is
+/// on.
+fn cut(line: &Line<'static>, from: usize, to: usize) -> (Vec<Span<'static>>, Vec<Span<'static>>, Vec<Span<'static>>) {
+  use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+  let mut parts: [Vec<Span<'static>>; 3] = Default::default();
+  let mut at = 0;
+  for span in &line.spans {
+    let width = span.content.width();
+    // A span the cuts miss is one of the three pieces as it stands.
+    let whole = match (at + width <= from, at >= to) {
+      (true, _) => Some(0),
+      (_, true) => Some(2),
+      _ if at >= from && at + width <= to => Some(1),
+      _ => None,
+    };
+    if let Some(part) = whole {
+      parts[part].push(span.clone());
+      at += width;
+      continue;
+    }
+    let mut pieces = [String::new(), String::new(), String::new()];
+    for ch in span.content.chars() {
+      let part = match (at < from, at < to) {
+        (true, _) => 0,
+        (_, true) => 1,
+        _ => 2,
+      };
+      pieces[part].push(ch);
+      at += ch.width().unwrap_or(0);
+    }
+    for (part, text) in pieces.into_iter().enumerate() {
+      if !text.is_empty() {
+        parts[part].push(Span::styled(text, span.style));
+      }
+    }
+  }
+  let [before, inside, after] = parts;
+  (before, inside, after)
+}
+
+/// The text of `line` between columns `from` and `to`, without the blanks a
+/// line ends in — which are the gap to the right margin rather than anything
+/// written on it.
+fn selected(line: &Line<'static>, from: usize, to: usize) -> String {
+  let text: String = cut(line, from, to).1.iter().map(|span| span.content.as_ref()).collect();
+  text.trim_end().to_string()
+}
+
+/// `line` with its columns between `from` and `to` drawn as selected.
+///
+/// Reversed rather than given a colour of its own, so the selection reads as
+/// one against any of the colours the transcript is drawn in, and takes the
+/// terminal's own idea of what a selection looks like with it.
+fn highlight(line: &Line<'static>, from: usize, to: usize) -> Line<'static> {
+  let (before, inside, after) = cut(line, from, to);
+  if inside.is_empty() {
+    return line.clone();
+  }
+  let mut spans = before;
+  spans.extend(
+    inside
+      .into_iter()
+      .map(|span| Span::styled(span.content, span.style.add_modifier(Modifier::REVERSED))),
+  );
+  spans.extend(after);
+  Line {
+    spans,
+    style: line.style,
+    alignment: line.alignment,
   }
 }
 
@@ -3460,6 +3714,11 @@ mod tests {
     assert_eq!(writing_body("bash", r#"{"command":"ls -la"#), []);
   }
 
+  /// A run of spans as the text it draws.
+  fn text_of(spans: &[Span<'static>]) -> String {
+    spans.iter().map(|span| span.content.as_ref()).collect()
+  }
+
   /// Drawn lines as their text, with the styling dropped.
   fn drawn(lines: &[Line<'static>]) -> Vec<String> {
     lines
@@ -3539,9 +3798,91 @@ mod tests {
     // and gutter included.
     let folded = drawn(&block(false));
     assert_eq!(folded, ["   ".to_string() + &"x".repeat(16) + "…"]);
-    // Unfolded, it is whole, for the terminal to wrap as it likes.
+    // Unfolded, it is whole, over as many rows as the wrap takes.
     assert_eq!(folded[0].chars().count(), 20);
     assert_eq!(drawn(&block(true)), [format!("   {long}")]);
+  }
+
+  #[test]
+  fn a_selection_covers_the_cells_the_drag_went_over() {
+    let selection = Selection {
+      anchor: (2, 4),
+      head: (4, 1),
+    };
+    // Nothing on the lines it does not reach.
+    assert_eq!(selection.columns(1), None);
+    assert_eq!(selection.columns(5), None);
+    // From where it started on the first line, all of the lines between, and
+    // up to and including the cell it ended on.
+    assert_eq!(selection.columns(2), Some((4, usize::MAX)));
+    assert_eq!(selection.columns(3), Some((0, usize::MAX)));
+    assert_eq!(selection.columns(4), Some((0, 2)));
+    // Dragged the other way it covers the same cells.
+    let backwards = Selection {
+      anchor: selection.head,
+      head: selection.anchor,
+    };
+    for at in 1..=5 {
+      assert_eq!(backwards.columns(at), selection.columns(at));
+    }
+    // A press that went nowhere is a click, and a click selects one cell —
+    // which is what makes it worth telling apart from a selection.
+    let click = Selection {
+      anchor: (2, 4),
+      head: (2, 4),
+    };
+    assert!(click.is_empty());
+    assert_eq!(click.columns(2), Some((4, 5)));
+  }
+
+  #[test]
+  fn a_line_is_cut_where_the_selection_starts_and_ends() {
+    let line = Line::from(vec![
+      Span::styled("❯ ", Style::default().fg(Color::Cyan)),
+      Span::styled("hello world", Style::default().bold()),
+    ]);
+    // Columns, not characters or spans: the cut falls inside the span it
+    // falls inside, and each piece keeps the styling it had.
+    let (before, inside, after) = cut(&line, 2, 7);
+    assert_eq!(text_of(&before), "❯ ");
+    assert_eq!(text_of(&inside), "hello");
+    assert_eq!(text_of(&after), " world");
+    assert_eq!(inside[0].style, Style::default().bold());
+    // A selection that starts past the end of the line takes nothing from it.
+    assert_eq!(cut(&line, 40, usize::MAX).1, []);
+    // The blanks a line ends in are the margin, not text that was selected.
+    let padded = Line::raw("word     ");
+    assert_eq!(selected(&padded, 0, usize::MAX), "word");
+  }
+
+  #[test]
+  fn a_wide_character_is_selected_by_either_of_its_columns() {
+    let line = Line::raw("日本語");
+    // The cell a wide character starts on is the one it belongs to, so a
+    // selection ending on its second column still holds all of it.
+    assert_eq!(selected(&line, 0, 2), "日");
+    assert_eq!(selected(&line, 0, 3), "日本");
+    assert_eq!(selected(&line, 2, 4), "本");
+  }
+
+  #[test]
+  fn what_is_selected_is_drawn_reversed_and_nothing_else_is() {
+    let line = Line::from(vec![Span::raw("ab"), Span::styled("cd", Style::default().bold())]);
+    let shown = highlight(&line, 1, 3);
+    // The same line, cell for cell — only how three of its cells are drawn
+    // has changed.
+    assert_eq!(text_of(&shown.spans), "abcd");
+    let reversed: String = shown
+      .spans
+      .iter()
+      .filter(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+      .map(|span| span.content.as_ref())
+      .collect();
+    assert_eq!(reversed, "bc");
+    // And a cell that was bold before is bold and selected now, not one or
+    // the other.
+    let c = shown.spans.iter().find(|span| span.content == "c").unwrap();
+    assert!(c.style.add_modifier.contains(Modifier::BOLD | Modifier::REVERSED));
   }
 
   #[test]

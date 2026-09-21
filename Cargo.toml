@@ -69,7 +69,7 @@ libc = "0.2.189"
 markdown = "1"
 mdstitch = "0.1"
 nucleo-matcher = "0.3.1"
-ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
+ratatui = "0.30"
 ratatui-textarea = "0.9"
 rig-agent = "0.42"
 rig-core = "0.42"

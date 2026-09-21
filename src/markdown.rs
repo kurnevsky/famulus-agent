@@ -16,7 +16,7 @@ use ::markdown::mdast::{AlignKind, List, Node};
 use mdstitch::{StitchOptions, stitch};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Indent for the body of a fenced code block.
 const CODE_INDENT: &str = "  ";
@@ -120,6 +120,106 @@ pub fn render(md: &str, width: u16, streaming: bool) -> Vec<Line<'static>> {
     out.pop();
   }
   out
+}
+
+/// Word-wraps a line that is already drawn the way it will be shown, for the
+/// transcript to fold its rows itself instead of leaving them to a
+/// `Paragraph` — which wraps as it draws and keeps to itself where each line
+/// ended up, where the mouse needs to be told what row it is pointing at.
+///
+/// A line that fits comes back as it is, which is nearly all of them: every
+/// renderer here wraps to the width as it goes, and only text shown as it was
+/// written — a prompt, an error, an unfolded block — can still be too long.
+///
+/// The indent a line starts with is part of it and is kept; the space a break
+/// falls on belongs to neither side and is dropped, as `wrap` drops it.
+pub fn wrap_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
+  let width = width as usize;
+  // A tab is measured as no columns and drawn as however many the terminal
+  // feels like, and a carriage return draws the rest of the line over the
+  // start of it, so a line carrying either is rebuilt even when it fits.
+  let literal = line.spans.iter().all(|span| !span.content.contains(['\n', '\t', '\r']));
+  if width == 0 || (literal && line.width() <= width) {
+    return vec![line];
+  }
+  let (style, alignment) = (line.style, line.alignment);
+  let mut lines: Vec<Line<'static>> = Vec::new();
+  let mut current: Vec<Span<'static>> = Vec::new();
+  let mut used = 0;
+  // Until the first word of the line, its spaces are the indent it was
+  // written with rather than the debris of a break.
+  let mut indent = true;
+
+  let mut push_line = |current: &mut Vec<Span<'static>>, used: &mut usize| {
+    // The space a break falls on is drawn on neither line. A line of nothing
+    // but spaces is an indent that never got its word, and keeps them.
+    if current.iter().any(|span| !span.content.trim().is_empty()) {
+      while current.last().is_some_and(|span| span.content.trim().is_empty()) {
+        current.pop();
+      }
+    }
+    lines.push(Line::from(std::mem::take(current)).style(style));
+    *used = 0;
+  };
+
+  for span in line.spans {
+    // A carriage return is not a column and not a break; what it meant was
+    // for the terminal to draw over what it had already drawn, which a
+    // transcript that scrolls has no way of honouring.
+    let content = expand_tabs(&span.content).replace('\r', "");
+    for (i, chunk) in content.split('\n').enumerate() {
+      if i > 0 {
+        // A break the text asked for starts a line of its own, indent and
+        // all — it is a line as written, not the remains of one.
+        push_line(&mut current, &mut used);
+        indent = true;
+      }
+      for word in words(chunk) {
+        let blank = word.trim().is_empty();
+        let w = word.width();
+        if blank && used == 0 && !indent {
+          continue;
+        }
+        // A word too long for a line of its own gains nothing by being moved
+        // to one, so it is broken where the line it is on runs out.
+        if w > width {
+          let mut piece = String::new();
+          for ch in word.chars() {
+            if used + ch.width().unwrap_or(0) > width {
+              if !piece.is_empty() {
+                current.push(Span::styled(std::mem::take(&mut piece), span.style));
+              }
+              push_line(&mut current, &mut used);
+            }
+            used += ch.width().unwrap_or(0);
+            piece.push(ch);
+          }
+          if !piece.is_empty() {
+            current.push(Span::styled(piece, span.style));
+          }
+          indent = false;
+          continue;
+        }
+        if used + w > width && used > 0 {
+          push_line(&mut current, &mut used);
+          indent = false;
+          if blank {
+            continue;
+          }
+        }
+        current.push(Span::styled(word.to_string(), span.style));
+        used += w;
+        indent &= blank;
+      }
+    }
+  }
+  if !current.is_empty() || lines.is_empty() {
+    lines.push(Line::from(current).style(style));
+  }
+  for line in &mut lines {
+    line.alignment = alignment;
+  }
+  lines
 }
 
 /// Word-wraps plain text to `width` columns, for prose that is shown as
@@ -1035,5 +1135,75 @@ mod tests {
     let rendered = plain(&lines);
     assert_eq!(rendered.len(), 3, "{rendered:?}");
     assert!(rendered[2].starts_with('└'));
+  }
+
+  #[test]
+  fn a_line_that_fits_is_the_line_it_was() {
+    let line = Line::from(vec![
+      Span::raw("  "),
+      Span::styled("gutter", Style::default().fg(Color::Green)),
+    ])
+    .style(Style::default().add_modifier(Modifier::DIM));
+    let wrapped = wrap_line(line.clone(), 20);
+    // Untouched, down to the indent it starts with, the colour of each span
+    // and the style of the line itself — which is where a dimmed line keeps
+    // its dimming.
+    assert_eq!(wrapped, [line]);
+  }
+
+  #[test]
+  fn a_line_too_long_for_the_width_is_wrapped_to_it() {
+    let line = Line::from(vec![
+      Span::styled("alpha beta ", Style::default().fg(Color::Red)),
+      Span::styled("gamma delta", Style::default().fg(Color::Blue)),
+    ]);
+    let wrapped = wrap_line(line, 12);
+    assert_eq!(plain(&wrapped), ["alpha beta", "gamma delta"]);
+    // Each piece is still the colour of the span it came out of.
+    assert_eq!(wrapped[0].spans[0].style.fg, Some(Color::Red));
+    assert_eq!(wrapped[1].spans[0].style.fg, Some(Color::Blue));
+  }
+
+  #[test]
+  fn the_indent_a_line_starts_with_survives_the_wrap() {
+    // The break drops the space it falls on, but the indent is not debris:
+    // it is where the line was written to start.
+    let line = Line::from(vec![Span::raw("  "), Span::raw("alpha beta gamma")]);
+    assert_eq!(plain(&wrap_line(line, 10)), ["  alpha", "beta gamma"]);
+  }
+
+  #[test]
+  fn a_word_longer_than_the_line_is_broken_into_lines() {
+    let line = Line::raw("0123456789abcde");
+    assert_eq!(plain(&wrap_line(line, 6)), ["012345", "6789ab", "cde"]);
+    // And it is broken where the line it is on runs out rather than moved to
+    // a line of its own, which it would not fit either: a block's indent and
+    // gutter would otherwise be a row with nothing on it.
+    let indented = Line::from(vec![Span::raw("  "), Span::raw("0123456789abcde")]);
+    assert_eq!(plain(&wrap_line(indented, 6)), ["  0123", "456789", "abcde"]);
+  }
+
+  #[test]
+  fn what_the_terminal_would_draw_for_itself_is_drawn_here_instead() {
+    // A tab is no columns to us and four to the terminal, and a carriage
+    // return would draw the rest of the line over the start of it: both are
+    // settled here, where a row is still a row.
+    assert_eq!(plain(&wrap_line(Line::raw("a\tb"), 20)), ["a    b"]);
+    assert_eq!(plain(&wrap_line(Line::raw("done\r"), 20)), ["done"]);
+    // A span carrying a newline is two lines, since it would be drawn as two,
+    // and the second keeps the indent it was written with.
+    let line = Line::from(Span::raw("one\n  two"));
+    assert_eq!(plain(&wrap_line(line, 20)), ["one", "  two"]);
+  }
+
+  #[test]
+  fn every_wrapped_line_fits_the_width_it_was_given() {
+    let text = "Reticulating splines — 日本語のテキスト, a-very-long-unbroken-token, and\ttabs.";
+    // From two columns, which is the narrowest a wide character fits in.
+    for width in [2_u16, 4, 7, 20, 33] {
+      for line in wrap_line(Line::raw(text), width) {
+        assert!(line.width() <= width as usize, "{width}: {line:?}");
+      }
+    }
   }
 }

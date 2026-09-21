@@ -591,6 +591,7 @@ what it spent.
 | `Esc` `Esc` | Open `/tree` (empty input, within half a second) |
 | `PageUp` / `PageDown`, mouse wheel | Scroll transcript |
 | Drag the scrollbar | Scroll transcript — clicking its track jumps there, and keeps hold |
+| Drag over the transcript | Select and copy — letting go copies what was covered, dragging along the top or bottom row scrolls |
 | `Ctrl+C` | Abort if running, otherwise quit |
 | `Ctrl+D` | Quit (empty input) |
 | `Ctrl+T` | Thinking in full, or only its last lines |
@@ -608,8 +609,22 @@ what it spent.
 
 \* in terminals that support the kitty keyboard protocol.
 
-Mouse capture is enabled for the wheel and the scrollbar, so selecting text
-with the mouse usually requires holding `Shift`.
+Mouse capture is enabled, so the terminal's own selection usually needs
+`Shift` held. Dragging without it selects here instead: the cells the drag
+covers are drawn reversed while the button is down, and letting go copies them
+to the terminal's clipboard — the primary selection and the clipboard proper
+both, so a middle click and a `Ctrl+V` paste the same thing. What is copied is
+what is on screen, line by line as it is drawn, without the blanks each line
+ends in. The highlight is the drag rather than a state of its own: it goes
+when the button does, so nothing is left on screen to be dismissed, and
+nothing has to notice when the lines under it move.
+
+The copy travels as an OSC 52 escape, which is what makes it work over ssh:
+the text lands on the clipboard of the terminal being looked at rather than of
+the machine `fa` runs on. Terminals that ship the escape turned off need it
+turned on — tmux wants `set -g set-clipboard on`, xterm `allowWindowOps` — and
+one that does not read it at all ignores the copy silently, since nothing
+comes back to say otherwise.
 
 ## Layout
 
@@ -668,7 +683,13 @@ with the mouse usually requires holding `Shift`.
   for rather than holding, and handing each server's tools to the agent. Rig
   speaks the protocol; this only decides who to speak to. Holding the result is what keeps the servers running, so it
   lives as long as the program does.
-- `src/ui.rs` – ratatui app: transcript, input, footer.
+- `src/ui.rs` – ratatui app: transcript, input, footer. The transcript is
+  wrapped to the width here rather than by the `Paragraph` that draws it, so a
+  row on screen is a line of a list: what the mouse points at can be named,
+  which is what a selection is made of and cut from.
+- `src/clipboard.rs` – copying as an OSC 52 escape handed to the terminal,
+  rather than as a call on the machine this runs on — which is what makes it
+  work over ssh.
 - `tests/e2e.rs` – the binary driven through tmux against a mock provider: a
   call written token by token and its output landing under it, pass and fail
   as the stripe beside each, an aborted run keeping its work and carrying on
@@ -680,8 +701,10 @@ with the mouse usually requires holding `Shift`.
   conversation reaching the model as its summary, what a call cost being
   counted while the run it belongs to is still going, a run that fills the
   window compacting and picking itself back up, a window with nothing left to
-  compact stopping instead of doing it forever, and a tool from a real MCP
-  server being offered, called and drawn like any other.
+  compact stopping instead of doing it forever, a tool from a real MCP
+  server being offered, called and drawn like any other, and a drag over the
+  transcript selecting what it covered and copying it — read back out of
+  tmux's own clipboard, which is where the OSC 52 escape lands.
 
 ## Testing
 
@@ -695,8 +718,10 @@ OpenAI-compatible server, types at it, and reads the screen back with
 person would have seen — wrapping, overwriting, colours and all, which is
 where most of this program's behaviour lives and none of which a unit test can
 reach. The mock decides which turn to play from the request rather than
-counting, so a resumed session picks up where the last one left off. Without
-tmux installed these skip rather than fail.
+counting, so a resumed session picks up where the last one left off. Each test
+gets a tmux server of its own rather than the one you are working in: they set
+server options and read the clipboard back, and two tests sharing either would
+be reading each other's. Without tmux installed these skip rather than fail.
 
 `src/agent.rs` also has end-to-end tests against a mock server, gated on an
 environment variable each: `FA_TEST_BASE_URL` for the OpenAI-compatible ones
