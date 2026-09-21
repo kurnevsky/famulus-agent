@@ -12,13 +12,17 @@
 //! lives is the XDG search path and nothing else — no dotfile in a home
 //! directory, nothing beside the project.
 //!
+//! A value that should not sit in a file is written as the line of shell that
+//! produces it, under `env-command` or `headers-command` rather than `env` or
+//! `headers`: run once, when the server starts, with its output for the value.
+//!
 //! ```toml
 //! [fetch]
 //! command = "uvx mcp-server-fetch"
 //!
 //! [docs]
 //! url = "https://example.com/mcp"
-//! headers.Authorization = "Bearer …"
+//! headers-command.Authorization = "echo Bearer $(pass show work/mcp)"
 //! timeout = 60
 //! ```
 
@@ -34,6 +38,12 @@ use serde::Deserialize;
 /// session without it.
 #[cfg(feature = "mcp")]
 const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long a command that produces a value has to produce it. Well under the
+/// budget the whole server has, so a keyring that stops to ask something is
+/// told about as the command it is rather than as a server that never came up.
+#[cfg(feature = "mcp")]
+const VALUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The name servers are declared under, in each configuration directory.
 const FILE: &str = "mcp.toml";
@@ -63,12 +73,20 @@ pub struct Server {
   /// Added to the environment that command inherits.
   #[serde(default)]
   pub env: BTreeMap<String, String>,
+  /// The same, for a value that should not sit in a file: a line of shell
+  /// whose output is what the variable is set to.
+  #[serde(default, rename = "env-command")]
+  pub env_command: BTreeMap<String, String>,
   /// The endpoint of a server that speaks streamable HTTP.
   #[serde(default)]
   pub url: Option<String>,
   /// Sent with every request to that endpoint, which is where a token goes.
   #[serde(default)]
   pub headers: BTreeMap<String, String>,
+  /// The same, for a token that should not sit in a file: a line of shell
+  /// whose output is the header's value — `pass`, `gh auth token`, `op read`.
+  #[serde(default, rename = "headers-command")]
+  pub headers_command: BTreeMap<String, String>,
   /// Seconds one of this server's tools may take before the call comes back
   /// as an error the model can recover from. `0` waits forever.
   #[serde(default)]
@@ -302,11 +320,12 @@ async fn start(server: &Server) -> anyhow::Result<rmcp::service::RunningService<
   match (&server.command, &server.url) {
     (Some(_), Some(_)) => bail!("declared as both a command and a URL"),
     (Some(command), None) => {
+      let env = values(&server.env, &server.env_command, "env").await?;
       // A line of shell, run the way the `bash` tool runs one, so a server is
       // started by the command that starts it in a terminal — quoting, `~`,
       // `$HOME` and all.
       let mut process = tokio::process::Command::new("bash");
-      process.arg("-c").arg(command).envs(&server.env);
+      process.arg("-c").arg(command).envs(&env);
       // A server's own chatter is not this program's to print: the terminal
       // belongs to the transcript.
       process.stderr(std::process::Stdio::null());
@@ -315,14 +334,74 @@ async fn start(server: &Server) -> anyhow::Result<rmcp::service::RunningService<
       Ok(().serve(transport).await?)
     }
     (None, Some(url)) => {
+      let sent = values(&server.headers, &server.headers_command, "header").await?;
       let mut config =
         rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(url.as_str());
-      config.custom_headers = headers(&server.headers)?;
+      config.custom_headers = headers(&sent)?;
       let transport = rmcp::transport::StreamableHttpClientTransport::from_config(config);
       Ok(().serve(transport).await?)
     }
     (None, None) => bail!("declared with neither a command to run nor a URL to call"),
   }
+}
+
+/// One table of values, with the ones written as a command run for.
+///
+/// A name in both tables is refused rather than resolved by a rule about which
+/// wins: a token declared twice is a token one of the two places is wrong
+/// about, and quietly using either is how the wrong one goes unnoticed.
+#[cfg(feature = "mcp")]
+async fn values(
+  literal: &BTreeMap<String, String>,
+  commands: &BTreeMap<String, String>,
+  what: &str,
+) -> anyhow::Result<BTreeMap<String, String>> {
+  use anyhow::{Context, bail};
+
+  if let Some(name) = commands.keys().find(|name| literal.contains_key(*name)) {
+    bail!("{what} {name} is given both a value and a command");
+  }
+  // Every one of them at once: they are separate programs that wait on
+  // separate things, and they are waited on inside the budget the server has
+  // to come up at all.
+  let run = commands.iter().map(async |(name, command)| {
+    let value = value(command).await.with_context(|| format!("{what} {name}"))?;
+    anyhow::Ok((name.clone(), value))
+  });
+  let mut values = literal.clone();
+  values.extend(futures::future::try_join_all(run).await?);
+  Ok(values)
+}
+
+/// What one line of shell prints, for a value a file should not hold.
+#[cfg(feature = "mcp")]
+async fn value(command: &str) -> anyhow::Result<String> {
+  use anyhow::{Context, bail};
+
+  let run = tokio::process::Command::new("bash")
+    .arg("-c")
+    .arg(command)
+    // The terminal belongs to the transcript, so nothing here may ask it
+    // anything: a pinentry that wanted this one would draw over the session
+    // and wait for an answer no one can give it.
+    .stdin(std::process::Stdio::null())
+    .kill_on_drop(true)
+    .output();
+  let output = tokio::time::timeout(VALUE_TIMEOUT, run)
+    .await
+    .map_err(|_| anyhow::anyhow!("{command}: no answer in {}s", VALUE_TIMEOUT.as_secs()))?
+    .with_context(|| format!("could not run {command}"))?;
+  if !output.status.success() {
+    // What it said for itself, never what it printed: the one is the reason
+    // and the other is the secret it failed to produce.
+    let said = String::from_utf8_lossy(&output.stderr);
+    bail!("{command}: {}", said.lines().next().unwrap_or("said nothing"));
+  }
+  let value = String::from_utf8(output.stdout).with_context(|| format!("{command}: printed no text"))?;
+  // A command prints a value with the newline it was printed with; the value
+  // is the rest. Only the end, since a space at the front is a value that is
+  // wrong rather than one that needs tidying.
+  Ok(value.trim_end().to_string())
 }
 
 #[cfg(feature = "mcp")]
@@ -335,9 +414,13 @@ fn headers(
     .iter()
     .map(|(name, value)| {
       let name: http::HeaderName = name.parse().with_context(|| format!("not a header name: {name}"))?;
-      let value: http::HeaderValue = value
+      let mut value: http::HeaderValue = value
         .parse()
         .with_context(|| format!("not a header value for {name}"))?;
+      // A header written in this file is a header that carries a token, near
+      // enough, and one marked as such is one nothing prints while looking at
+      // the request it went out on.
+      value.set_sensitive(true);
       Ok((name, value))
     })
     .collect()
@@ -386,10 +469,12 @@ mod tests {
         [files]
         command = "mcp-files --root ."
         env.TOKEN = "x"
+        env-command.KEY = "gh auth token"
 
         [docs]
         url = "https://example.com/mcp"
         headers.Authorization = "Bearer k"
+        headers-command.X-Api-Key = "pass show work/mcp"
         timeout = 60
       "#,
     );
@@ -397,10 +482,12 @@ mod tests {
     let files = &read["files"];
     assert_eq!(files.command.as_deref(), Some("mcp-files --root ."));
     assert_eq!(files.env["TOKEN"], "x");
+    assert_eq!(files.env_command["KEY"], "gh auth token");
     assert_eq!(files.timeout, None, "a server says nothing about time by default");
     let docs = &read["docs"];
     assert_eq!(docs.url.as_deref(), Some("https://example.com/mcp"));
     assert_eq!(docs.headers["Authorization"], "Bearer k");
+    assert_eq!(docs.headers_command["X-Api-Key"], "pass show work/mcp");
     assert_eq!(docs.timeout, Some(60));
     // An empty file is a file with no servers in it, not an error.
     assert_eq!(config(""), Config::default());
@@ -411,6 +498,72 @@ mod tests {
       .expect_err("an unknown key is refused")
       .to_string();
     assert!(err.contains("comand"), "which key it was: {err}");
+  }
+
+  #[cfg(feature = "mcp")]
+  #[tokio::test]
+  async fn a_value_can_be_what_a_command_prints_and_what_went_wrong_is_never_that() {
+    let map = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+      pairs
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
+    };
+    let none = BTreeMap::new();
+
+    // What the command printed is the value, without the newline it was
+    // printed with, and a value written out is left alone.
+    let read = values(
+      &map(&[("KEEP", "as written")]),
+      &map(&[("TOKEN", "printf 'secret \n'"), ("SUM", "echo $((1 + 1))")]),
+      "env",
+    )
+    .await
+    .expect("both kinds of value");
+    assert_eq!(read["KEEP"], "as written");
+    assert_eq!(read["TOKEN"], "secret");
+    assert_eq!(read["SUM"], "2", "a line of shell, not an argv");
+
+    // Nothing here may stop to ask the terminal anything, so a command that
+    // reads is given the end of the input rather than the session's keys.
+    let read = values(&none, &map(&[("ASKS", "cat")]), "env")
+      .await
+      .expect("no waiting");
+    assert_eq!(read["ASKS"], "");
+
+    // A command that failed is told about as what it said for itself — the
+    // value, the command from the file, and the first line of its complaint.
+    // Never what it printed: that is the secret it half produced, and a note
+    // in the transcript is a note in the session file on disk.
+    let err = values(
+      &none,
+      &map(&[("TOKEN", "echo $((111 * 111)); echo locked >&2; exit 1")]),
+      "env",
+    )
+    .await
+    .expect_err("a command that failed");
+    let err = format!("{err:#}");
+    assert!(err.contains("env TOKEN"), "which value it was: {err}");
+    assert!(err.contains("locked"), "and why: {err}");
+    assert!(!err.contains("12321"), "but never the output: {err}");
+
+    // Given twice, it is wrong in one of the two places.
+    let err = values(
+      &map(&[("Authorization", "Bearer k")]),
+      &map(&[("Authorization", "true")]),
+      "header",
+    )
+    .await
+    .expect_err("declared twice")
+    .to_string();
+    assert!(err.contains("header Authorization"), "{err}");
+
+    // And a header this file carries is one nothing prints while looking at
+    // the request it went out on.
+    let built = headers(&map(&[("Authorization", "Bearer k")])).expect("a header");
+    let value = &built[&http::HeaderName::from_static("authorization")];
+    assert_eq!(value.to_str().expect("text"), "Bearer k");
+    assert!(value.is_sensitive(), "a token is not for printing");
   }
 
   #[cfg(feature = "mcp")]

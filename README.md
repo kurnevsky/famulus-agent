@@ -171,7 +171,7 @@ env.TOKEN = "…"
 
 [docs]
 url = "https://example.com/mcp"
-headers.Authorization = "Bearer …"
+headers-command.Authorization = "echo Bearer $(pass show work/mcp)"
 timeout = 60
 except = ["delete_page"]
 ```
@@ -183,8 +183,10 @@ A server is a `command` to run, spoken to over its own stdin and stdout, or a
 |-----|---------|
 | `command` | A line of shell, run the way the `bash` tool runs one — quoting, `~` and `$HOME` all work |
 | `env` | Added to the environment that command inherits |
+| `env-command` | The same, each value the output of a line of shell rather than written out |
 | `url` | Endpoint of a server that speaks streamable HTTP |
 | `headers` | Sent with every request to it, which is where a token goes |
+| `headers-command` | The same, each value the output of a line of shell rather than written out |
 | `timeout` | Seconds one of this server's tools may take, `0` to wait forever (default 300) |
 | `tools` | Take only these of the tools it offers |
 | `except` | Take everything but these |
@@ -192,6 +194,22 @@ A server is a `command` to run, spoken to over its own stdin and stdout, or a
 `tools` and `except` are the same idea as `--tools` and `--no-tools`, for one
 server: a server with thirty tools can be cut to the two worth having without
 naming every tool of every other server.
+
+A token is better kept out of the file it is used from, so `env-command` and
+`headers-command` take the line of shell that produces the value instead of the
+value — `pass show …`, `gh auth token`, `op read …`, `echo Bearer $(…)` to put
+a word in front of it. Each runs once, when its server starts, and what it
+printed is the value, without the newline it was printed with. A name given
+both a value and a command is refused rather than resolved by some rule about
+which wins.
+
+Such a command has ten seconds and no terminal: its input is closed, so an
+agent that wants a passphrase must be one that can ask elsewhere or one that is
+already unlocked — a pinentry in this terminal would draw over the session and
+wait for an answer nobody could give it. One that fails is a note naming the
+value, the command and the first line of what it said for itself, never what it
+printed. A value is fetched once per session and held, so a token that expires
+mid-session is a session to restart.
 
 The file is fa's own, so it reads the way the rest of fa does — a command is
 the line you would type, not an argv — and a key it does not know is an error
@@ -646,9 +664,9 @@ with the mouse usually requires holding `Shift`.
   highlight queries and are used as they come, except Haskell, whose query is
   written for neovim's pattern precedence and needs one of our own.
 - `src/mcp.rs` – finding MCP servers and starting them: the XDG search for
-  `mcp.toml`, the table-per-server file it reads, and handing each
-  server's tools to the agent. Rig speaks the protocol; this only decides who
-  to speak to. Holding the result is what keeps the servers running, so it
+  `mcp.toml`, the table-per-server file it reads, the values it runs a command
+  for rather than holding, and handing each server's tools to the agent. Rig
+  speaks the protocol; this only decides who to speak to. Holding the result is what keeps the servers running, so it
   lives as long as the program does.
 - `src/ui.rs` – ratatui app: transcript, input, footer.
 - `tests/e2e.rs` – the binary driven through tmux against a mock provider: a
