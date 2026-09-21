@@ -3,8 +3,8 @@
 //! summarized by the model and replaced with a structured checkpoint, while the
 //! most recent ~`keep_recent_tokens` stay verbatim.
 
-use rig_agent::agent::Agent;
-use rig_agent::completion::{Prompt, PromptError};
+use crate::agent::Summarizer;
+use rig_core::completion::CompletionError;
 use rig_core::completion::Message;
 use rig_core::message::{AssistantContent, ToolResultContent, UserContent};
 
@@ -358,7 +358,11 @@ pub fn summary_message(summary: &str) -> Message {
 /// compaction has already been through it.
 ///
 /// Block order: conversation, previous summary, instructions.
-async fn summarize(summarizer: &Agent, messages: &[Message], previous: Option<&str>) -> Result<String, PromptError> {
+async fn summarize(
+  summarizer: &Summarizer,
+  messages: &[Message],
+  previous: Option<&str>,
+) -> Result<String, CompletionError> {
   let conversation = serialize(messages);
   let mut prompt = format!("<conversation>\n{conversation}\n</conversation>\n\n");
   if let Some(previous) = previous {
@@ -375,7 +379,7 @@ async fn summarize(summarizer: &Agent, messages: &[Message], previous: Option<&s
 /// The same for the beginning of a split turn, which is asked for in terms of
 /// the rest of that turn rather than of the conversation: what was asked for,
 /// how far it got, and what the half still on screen needs to be read by.
-async fn summarize_turn(summarizer: &Agent, messages: &[Message]) -> Result<String, PromptError> {
+async fn summarize_turn(summarizer: &Summarizer, messages: &[Message]) -> Result<String, CompletionError> {
   let conversation = serialize(messages);
   answer(
     summarizer,
@@ -387,11 +391,11 @@ async fn summarize_turn(summarizer: &Agent, messages: &[Message]) -> Result<Stri
 /// What the summarizer said, which may not be nothing: an empty checkpoint
 /// stands for the conversation every bit as much as a full one does, and
 /// there would be no telling afterwards what it was standing for.
-async fn answer(summarizer: &Agent, prompt: String) -> Result<String, PromptError> {
-  let summary = summarizer.prompt(prompt).await?.trim().to_string();
+async fn answer(summarizer: &Summarizer, prompt: String) -> Result<String, CompletionError> {
+  let summary = summarizer.ask(prompt).await?.trim().to_string();
   if summary.is_empty() {
-    return Err(PromptError::CompletionError(
-      rig_core::completion::CompletionError::ResponseError("summarizer returned an empty summary".into()),
+    return Err(CompletionError::ResponseError(
+      "summarizer returned an empty summary".into(),
     ));
   }
   Ok(summary)
@@ -404,10 +408,10 @@ async fn answer(summarizer: &Agent, prompt: String) -> Result<String, PromptErro
 /// `turn_summary` is on: the conversation before that turn, and the beginning
 /// of the turn itself, joined into the one message the history keeps.
 pub async fn compact(
-  summarizer: &Agent,
+  summarizer: &Summarizer,
   history: Vec<Message>,
   settings: &Settings,
-) -> Result<Option<Compacted>, PromptError> {
+) -> Result<Option<Compacted>, CompletionError> {
   let Some(cut) = cut_point(&history, settings.keep_recent_tokens) else {
     return Ok(None);
   };

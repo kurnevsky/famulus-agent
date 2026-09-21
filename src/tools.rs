@@ -116,11 +116,6 @@ fn schema<T: JsonSchema>() -> serde_json::Value {
     }
   }
   strip(&mut value);
-  // The call id a hook injects is ours, not the model's: it is never asked
-  // for, so it is never offered.
-  if let Some(properties) = value.get_mut("properties").and_then(|p| p.as_object_mut()) {
-    properties.remove(CALL_ARG);
-  }
   value
 }
 
@@ -990,18 +985,16 @@ mod edit_tests {
 
 // ---------------------------------------------------------------- bash
 
-/// Receives throttled snapshots of a running command's output for live display.
-/// Live output of a running command, with the tool call it belongs to — so a
-/// transcript can put it under the right one when several run at once.
-pub type OutputSink = Arc<dyn Fn(String, String) + Send + Sync>;
-
-/// The argument `UiHook` injects to tell a call which call it is.
+/// Where a running command reports throttled snapshots of its output, put
+/// into its context by the loop that dispatched it.
 ///
-/// Nothing in rig hands a tool its own call id, and the hook that knows it
-/// runs before the body rather than around it. Rewriting the arguments is the
-/// one channel between them, so the id travels as one — stripped from the
-/// schema, so it is never something the model is asked for or sends.
-pub const CALL_ARG: &str = "__call";
+/// Bound to the call it answers for before the tool ever sees it, so the
+/// transcript can put the output under the right line when several commands
+/// run at once — and the command itself never has to know which one it is.
+/// Nothing about the call travels through the arguments to tell it, and
+/// nothing about it is offered to the model.
+#[derive(Clone)]
+pub struct Output(pub Arc<dyn Fn(String) + Send + Sync>);
 
 /// Minimum interval between live output snapshots.
 const UPDATE_THROTTLE: Duration = Duration::from_millis(100);
@@ -1012,7 +1005,6 @@ const DRAIN_GRACE: Duration = Duration::from_millis(500);
 #[derive(Clone)]
 pub struct BashTool {
   pub cwd: PathBuf,
-  pub on_output: Option<OutputSink>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1021,9 +1013,6 @@ pub struct BashArgs {
   command: String,
   /// Timeout in seconds (optional, no default timeout)
   timeout: Option<f64>,
-  /// Not the model's: see `CALL_ARG`.
-  #[serde(default, rename = "__call")]
-  call: String,
 }
 
 impl Tool for BashTool {
@@ -1040,7 +1029,7 @@ impl Tool for BashTool {
     )
   }
 
-  async fn call(&self, _ctx: &mut ToolContext, args: BashArgs) -> Result<String, ToolError> {
+  async fn call(&self, ctx: &mut ToolContext, args: BashArgs) -> Result<String, ToolError> {
     let timeout = match args.timeout {
       Some(t) if !(t.is_finite() && t > 0.0) => {
         return Err(ToolError("Invalid timeout: must be a finite number of seconds".into()));
@@ -1078,7 +1067,7 @@ impl Tool for BashTool {
     let mut merged = tokio::net::unix::pipe::Receiver::from_owned_fd(reads.into())?;
 
     let mut output = OutputAccumulator::new("fa-bash");
-    let mut throttle = UpdateThrottle::new(self.on_output.clone(), args.call.clone());
+    let mut throttle = UpdateThrottle::new(ctx.get::<Output>().cloned());
     let far_future = tokio::time::Instant::now() + Duration::from_secs(365 * 24 * 3600);
     let mut deadline = timeout.map(|t| tokio::time::Instant::now() + t);
     let mut drain_deadline: Option<tokio::time::Instant> = None;
@@ -1192,24 +1181,22 @@ impl Drop for ProcessGroupGuard {
 }
 
 struct UpdateThrottle {
-  sink: Option<OutputSink>,
-  /// The call whose output this is.
-  call: String,
+  sink: Option<Output>,
   last: Option<Instant>,
 }
 
 impl UpdateThrottle {
-  fn new(sink: Option<OutputSink>, call: String) -> Self {
-    Self { sink, call, last: None }
+  fn new(sink: Option<Output>) -> Self {
+    Self { sink, last: None }
   }
 
   fn maybe_emit(&mut self, output: &mut OutputAccumulator) {
-    let Some(sink) = &self.sink else { return };
+    let Some(Output(sink)) = &self.sink else { return };
     if self.last.is_some_and(|t| t.elapsed() < UPDATE_THROTTLE) {
       return;
     }
     self.last = Some(Instant::now());
-    sink(self.call.clone(), output.snapshot(false).content);
+    sink(output.snapshot(false).content);
   }
 }
 
@@ -1478,31 +1465,34 @@ mod bash_tests {
     assert_eq!(first(schema::<BashArgs>()), "command");
   }
 
-  #[test]
-  fn the_injected_call_id_is_never_offered_to_the_model() {
-    // It is how a hook tells a command which call it is; the model neither
-    // sends it nor should know it exists.
+  #[tokio::test]
+  async fn a_command_is_told_which_call_it_is_without_being_asked_for_it() {
+    // A command reports its output down whatever it was handed, and is
+    // told nothing else — so the model is never offered a field that is
+    // not its own, and the arguments it sends are only ever its own too.
     let schema = schema::<BashArgs>();
     let properties = schema["properties"].as_object().unwrap();
-    assert!(properties.contains_key("command"));
-    assert!(!properties.contains_key(CALL_ARG), "{schema}");
-    assert!(!schema.to_string().contains(CALL_ARG), "{schema}");
-  }
+    assert_eq!(properties.len(), 2, "{schema}");
+    assert!(properties.contains_key("command") && properties.contains_key("timeout"));
 
-  #[test]
-  fn a_command_is_told_which_call_it_is() {
-    // The hook rewrites the arguments to carry it, so it has to survive the
-    // trip back through deserialization.
-    let args: BashArgs = serde_json::from_value(serde_json::json!({
-      "command": "echo hi",
-      CALL_ARG: "call_7",
-    }))
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let sink = seen.clone();
+    let mut ctx = ToolContext::new();
+    ctx.insert(Output(Arc::new(move |text| sink.lock().unwrap().push(text))));
+    let args = BashArgs {
+      command: "echo first; sleep 0.3; echo second".into(),
+      timeout: None,
+    };
+    BashTool {
+      cwd: std::env::temp_dir(),
+    }
+    .call(&mut ctx, args)
+    .await
     .unwrap();
-    assert_eq!(args.command, "echo hi");
-    assert_eq!(args.call, "call_7");
-    // The tool still runs standalone, without a hook to tell it anything.
-    let plain: BashArgs = serde_json::from_value(serde_json::json!({ "command": "echo hi" })).unwrap();
-    assert!(plain.call.is_empty());
+    assert!(
+      seen.lock().unwrap().iter().any(|text| text == "first\n"),
+      "output goes where the dispatcher said, as it arrives"
+    );
   }
 
   use super::*;
@@ -1511,7 +1501,6 @@ mod bash_tests {
   fn tool() -> BashTool {
     BashTool {
       cwd: std::env::temp_dir(),
-      on_output: None,
     }
   }
 
@@ -1520,7 +1509,6 @@ mod bash_tests {
       .call(
         &mut ToolContext::new(),
         BashArgs {
-          call: String::new(),
           command: command.into(),
           timeout,
         },
@@ -1611,24 +1599,9 @@ mod bash_tests {
   }
 
   #[tokio::test]
-  async fn streams_partial_output() {
-    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
-    let sink = seen.clone();
-    let tool = BashTool {
-      cwd: std::env::temp_dir(),
-      on_output: Some(Arc::new(move |_call, text| sink.lock().unwrap().push(text))),
-    };
-    let out = run(&tool, "echo first; sleep 0.3; echo second", None).await.unwrap();
-    assert_eq!(out, "first\nsecond\n");
-    let seen = seen.lock().unwrap();
-    assert!(seen.iter().any(|s| s == "first\n"), "{seen:?}");
-  }
-
-  #[tokio::test]
   async fn missing_cwd_is_reported() {
     let tool = BashTool {
       cwd: PathBuf::from("/nonexistent/dir"),
-      on_output: None,
     };
     let err = run(&tool, "true", None).await.unwrap_err();
     assert!(err.0.starts_with("Working directory does not exist: /nonexistent/dir"));

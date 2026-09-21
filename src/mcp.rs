@@ -345,11 +345,8 @@ fn headers(
 
 /// Hand every tool that came up to the agent being built.
 #[cfg(feature = "mcp")]
-pub fn attach(
-  builder: rig_agent::agent::AgentBuilder<rig_agent::agent::WithBuilderTools>,
-  servers: &Servers,
-) -> rig_agent::agent::AgentBuilder<rig_agent::agent::WithBuilderTools> {
-  servers.tools.iter().fold(builder, |builder, (tools, sink, timeout)| {
+pub fn attach(server: rig_agent::tool::server::ToolServer, servers: &Servers) -> rig_agent::tool::server::ToolServer {
+  servers.tools.iter().fold(server, |server, (tools, sink, timeout)| {
     // Rig bounds a call at five minutes unless told otherwise. A server can
     // say its own number, and zero lets a call take as long as it takes.
     let timeout = match timeout {
@@ -357,7 +354,7 @@ pub fn attach(
       Some(seconds) => Some(std::time::Duration::from_secs(*seconds)),
       None => Some(rig_agent::tool::rmcp::DEFAULT_MCP_TOOL_TIMEOUT),
     };
-    builder.rmcp_tools_with_timeout(tools.clone(), sink.clone(), timeout)
+    server.rmcp_tools_with_timeout(tools.clone(), sink.clone(), timeout)
   })
 }
 
@@ -367,11 +364,8 @@ pub async fn connect(_config: Config) -> Servers {
 }
 
 #[cfg(not(feature = "mcp"))]
-pub fn attach(
-  builder: rig_agent::agent::AgentBuilder<rig_agent::agent::WithBuilderTools>,
-  _servers: &Servers,
-) -> rig_agent::agent::AgentBuilder<rig_agent::agent::WithBuilderTools> {
-  builder
+pub fn attach(server: rig_agent::tool::server::ToolServer, _servers: &Servers) -> rig_agent::tool::server::ToolServer {
+  server
 }
 
 #[cfg(test)]

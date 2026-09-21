@@ -1,40 +1,51 @@
-//! Agent construction and the streaming run loop. The TUI never touches rig
-//! directly; it receives `AgentEvent`s over a channel and can abort a run.
+//! The run loop, and what it is built from.
+//!
+//! The TUI never touches rig directly: it starts a run, reads `AgentEvent`s
+//! off a channel, and stops or steers the run through a [`Control`].
+//!
+//! The loop here owns the conversation as it grows. That is the whole of the
+//! design: a run that is interrupted, or added to while it goes, leaves the
+//! messages behind the interruption exactly as the model gave them, because
+//! they were never anywhere else to be rebuilt from. Rig supplies the two
+//! hard parts — the provider wires, and the tools — and nothing in between.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use rig_agent::agent::{
-  Agent, AgentBuilder, AgentHook, CompletionCallAction, CompletionCallEvent, HookContext, ModelTurnAction,
-  ModelTurnFinished, MultiTurnStreamItem, RequestPatch, StreamingError, ToolCall, ToolCallAction, ToolResultAction,
-  ToolResultEvent,
-};
-use rig_agent::client::AgentClientExt;
-use rig_agent::completion::PromptError;
-use rig_agent::streaming::StreamingPrompt;
-use rig_agent::tool::Tool;
+use futures::future::BoxFuture;
+use rig_agent::tool::ToolContext;
+use rig_agent::tool::server::{ToolServer, ToolServerHandle};
 use rig_core::client::completion::CompletionClient;
-use rig_core::completion::{
-  CompletionError, CompletionModel, CompletionRequest, CompletionResponse, Message, ProviderCapabilities, Usage,
-};
-use rig_core::message::{ToolResultContent, UserContent};
+use rig_core::completion::{CompletionError, CompletionModel, CompletionRequest, Message, ToolDefinition, Usage};
+use rig_core::message::{AssistantContent, Reasoning, ToolCall, ToolResultContent, UserContent};
 use rig_core::providers::{gemini, openai};
 use rig_core::streaming::{StreamedAssistantContent, StreamingCompletionResponse, ToolCallDeltaContent};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::compaction::{self, Compacted, Settings};
-use crate::tools::{AskTool, BUILT_IN, BashTool, CALL_ARG, EditDiff, EditTool, ReadTool, WriteTool};
+use crate::tools::{AskTool, BUILT_IN, BashTool, EditDiff, EditTool, Output, ReadTool, WriteTool};
+
+/// What a tool result says when the run was stopped before it could be run.
+///
+/// The model asked for the call, so the conversation owes an answer — a call
+/// left hanging is one no provider will take back, which would leave the
+/// session unable to carry on from what it just kept.
+pub const ABORTED: &str = "Aborted by the user.";
 
 /// Events streamed from a run to the UI.
 #[derive(Debug)]
 pub enum AgentEvent {
   Text(String),
   Reasoning(String),
+  /// A message the user typed mid-run, read by the run at the top of a turn.
+  /// The UI has been drawing it as waiting; this is where it becomes part of
+  /// the conversation.
+  Steered(String),
   ToolCall {
     name: String,
     args: serde_json::Value,
@@ -66,10 +77,7 @@ pub enum AgentEvent {
     /// Images the tool answered with, drawn under its output.
     images: Vec<Vec<u8>>,
     is_error: bool,
-    /// The call this answers, as the transcript will name it. Whether a tool
-    /// failed is not something a transcript records — a failed result looks
-    /// like any other on the wire — so a session that wants to redraw it
-    /// later has to keep the flag against this id itself.
+    /// The call this answers, as the transcript will name it.
     call: String,
     /// Numbered diff for `edit`, shown in place of the output text.
     diff: Option<String>,
@@ -84,21 +92,10 @@ pub enum AgentEvent {
     usage: Usage,
     context_tokens: u64,
   },
-  /// The run finished. `messages` holds only this run's new transcript
-  /// messages (prompt, tool calls/results, final answer); append them to the
-  /// history.
+  /// The run reached its answer. `messages` is everything it added to the
+  /// conversation: the prompt, every turn, and the answer.
   Done {
     messages: Vec<Message>,
-  },
-  /// A turn is about to be asked for, and `history` is what this run has
-  /// added to the conversation so far — rig's own copy, the same one the
-  /// request about to go out carries.
-  ///
-  /// Sent so that a run nothing can ask for its messages afterwards, because
-  /// the task running it was dropped where it stood, still leaves the turns
-  /// behind the one it was dropped in exactly as the model gave them.
-  Turn {
-    history: Vec<Message>,
   },
   /// The `ask` tool wants the user to answer something. The dialog the UI
   /// opens sends what they said back down `reply`; dropping it instead is a
@@ -107,11 +104,9 @@ pub enum AgentEvent {
     questions: Vec<crate::ask::Question>,
     reply: oneshot::Sender<crate::ask::Outcome>,
   },
-  /// The run ended without a final response: stopped at a turn boundary, or
-  /// gave up after an `Error`. `messages` is what it got through, in the same
-  /// shape and holding the same thing `Done` carries — empty when the run
-  /// ended somewhere with nothing to hand back, which leaves the transcript
-  /// the only record of it.
+  /// The run stopped short of an answer — cancelled, out of room, or after
+  /// an `Error`. `messages` holds the same thing `Done` carries: everything
+  /// it got through, as it was sent.
   Ended {
     messages: Vec<Message>,
   },
@@ -120,25 +115,195 @@ pub enum AgentEvent {
   Error(String),
 }
 
+/// What a session runs on: one model with its tools, and the handle the UI
+/// stops and steers it by.
 pub struct Agents {
-  pub agent: Arc<Agent>,
-  /// Tool-less agent used to summarize history during compaction.
-  pub summarizer: Arc<Agent>,
-  /// Raised while a message the user typed is waiting behind the run.
-  pub waiting: Waiting,
-  /// Raised when the context has outgrown the window.
-  pub overflow: Overflow,
+  pub runtime: Arc<Runtime>,
+  /// Tool-less model used to summarize history during compaction.
+  pub summarizer: Arc<Summarizer>,
+  pub control: Control,
 }
 
-/// Whether something the user typed is waiting to be sent. The UI raises it,
-/// the run reads it at each turn boundary, so a message that arrives mid-run
-/// is taken at the next opportunity rather than after the whole answer.
-pub type Waiting = Arc<AtomicBool>;
+// ---------------------------------------------------------------- control
 
-/// Whether the conversation has grown past what the context window holds. The
-/// run raises it as soon as a request goes over the limit and stops at its
-/// next turn boundary; the UI takes it back down once it has compacted.
-pub type Overflow = Arc<AtomicBool>;
+/// What the UI says to a run while it is going.
+///
+/// Cancelling and steering are the two things it has to say, and both have
+/// to reach a run that is in the middle of something — so each is a flag the
+/// loop reads at its next opportunity, and a wake-up for the ones that
+/// cannot wait for whatever the loop is blocked on.
+#[derive(Clone, Default)]
+pub struct Control(Arc<Signals>);
+
+#[derive(Default)]
+struct Signals {
+  /// Esc.
+  cancelled: AtomicBool,
+  /// Raised by the run when the conversation outgrew the window. The UI
+  /// takes it back down once it has made the room.
+  overflow: AtomicBool,
+  /// What the user typed while the run was going, for the run to read at
+  /// the top of its next turn.
+  steer: Mutex<VecDeque<String>>,
+  /// Woken when a run should look at the above rather than go on waiting
+  /// for whatever it is in the middle of.
+  wake: Notify,
+}
+
+impl Control {
+  /// Start a run with nothing held against it — but keep anything typed
+  /// while the last one was ending, which was meant for this one.
+  fn begin(&self) {
+    self.0.cancelled.store(false, Ordering::Relaxed);
+  }
+
+  /// Stop the run at the first thing it can stop in the middle of.
+  pub fn cancel(&self) {
+    self.0.cancelled.store(true, Ordering::Relaxed);
+    self.0.wake.notify_waiters();
+  }
+
+  pub fn cancelled(&self) -> bool {
+    self.0.cancelled.load(Ordering::Relaxed)
+  }
+
+  /// Resolves once the run should stop what it is doing. Registered before
+  /// the flag is read, so a cancellation between the two is still caught.
+  async fn stopped(&self) {
+    loop {
+      let woken = self.0.wake.notified();
+      if self.cancelled() {
+        return;
+      }
+      woken.await;
+    }
+  }
+
+  /// Hand the run something the user typed while it was going.
+  ///
+  /// This is where a waiting message lives — there is no second copy of it
+  /// anywhere. Whoever gets to it first takes it: the run, at the top of
+  /// its next turn, or the UI once there is no run left to give it to.
+  pub fn steer(&self, text: String) {
+    self.held().push_back(text);
+  }
+
+  /// Take the newest back, for the input box to have it again.
+  pub fn unsteer(&self) -> Option<String> {
+    self.held().pop_back()
+  }
+
+  /// Take the oldest, for the UI to send as a run of its own.
+  pub fn take_next(&self) -> Option<String> {
+    self.held().pop_front()
+  }
+
+  /// Take everything, in the order it was typed: the run reads them into
+  /// the turn it is about to ask for, and Esc takes them out of its way.
+  pub fn take(&self) -> Vec<String> {
+    self.held().drain(..).collect()
+  }
+
+  pub fn steering(&self) -> bool {
+    !self.held().is_empty()
+  }
+
+  /// What is waiting, for the screen to say so.
+  pub fn waiting(&self) -> Vec<String> {
+    self.held().iter().cloned().collect()
+  }
+
+  fn held(&self) -> std::sync::MutexGuard<'_, VecDeque<String>> {
+    self.0.steer.lock().expect("a queue nobody panicked holding")
+  }
+
+  fn overflowed_now(&self) {
+    self.0.overflow.store(true, Ordering::Relaxed);
+  }
+
+  /// Whether the run found the context window full — and clear the mark,
+  /// since answering it is the UI's half of the bargain.
+  pub fn overflowed(&self) -> bool {
+    self.0.overflow.swap(false, Ordering::Relaxed)
+  }
+}
+
+// ------------------------------------------------------------------ model
+
+/// One model, whichever provider it came from.
+///
+/// `CompletionModel` returns `impl Future`, so it cannot be made into an
+/// object. This is the same two calls behind a boxed one, which is what lets
+/// the rest of the file stop caring which provider a session opened.
+trait Model: Send + Sync {
+  fn stream(&self, request: CompletionRequest) -> BoxFuture<'_, Result<StreamingCompletionResponse, CompletionError>>;
+  fn answer(&self, request: CompletionRequest) -> BoxFuture<'_, Result<String, CompletionError>>;
+}
+
+impl<M: CompletionModel + Send + Sync + 'static> Model for M {
+  fn stream(&self, request: CompletionRequest) -> BoxFuture<'_, Result<StreamingCompletionResponse, CompletionError>> {
+    Box::pin(CompletionModel::stream(self, request))
+  }
+
+  fn answer(&self, request: CompletionRequest) -> BoxFuture<'_, Result<String, CompletionError>> {
+    Box::pin(async move {
+      let response = CompletionModel::completion(self, request).await?;
+      Ok(
+        response
+          .choice
+          .iter()
+          .filter_map(|content| match content {
+            AssistantContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+          })
+          .collect::<Vec<_>>()
+          .join(""),
+      )
+    })
+  }
+}
+
+/// Everything a run needs that does not change between runs.
+pub struct Runtime {
+  model: Arc<dyn Model>,
+  tools: ToolServerHandle,
+  preamble: String,
+  max_turns: usize,
+  compaction: Settings,
+  /// The tool names this session was held to, or all of them.
+  allowed: Option<Vec<String>>,
+  /// Chat completions will not carry an image inside a tool message, so a
+  /// `read` that answers with a screenshot has it relayed after the result.
+  relay_images: bool,
+}
+
+/// The tool-less model compaction summarizes with.
+pub struct Summarizer {
+  model: Arc<dyn Model>,
+  preamble: String,
+}
+
+impl Summarizer {
+  /// One question, one answer. Nothing here is a conversation.
+  pub async fn ask(&self, prompt: String) -> Result<String, CompletionError> {
+    self
+      .model
+      .answer(CompletionRequest {
+        model: None,
+        preamble: Some(self.preamble.clone()),
+        chat_history: vec![Message::user(prompt)],
+        documents: Vec::new(),
+        tools: Vec::new(),
+        temperature: None,
+        max_tokens: None,
+        tool_choice: None,
+        additional_params: None,
+        output_schema: None,
+        record_telemetry_content: false,
+      })
+      .await
+  }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provider {
@@ -159,240 +324,8 @@ pub struct Config {
   pub compaction: Settings,
   /// Whether the model accepts image input.
   pub vision: bool,
-  /// The tools to offer the model, or `None` to offer every one there is.
-  /// Every tool is registered either way; this is what the model is shown,
-  /// and rig refuses a call to anything left out of it.
+  /// Tool names this session offers, or `None` for all of them.
   pub tools: Option<Vec<String>>,
-}
-
-/// The id of the call a hook is reporting.
-///
-/// Rig's handle is always there — minted when the provider issued none — and
-/// the `Option` is only in the shape of the event, so there is no absent case
-/// to have an answer for.
-fn call_id(id: Option<&str>) -> String {
-  id.unwrap_or_default().to_string()
-}
-
-/// Reports tool calls and results to the UI. Both go through the hook path so
-/// they stay ordered, and the result carries an accurate error flag, which the
-/// transcript-level stream items do not.
-struct UiHook {
-  tx: mpsc::UnboundedSender<AgentEvent>,
-  waiting: Waiting,
-  /// Narrows what each request advertises, when a session asked for less than
-  /// everything. Per turn is the only place rig takes it, so it is said again
-  /// every turn.
-  tools: Option<Vec<String>>,
-  /// What the context window holds and when to make room in it.
-  compaction: Settings,
-  overflow: Overflow,
-  /// How much of the conversation the provider has counted, and what it said.
-  tally: Mutex<Tally>,
-}
-
-/// What the last answered request cost, and how much of the conversation that
-/// figure covers.
-///
-/// A provider counts the request it was sent, so its figure is the truth
-/// about everything up to the answer it gave — and says nothing about what a
-/// tool has returned since. Holding the two apart is what keeps the guessing
-/// down to the few messages nobody has counted yet.
-#[derive(Default)]
-struct Tally {
-  /// The provider's own count for the request it has answered, or 0 while it
-  /// has answered none — or reports nothing.
-  reported: u64,
-  /// How many messages that count covers: everything the request carried,
-  /// and the answer its output tokens paid for.
-  counted: usize,
-  /// How many the request in flight carries, to become `counted` once it is
-  /// answered.
-  sent: usize,
-  /// How much of the conversation this run was handed rather than made —
-  /// everything before its own first message. Taken at the first call, whose
-  /// history is exactly that and nothing else.
-  carried: usize,
-  /// What the context last weighed, for the turn to report when the provider
-  /// will not say.
-  estimated: u64,
-}
-
-impl AgentHook for UiHook {
-  /// Stop before the next model call when the user has said something since
-  /// the run started, or when the conversation no longer fits the context
-  /// window — so their message is the next thing the model reads, and so the
-  /// room to read it in is made before the request that needs it goes out.
-  ///
-  /// Between turns is the only place a run can be cut without leaving a call
-  /// unanswered: every tool the turn just ended asked for has come back. The
-  /// run's work is kept the way an abort keeps it, and what comes next — the
-  /// waiting message, or the same run picked back up over a compacted
-  /// history — is sent as a fresh run over it. Which is what the model would
-  /// have seen had the message been typed a moment earlier, or had the
-  /// summary been written a moment before it was needed.
-  ///
-  /// Never before the first call, where the run has done nothing yet: the
-  /// message it stopped for would start a run that stops for the next one,
-  /// and a compaction it stopped for would be handed the same history again.
-  async fn on_completion_call(&self, _ctx: &HookContext, event: CompletionCallEvent<'_>) -> CompletionCallAction {
-    // Weighed before it is sent, rather than only once the answer to it has
-    // come back: a tool can return a file the size of the window, and the
-    // request carrying it is the one that would be refused.
-    let context = self.weigh_request(event.history, event.prompt, event.turn);
-    self.weigh(context);
-    // Where the turns behind this one are said once in rig's own words, so
-    // that an abort — which leaves nothing to ask afterwards — has something
-    // better to keep than what the screen showed.
-    let _ = self.tx.send(AgentEvent::Turn {
-      history: self.made(event.history, event.prompt),
-    });
-    if event.turn > 1 {
-      // The reason is rig's to carry, not anything this program reads: the
-      // stop comes back as a `PromptCancelled` and `start_run` knows it by
-      // that, not by what it says. It is here for a stack trace to say.
-      if self.waiting.load(Ordering::Relaxed) {
-        return CompletionCallAction::Stop("a message is waiting to be sent".into());
-      }
-      if self.overflow.load(Ordering::Relaxed) {
-        return CompletionCallAction::Stop("the context window is full".into());
-      }
-    }
-    match &self.tools {
-      Some(tools) => CompletionCallAction::Patch(RequestPatch::new().active_tools(tools.clone())),
-      None => CompletionCallAction::Continue,
-    }
-  }
-
-  /// Report what a call cost as soon as it comes back. Rig hands the whole
-  /// run's usage back at the end too, but a run is many calls and an hour of
-  /// them is a long time to say nothing — and a run that ends in an error or
-  /// an abort never gets to the end at all.
-  async fn on_model_turn_finished(&self, _ctx: &HookContext, event: ModelTurnFinished<'_>) -> ModelTurnAction {
-    let context_tokens = self.record(&event.usage);
-    let _ = self.tx.send(AgentEvent::Usage {
-      usage: event.usage,
-      context_tokens,
-    });
-    self.weigh(context_tokens);
-    ModelTurnAction::Continue
-  }
-
-  async fn on_tool_call(&self, _ctx: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
-    let args = serde_json::from_str(event.args).unwrap_or_else(|_| serde_json::Value::String(event.args.to_string()));
-    let _ = self.tx.send(AgentEvent::ToolCall {
-      name: event.tool_name.to_string(),
-      args: args.clone(),
-      call: call_id(event.tool_call_id),
-      internal: event.internal_call_id.to_string(),
-    });
-    // A command reports its output while it runs, and nothing in rig tells a
-    // tool which call it is. Rewriting the arguments is the one channel from
-    // here into the body, so the id goes down it — see `tools::CALL_ARG`.
-    match (event.tool_name, args) {
-      (BashTool::NAME, serde_json::Value::Object(mut args)) => {
-        args.insert(CALL_ARG.to_string(), call_id(event.tool_call_id).into());
-        ToolCallAction::Rewrite(args.into())
-      }
-      _ => ToolCallAction::Run,
-    }
-  }
-
-  async fn on_tool_result(&self, _ctx: &HookContext, event: ToolResultEvent<'_>) -> ToolResultAction {
-    // A built-in tool holds itself to a size as it makes its output; a
-    // server's reply arrives whole, and as long as the server felt like, so
-    // it is cut here — the one place every result passes through. Before the
-    // transcript is told, so the terminal shows the copy the model was given
-    // rather than one nobody read.
-    let capped = match BUILT_IN.contains(&event.tool_name) {
-      true => None,
-      false => crate::tools::cap_reply(event.presentation.as_content()),
-    };
-    let (output, images) = crate::images::split(capped.as_deref().unwrap_or(event.presentation.as_content()));
-    let _ = self.tx.send(AgentEvent::ToolResult {
-      name: event.tool_name.to_string(),
-      call: call_id(event.tool_call_id),
-      diff: event.tool_context.result::<EditDiff>().map(|d| d.diff.clone()),
-      output,
-      images,
-      is_error: event.raw_result.is_error() || event.raw_result.is_refused(),
-    });
-    capped
-      .and_then(|content| rig_agent::tool::ToolOutput::content(content).ok())
-      .map_or(ToolResultAction::Keep, ToolResultAction::rewrite_output)
-  }
-}
-
-impl UiHook {
-  /// What the request about to go out comes to: the provider's own count of
-  /// everything it has already weighed, plus a chars/4 estimate of what has
-  /// been said since — the tool results it has never seen. Nothing it has
-  /// counted is guessed at, which is as close as a client gets without a
-  /// tokenizer of its own.
-  fn weigh_request(&self, history: &[Message], prompt: &Message, turn: usize) -> u64 {
-    let mut tally = self.tally.lock().expect("a tally nobody panicked holding");
-    // A run starts over. The history it was handed is not the one the last
-    // run's figure was counted against: compacting rewrites it, and so does
-    // moving the session to another point of itself.
-    if turn == 1 {
-      *tally = Tally {
-        carried: history.len(),
-        ..Tally::default()
-      };
-    }
-    let counted = tally.counted.min(history.len());
-    let context = tally.reported
-      + compaction::estimate_tokens(&history[counted..])
-      + compaction::estimate_tokens(std::slice::from_ref(prompt));
-    tally.sent = history.len() + 1;
-    tally.estimated = context;
-    context
-  }
-
-  /// This run's own messages out of the conversation a turn is about to be
-  /// asked for: rig's record of everything it has added, prompt first.
-  ///
-  /// The two the hook is handed are the request itself — the history and the
-  /// message it ends on — so together they are the conversation as the next
-  /// answer will see it, which is the copy the run would hand back had it
-  /// been let finish.
-  fn made(&self, history: &[Message], prompt: &Message) -> Vec<Message> {
-    let carried = self
-      .tally
-      .lock()
-      .expect("a tally nobody panicked holding")
-      .carried
-      .min(history.len());
-    let mut made = history[carried..].to_vec();
-    made.push(prompt.clone());
-    made
-  }
-
-  /// Take the provider's word for what the answered request held, and say
-  /// how big the context now is. A provider that reports nothing leaves the
-  /// estimate standing.
-  fn record(&self, usage: &Usage) -> u64 {
-    let mut tally = self.tally.lock().expect("a tally nobody panicked holding");
-    match usage.input_tokens + usage.output_tokens {
-      0 => tally.estimated,
-      reported => {
-        tally.reported = reported;
-        // Everything the request carried, and the answer it was charged for
-        // — which is the next request's last message but one.
-        tally.counted = tally.sent + 1;
-        reported
-      }
-    }
-  }
-
-  /// Mark the context as full when a request of `context_tokens` no longer
-  /// leaves the window room to answer in. Only ever raised here: the UI takes
-  /// it back down when it has made the room.
-  fn weigh(&self, context_tokens: u64) {
-    if compaction::should_compact(context_tokens, &self.compaction) {
-      self.overflow.store(true, Ordering::Relaxed);
-    }
-  }
 }
 
 pub fn build_agents(
@@ -407,20 +340,19 @@ pub fn build_agents(
   };
   let base_url = cfg.base_url.as_deref().map(|u| u.trim_end_matches('/'));
 
-  // The two providers differ only in the model handed to the builder. Gemini
-  // accepts images inside function responses, so it gets the raw model; the
-  // chat completions format needs the relay wrapper.
-  let (agent, summarizer) = match cfg.provider {
+  // The two providers differ in the client, and in one thing about the
+  // wire: Gemini takes images inside a function response and chat
+  // completions does not. Summarizing asks the same model the same way, so
+  // it is the same handle — what makes that call a summary is the preamble
+  // it carries, which belongs to the request rather than to the model.
+  let (model, relay_images): (Arc<dyn Model>, bool) = match cfg.provider {
     Provider::OpenAi => {
       let mut builder = openai::CompletionsClient::builder().api_key(cfg.api_key.as_str());
       if let Some(url) = base_url {
         builder = builder.base_url(url);
       }
       let client = builder.build().context("failed to build OpenAI-compatible client")?;
-      let model = ToolImageRelay {
-        inner: client.completion_model(cfg.model.clone()),
-      };
-      (AgentBuilder::new(model), client.agent(cfg.model.clone()))
+      (Arc::new(client.completion_model(cfg.model.clone())), true)
     }
     Provider::Gemini => {
       let mut builder = gemini::Client::builder().api_key(cfg.api_key.as_str());
@@ -428,83 +360,459 @@ pub fn build_agents(
         builder = builder.base_url(url);
       }
       let client = builder.build().context("failed to build Gemini client")?;
-      (
-        AgentBuilder::new(client.completion_model(cfg.model.clone())),
-        client.agent(cfg.model.clone()),
-      )
+      (Arc::new(client.completion_model(cfg.model.clone())), false)
     }
   };
 
-  let output_tx = tx.clone();
-  let ask_tx = tx.clone();
-  let waiting = Waiting::default();
-  let overflow = Overflow::default();
-  let agent = agent
-    .preamble(&preamble)
-    .default_max_turns(cfg.max_turns)
-    .add_hook(UiHook {
-      tx,
-      waiting: waiting.clone(),
-      tools: cfg.tools.clone(),
-      compaction: cfg.compaction,
-      overflow: overflow.clone(),
-      tally: Mutex::default(),
-    })
+  let tools = ToolServer::new()
     .tool(ReadTool {
       cwd: cwd.to_path_buf(),
       vision: cfg.vision,
     })
     .tool(WriteTool { cwd: cwd.to_path_buf() })
     .tool(EditTool { cwd: cwd.to_path_buf() })
-    .tool(BashTool {
-      cwd: cwd.to_path_buf(),
-      on_output: Some(Arc::new(move |call, text| {
-        let _ = output_tx.send(AgentEvent::ToolOutput { call, text });
-      })),
-    })
+    .tool(BashTool { cwd: cwd.to_path_buf() })
     .tool(AskTool {
       ask: Some(Arc::new(move |questions, reply| {
-        let _ = ask_tx.send(AgentEvent::AskUser { questions, reply });
+        let _ = tx.send(AgentEvent::AskUser { questions, reply });
       })),
     });
   // Whatever the session's MCP servers offer, alongside the five the agent
   // brought: a tool is a tool, and the transcript draws them all the same.
-  let agent = crate::mcp::attach(agent, servers).build();
-  let summarizer = summarizer
-    .preamble(compaction::SYSTEM_PROMPT)
-    .default_max_turns(1)
-    .build();
+  let tools = crate::mcp::attach(tools, servers).run();
+
   Ok(Agents {
-    agent: Arc::new(agent),
-    summarizer: Arc::new(summarizer),
-    waiting,
-    overflow,
+    runtime: Arc::new(Runtime {
+      model: model.clone(),
+      tools,
+      preamble,
+      max_turns: cfg.max_turns,
+      compaction: cfg.compaction,
+      allowed: cfg.tools.clone(),
+      relay_images,
+    }),
+    summarizer: Arc::new(Summarizer {
+      model,
+      preamble: compaction::SYSTEM_PROMPT.to_string(),
+    }),
+    control: Control::default(),
   })
 }
 
-/// The OpenAI chat completions API only accepts text in tool messages, so this
-/// wrapper strips images out of tool results and re-sends them in a user
+// ------------------------------------------------------------------- loop
+
+/// What the last answered request cost, and how much of the conversation
+/// that figure covers.
+///
+/// A provider counts the request it was sent, so its figure is the truth
+/// about everything up to the answer it gave — and says nothing about what a
+/// tool has returned since. Holding the two apart is what keeps the guessing
+/// down to the few messages nobody has counted yet.
+#[derive(Default)]
+struct Weigh {
+  /// The provider's own count for the request it has answered, or 0 while
+  /// it has answered none — or reports nothing.
+  reported: u64,
+  /// How many messages that count covers: everything the request carried,
+  /// and the answer its output tokens paid for.
+  counted: usize,
+}
+
+impl Weigh {
+  /// What the request about to go out comes to: the provider's own count of
+  /// everything it has already weighed, plus a chars/4 estimate of what has
+  /// been said since. Nothing it has counted is guessed at, which is as
+  /// close as a client gets without a tokenizer of its own.
+  fn request(&self, chat: &[Message]) -> u64 {
+    self.reported + compaction::estimate_tokens(&chat[self.counted.min(chat.len())..])
+  }
+
+  /// Take the provider's word for what the answered request held. One that
+  /// reports nothing leaves the last figure standing.
+  fn answered(&mut self, usage: &Usage, sent: usize) {
+    let reported = usage.input_tokens + usage.output_tokens;
+    if reported > 0 {
+      self.reported = reported;
+      self.counted = sent + 1;
+    }
+  }
+}
+
+/// Why a run stopped short of an answer.
+enum Stop {
+  /// Esc. What it got through is kept, and the calls it was in the middle
+  /// of are answered.
+  Cancelled,
+  /// The conversation outgrew the window. The UI makes room and picks the
+  /// run back up where it left off.
+  Overflow,
+  /// Something the user should be told: the turn budget, or a provider or
+  /// tool that would not.
+  Failed(String),
+}
+
+/// Start one run in the background.
+///
+/// `prompt` is the message the run opens with, or `None` for `/continue`,
+/// which picks the loop back up over the history as it stands — an
+/// unanswered message is answered, a half-written turn is carried on.
+/// Everything the run adds, that prompt included, comes back in the `Done`
+/// or `Ended` that ends it, and nothing that was already in the history
+/// does: what is handed back is only ever new.
+pub fn start_run(
+  runtime: Arc<Runtime>,
+  control: Control,
+  history: Vec<Message>,
+  prompt: Option<Message>,
+  tx: mpsc::UnboundedSender<AgentEvent>,
+) -> JoinHandle<()> {
+  tokio::spawn(async move {
+    control.begin();
+    let mut made: Vec<Message> = prompt.into_iter().collect();
+    let event = match run(&runtime, &control, &history, &mut made, &tx).await {
+      None => AgentEvent::Done { messages: made },
+      Some(stop) => {
+        if let Stop::Failed(err) = stop {
+          let _ = tx.send(AgentEvent::Error(err));
+        }
+        AgentEvent::Ended { messages: made }
+      }
+    };
+    let _ = tx.send(event);
+  })
+}
+
+/// The loop itself. `made` grows with everything the run adds, and is the
+/// caller's however it ends.
+async fn run(
+  rt: &Runtime,
+  control: &Control,
+  history: &[Message],
+  made: &mut Vec<Message>,
+  tx: &mpsc::UnboundedSender<AgentEvent>,
+) -> Option<Stop> {
+  let definitions = match rt.definitions().await {
+    Ok(definitions) => definitions,
+    Err(err) => return Some(Stop::Failed(err)),
+  };
+  let mut weigh = Weigh::default();
+
+  for turn in 1..=rt.max_turns {
+    // Anything typed while the last turn ran is read before this one, so it
+    // lands where the user meant it rather than after the whole answer.
+    for text in control.take() {
+      let _ = tx.send(AgentEvent::Steered(text.clone()));
+      made.push(Message::user(text));
+    }
+    if control.cancelled() {
+      return Some(Stop::Cancelled);
+    }
+
+    let mut chat = Vec::with_capacity(history.len() + made.len());
+    chat.extend_from_slice(history);
+    chat.extend(made.iter().cloned());
+    if rt.relay_images {
+      relay_tool_images(&mut chat);
+    }
+
+    // Weighed before it is sent rather than once the answer comes back: a
+    // tool can return a file the size of the window, and the request
+    // carrying it is the one that would be refused.
+    let context = weigh.request(&chat);
+    if compaction::should_compact(context, &rt.compaction) {
+      control.overflowed_now();
+      // Never before the first call, where the run has done nothing yet:
+      // it would be handed the same conversation again and stop again.
+      if turn > 1 {
+        return Some(Stop::Overflow);
+      }
+    }
+
+    let sent = chat.len();
+    let request = CompletionRequest {
+      model: None,
+      preamble: Some(rt.preamble.clone()),
+      chat_history: chat,
+      documents: Vec::new(),
+      tools: definitions.clone(),
+      temperature: None,
+      max_tokens: None,
+      tool_choice: None,
+      additional_params: None,
+      output_schema: None,
+      record_telemetry_content: false,
+    };
+    let mut stream = match rt.model.stream(request).await {
+      Ok(stream) => stream,
+      Err(err) => return Some(Stop::Failed(err.to_string())),
+    };
+
+    // Arguments arrive a few characters at a time and each fragment carries
+    // only what is new, so the turn holds what has arrived per call and
+    // sends the whole of it. The UI then has nothing to reassemble.
+    let mut writing: HashMap<String, (String, String)> = HashMap::new();
+    let mut partial = Partial::default();
+    loop {
+      let item = tokio::select! {
+        biased;
+        () = control.stopped() => {
+          // Nothing of this turn has run, so the half of it that was
+          // written is kept for the transcript's sake and no more: a call
+          // the model had not finished asking for is not one to answer.
+          made.extend(partial.said());
+          return Some(Stop::Cancelled);
+        }
+        item = stream.next() => item,
+      };
+      let Some(item) = item else { break };
+      let content = match item {
+        Ok(content) => content,
+        Err(err) => {
+          made.extend(partial.said());
+          return Some(Stop::Failed(err.to_string()));
+        }
+      };
+      if let Some(event) = partial.saw(content, &mut writing) {
+        let _ = tx.send(event);
+      }
+    }
+
+    // Which line each call was written on, for the dispatch to take away.
+    let written = std::mem::take(&mut partial.written);
+    // The turn as the provider gave it, aggregated by rig: the text, the
+    // reasoning, and the calls, in the order they were said. This is the
+    // copy that goes into the conversation and the copy the next request
+    // replays — there is only ever the one.
+    let choice = std::mem::take(&mut stream.choice);
+    let usage = stream.response.as_ref().map(|final_| final_.usage).unwrap_or_default();
+    weigh.answered(&usage, sent);
+    let _ = tx.send(AgentEvent::Usage {
+      usage,
+      context_tokens: weigh.reported.max(context),
+    });
+    if choice.is_empty() {
+      return Some(Stop::Failed("the model answered with nothing".into()));
+    }
+    let calls: Vec<ToolCall> = choice
+      .iter()
+      .filter_map(|content| match content {
+        AssistantContent::ToolCall(call) => Some(call.clone()),
+        _ => None,
+      })
+      .collect();
+    made.push(Message::Assistant {
+      id: stream.message_id.clone(),
+      content: choice,
+    });
+
+    if calls.is_empty() {
+      // The answer — unless something was typed while it was being
+      // written, which the run reads rather than making it be sent again.
+      match control.steering() {
+        true => continue,
+        false => return None,
+      }
+    }
+
+    // In the order the model asked for them: a conversation replayed is
+    // the same conversation, which is worth more than the overlap.
+    let mut results = Vec::with_capacity(calls.len());
+    for call in &calls {
+      // Biased, so a run already stopped answers the call rather than
+      // starting it: the one it was in the middle of and the ones it never
+      // reached are answered the same way, and neither is left hanging.
+      results.push(tokio::select! {
+        biased;
+        () = control.stopped() => aborted(call),
+        answer = rt.call(call, written.get(call.id.as_str()), tx) => answer,
+      });
+    }
+    made.push(Message::User { content: results });
+    if control.cancelled() {
+      return Some(Stop::Cancelled);
+    }
+  }
+  Some(Stop::Failed(format!("stopped after {} turns", rt.max_turns)))
+}
+
+/// The turn as far as it has been streamed.
+///
+/// Only ever read when a run is stopped inside one: a turn the stream
+/// finished is taken from rig's own aggregate instead, which is the copy the
+/// provider will be given back.
+#[derive(Default)]
+struct Partial {
+  text: String,
+  reasoning: Vec<String>,
+  /// The id rig correlated a call's fragments under, by the id the provider
+  /// gave the finished call.
+  ///
+  /// The two are not the same — rig mints its own so a call stays followable
+  /// before the provider has named it — and the line the call was written on
+  /// is keyed by rig's. Without the pairing, dispatching the call would
+  /// leave that line on screen with nothing to take it away.
+  written: HashMap<String, String>,
+}
+
+impl Partial {
+  /// Note what the stream said, and what the UI should be told about it.
+  fn saw(
+    &mut self,
+    content: StreamedAssistantContent,
+    writing: &mut HashMap<String, (String, String)>,
+  ) -> Option<AgentEvent> {
+    match content {
+      StreamedAssistantContent::Text(text) => {
+        self.text.push_str(&text.text);
+        Some(AgentEvent::Text(text.text))
+      }
+      StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
+        match self.reasoning.last_mut() {
+          Some(last) => last.push_str(&reasoning),
+          None => self.reasoning.push(reasoning.clone()),
+        }
+        Some(AgentEvent::Reasoning(reasoning))
+      }
+      StreamedAssistantContent::Reasoning { reasoning, .. } => {
+        let text = reasoning.display_text();
+        if text.is_empty() {
+          return None;
+        }
+        self.reasoning.push(text.clone());
+        Some(AgentEvent::Reasoning(text))
+      }
+      StreamedAssistantContent::ToolCallDelta {
+        internal_call_id,
+        content,
+      } => {
+        let (name, args) = writing.entry(internal_call_id.clone()).or_default();
+        match content {
+          ToolCallDeltaContent::Name(part) => name.push_str(&part),
+          ToolCallDeltaContent::Delta(part) => args.push_str(&part),
+        }
+        Some(AgentEvent::ToolCallDelta {
+          id: internal_call_id,
+          name: name.clone(),
+          args: args.clone(),
+        })
+      }
+      // Written but not yet run — the loop reports it when it starts it.
+      // Showing it whole in the meantime is what the finished line will
+      // say, so nothing jumps when the two swap over.
+      StreamedAssistantContent::ToolCall {
+        tool_call,
+        internal_call_id,
+      } => {
+        self
+          .written
+          .insert(tool_call.id.as_str().to_string(), internal_call_id.clone());
+        Some(AgentEvent::ToolCallDelta {
+          id: internal_call_id,
+          name: tool_call.function.name,
+          args: tool_call.function.arguments.to_string(),
+        })
+      }
+      _ => None,
+    }
+  }
+
+  /// What the turn had said by the time it was stopped, if anything — the
+  /// calls it was writing left out, since a call nobody ran is one nothing
+  /// would answer.
+  fn said(self) -> Option<Message> {
+    let mut content: Vec<AssistantContent> = self
+      .reasoning
+      .into_iter()
+      .filter(|thought| !thought.trim().is_empty())
+      .map(|thought| AssistantContent::Reasoning(Reasoning::new(&thought)))
+      .collect();
+    if !self.text.trim().is_empty() {
+      content.push(AssistantContent::text(self.text));
+    }
+    (!content.is_empty()).then_some(Message::Assistant { id: None, content })
+  }
+}
+
+/// A call answered without being run.
+fn aborted(call: &ToolCall) -> UserContent {
+  UserContent::tool_result(
+    call.id.as_str(),
+    &call.function.name,
+    vec![ToolResultContent::text(ABORTED)],
+  )
+}
+
+impl Runtime {
+  /// What this session offers the model, in a stable order — a tool set that
+  /// shuffled between requests would be a different prompt every time.
+  async fn definitions(&self) -> Result<Vec<ToolDefinition>, String> {
+    let mut definitions = self.tools.get_tool_defs(None).await.map_err(|err| err.to_string())?;
+    if let Some(allowed) = &self.allowed {
+      definitions.retain(|definition| allowed.iter().any(|name| name == &definition.name));
+    }
+    Ok(definitions)
+  }
+
+  /// Run one call and answer it, telling the UI as it goes.
+  async fn call(
+    &self,
+    call: &ToolCall,
+    written: Option<&String>,
+    tx: &mpsc::UnboundedSender<AgentEvent>,
+  ) -> UserContent {
+    let name = call.function.name.clone();
+    let id = call.id.as_str().to_string();
+    let _ = tx.send(AgentEvent::ToolCall {
+      name: name.clone(),
+      args: call.function.arguments.clone(),
+      call: id.clone(),
+      internal: written.cloned().unwrap_or_else(|| id.clone()),
+    });
+
+    let mut context = ToolContext::new();
+    // Where to report output while the call runs, already answering for
+    // this call. The loop dispatching it is the one that knows which it
+    // is, so nothing has to be smuggled through the arguments to tell the
+    // tool — and the tool never has to be told at all.
+    let (reporting, under) = (tx.clone(), id.clone());
+    context.insert(Output(Arc::new(move |text| {
+      let _ = reporting.send(AgentEvent::ToolOutput {
+        call: under.clone(),
+        text,
+      });
+    })));
+    let result = self
+      .tools
+      .execute(&name, &call.function.arguments.to_string(), &mut context)
+      .await;
+
+    // A built-in tool holds itself to a size as it makes its output; a
+    // server's reply arrives whole, and as long as the server felt like, so
+    // it is cut here — the one place every result passes through.
+    let raw = result.output().as_content();
+    let content = match BUILT_IN.contains(&name.as_str()) {
+      true => None,
+      false => crate::tools::cap_reply(raw),
+    }
+    .unwrap_or_else(|| raw.to_vec());
+    let (output, images) = crate::images::split(&content);
+    let _ = tx.send(AgentEvent::ToolResult {
+      name: name.clone(),
+      call: id.clone(),
+      diff: context.result::<EditDiff>().map(|diff| diff.diff.clone()),
+      output,
+      images,
+      is_error: result.is_error() || result.is_refused(),
+    });
+    // What the transcript shows and what the model is given are the same
+    // bytes: there is one copy of a result, not a shown one and a sent one.
+    UserContent::tool_result(id, name, content)
+  }
+}
+
+/// The OpenAI chat completions API only accepts text in tool messages, so
+/// this strips images out of tool results and re-sends them in a user
 /// message right after, so `read` can return screenshots.
-struct ToolImageRelay<M> {
-  inner: M,
-}
-
-impl<M: CompletionModel> CompletionModel for ToolImageRelay<M> {
-  async fn completion(&self, mut request: CompletionRequest) -> Result<CompletionResponse, CompletionError> {
-    relay_tool_images(&mut request.chat_history);
-    self.inner.completion(request).await
-  }
-
-  async fn stream(&self, mut request: CompletionRequest) -> Result<StreamingCompletionResponse, CompletionError> {
-    relay_tool_images(&mut request.chat_history);
-    self.inner.stream(request).await
-  }
-
-  fn capabilities(&self) -> ProviderCapabilities {
-    self.inner.capabilities()
-  }
-}
-
 fn relay_tool_images(history: &mut Vec<Message>) {
   let has_image = |message: &Message| {
     matches!(message, Message::User { content } if content.iter().any(|c| {
@@ -630,120 +938,10 @@ fn default_system_prompt(cwd: &Path, tools: Option<&[String]>) -> String {
   prompt
 }
 
-/// Start one agent run in the background. Dropping/aborting the handle cancels
-/// the HTTP stream and any running tool process. `prompt` is the last message
-/// of the request: usually a new user message, but `/continue` re-sends the
-/// last message of the history to resume the loop without one.
-pub fn start_run(
-  agent: Arc<Agent>,
-  history: Vec<Message>,
-  prompt: Message,
-  tx: mpsc::UnboundedSender<AgentEvent>,
-) -> JoinHandle<()> {
-  tokio::spawn(async move {
-    // What the request already carried. A run hands its whole conversation
-    // back when it is stopped, and only the part of it this run added is the
-    // session's to record.
-    let carried = history.len();
-    let mut stream = agent.stream_prompt(prompt).history(history).await;
-    let mut sent_done = false;
-    // The stream stopped for a reason the UI has already been told, so there
-    // is nothing left to say about it when the loop falls out.
-    let mut explained = false;
-    // What a stopped run got through, as rig kept it.
-    let mut stopped: Vec<Message> = Vec::new();
-    // Arguments arrive a few characters at a time and each fragment carries
-    // only what is new, so the run holds what has arrived per call and sends
-    // the whole of it. The UI then has nothing to reassemble.
-    let mut writing: HashMap<String, (String, String)> = HashMap::new();
-    while let Some(item) = stream.next().await {
-      let event = match item {
-        Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => match content {
-          StreamedAssistantContent::Text(text) => Some(AgentEvent::Text(text.text)),
-          StreamedAssistantContent::ReasoningDelta { reasoning, .. } => Some(AgentEvent::Reasoning(reasoning)),
-          StreamedAssistantContent::Reasoning { reasoning, .. } => {
-            let text = reasoning.display_text();
-            (!text.is_empty()).then_some(AgentEvent::Reasoning(text))
-          }
-          StreamedAssistantContent::ToolCallDelta {
-            internal_call_id,
-            content,
-          } => {
-            let (name, args) = writing.entry(internal_call_id.clone()).or_default();
-            match content {
-              ToolCallDeltaContent::Name(part) => name.push_str(&part),
-              ToolCallDeltaContent::Delta(part) => args.push_str(&part),
-            }
-            Some(AgentEvent::ToolCallDelta {
-              id: internal_call_id,
-              name: name.clone(),
-              args: args.clone(),
-            })
-          }
-          // The call is written but not yet run — `UiHook` reports it when it
-          // starts. Showing it whole in the meantime is what the finished
-          // line will say, so nothing jumps when the two swap over.
-          StreamedAssistantContent::ToolCall {
-            tool_call,
-            internal_call_id,
-          } => Some(AgentEvent::ToolCallDelta {
-            id: internal_call_id,
-            name: tool_call.function.name,
-            args: tool_call.function.arguments.to_string(),
-          }),
-          _ => None,
-        },
-        // Tool calls and results are reported by `UiHook`, and so is what
-        // each of them cost — by the time a run ends, everything it spent
-        // has already been said.
-        Ok(MultiTurnStreamItem::FinalResponse(response)) => {
-          sent_done = true;
-          Some(AgentEvent::Done {
-            messages: response.messages.unwrap_or_default(),
-          })
-        }
-        Ok(_) => None,
-        // A cancelled run is this app cutting in with the message the user
-        // typed while it ran, not something that went wrong, so it ends the
-        // way an abort does — quietly, keeping what it got through.
-        //
-        // What it got through comes back with the cancellation: rig's own
-        // messages, down to the reasoning each turn carried and the way it
-        // grouped the results of calls made together. Keeping those rather
-        // than piecing the run back together from what the UI saw is what
-        // leaves the next request an append to the one just stopped — and so
-        // leaves the provider's cache of everything before it standing.
-        Err(StreamingError::Prompt(err)) if matches!(*err, PromptError::PromptCancelled { .. }) => {
-          explained = true;
-          if let PromptError::PromptCancelled { chat_history, .. } = *err {
-            stopped = chat_history.into_iter().skip(carried).collect();
-          }
-          None
-        }
-        Err(err) => {
-          explained = true;
-          Some(AgentEvent::Error(err.to_string()))
-        }
-      };
-      if let Some(event) = event
-        && tx.send(event).is_err()
-      {
-        return;
-      }
-    }
-    if !sent_done {
-      if !explained {
-        let _ = tx.send(AgentEvent::Error("stream ended without a final response".into()));
-      }
-      let _ = tx.send(AgentEvent::Ended { messages: stopped });
-    }
-  })
-}
-
 /// Summarize older history in the background; the result arrives as
 /// `AgentEvent::Compacted` (or `AgentEvent::Error` followed by `Ended`).
 pub fn start_compaction(
-  summarizer: Arc<Agent>,
+  summarizer: Arc<Summarizer>,
   history: Vec<Message>,
   settings: Settings,
   tx: mpsc::UnboundedSender<AgentEvent>,
@@ -766,13 +964,19 @@ mod tests {
   use super::*;
 
   async fn collect(
-    agent: &Arc<Agent>,
+    runtime: &Arc<Runtime>,
     history: Vec<Message>,
     prompt: &str,
     rx: &mut mpsc::UnboundedReceiver<AgentEvent>,
     tx: &mpsc::UnboundedSender<AgentEvent>,
   ) -> Vec<AgentEvent> {
-    let handle = start_run(agent.clone(), history, Message::user(prompt), tx.clone());
+    let handle = start_run(
+      runtime.clone(),
+      Control::default(),
+      history,
+      Some(Message::user(prompt)),
+      tx.clone(),
+    );
     let mut events = Vec::new();
     loop {
       let ev = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
@@ -787,6 +991,237 @@ mod tests {
     }
     handle.await.unwrap();
     events
+  }
+
+  // -------------------------------------------------- driving the loop
+
+  /// A model that answers from a script, so the loop can be put in the
+  /// states a provider is too slow and too willing to reach: a turn cut off
+  /// half-said, a turn whose calls never all come back.
+  struct Scripted {
+    turns: Mutex<VecDeque<Vec<rig_core::streaming::RawStreamingChoice>>>,
+    /// Leave the stream open after the script runs out, so a turn can be
+    /// stopped in the middle of itself rather than ending on its own.
+    hang: bool,
+  }
+
+  impl CompletionModel for Scripted {
+    async fn completion(
+      &self,
+      _request: CompletionRequest,
+    ) -> Result<rig_core::completion::CompletionResponse, CompletionError> {
+      Err(CompletionError::ResponseError("the script only streams".into()))
+    }
+
+    async fn stream(&self, _request: CompletionRequest) -> Result<StreamingCompletionResponse, CompletionError> {
+      let turn = self.turns.lock().expect("a script nobody panicked holding").pop_front();
+      let items = futures::stream::iter(turn.unwrap_or_default().into_iter().map(Ok));
+      let inner: rig_core::streaming::StreamingResult = match self.hang {
+        true => Box::pin(items.chain(futures::stream::pending())),
+        false => Box::pin(items),
+      };
+      Ok(StreamingCompletionResponse::stream("scripted", inner))
+    }
+  }
+
+  fn said(text: &str) -> rig_core::streaming::RawStreamingChoice {
+    rig_core::streaming::RawStreamingChoice::Message(text.to_string())
+  }
+
+  fn asks(id: &str, command: &str) -> rig_core::streaming::RawStreamingChoice {
+    rig_core::streaming::RawStreamingChoice::ToolCall(rig_core::streaming::RawStreamingToolCall::new(
+      id,
+      "bash".to_string(),
+      serde_json::json!({ "command": command }),
+    ))
+  }
+
+  /// A runtime whose model reads from `turns` and whose only tool is the
+  /// real `bash`, which is the one that can be told to take its time.
+  fn scripted(turns: Vec<Vec<rig_core::streaming::RawStreamingChoice>>, hang: bool) -> Arc<Runtime> {
+    let tools = ToolServer::new()
+      .tool(BashTool {
+        cwd: std::env::temp_dir(),
+      })
+      .run();
+    Arc::new(Runtime {
+      model: Arc::new(Scripted {
+        turns: Mutex::new(turns.into()),
+        hang,
+      }),
+      tools,
+      preamble: String::new(),
+      max_turns: 10,
+      compaction: TEST_SETTINGS,
+      allowed: None,
+      relay_images: false,
+    })
+  }
+
+  /// Read events until one of them is what the test was waiting for, then
+  /// keep reading until the run says it is over. Returns what it ended with.
+  async fn stop_at(
+    runtime: Arc<Runtime>,
+    control: Control,
+    prompt: &str,
+    at: impl Fn(&AgentEvent) -> bool,
+  ) -> Vec<Message> {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let handle = start_run(runtime, control.clone(), Vec::new(), Some(Message::user(prompt)), tx);
+    let mut cancelled = false;
+    loop {
+      let event = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+        .await
+        .expect("an event within 10s")
+        .expect("the channel open");
+      if !cancelled && at(&event) {
+        cancelled = true;
+        control.cancel();
+      }
+      match event {
+        AgentEvent::Ended { messages } | AgentEvent::Done { messages } => {
+          handle.await.expect("the run to finish");
+          return messages;
+        }
+        _ => {}
+      }
+    }
+  }
+
+  fn shapes(messages: &[Message]) -> Vec<String> {
+    messages
+      .iter()
+      .map(|message| match message {
+        Message::User { content } => content
+          .iter()
+          .map(|c| match c {
+            UserContent::Text(text) => format!("user {}", text.text),
+            UserContent::ToolResult(result) => format!(
+              "result {} {}",
+              result.call.as_str(),
+              match &result.content[..] {
+                [ToolResultContent::Text(text)] => text.text.trim().to_string(),
+                _ => String::new(),
+              }
+            ),
+            _ => "?".into(),
+          })
+          .collect::<Vec<_>>()
+          .join(" + "),
+        Message::Assistant { content, .. } => content
+          .iter()
+          .map(|c| match c {
+            AssistantContent::Text(text) => format!("said {:?}", text.text),
+            AssistantContent::Reasoning(reasoning) => format!("thought {:?}", reasoning.display_text()),
+            AssistantContent::ToolCall(call) => format!("call {}", call.id.as_str()),
+            _ => "?".into(),
+          })
+          .collect::<Vec<_>>()
+          .join(" + "),
+        Message::System { .. } => "system".into(),
+      })
+      .collect()
+  }
+
+  /// A turn stopped while the model was still writing it keeps what was
+  /// said and asks for nothing.
+  ///
+  /// The calls it had begun to write were never dispatched, so carrying
+  /// them would leave the conversation owing answers nothing is coming to
+  /// give — which is a conversation no provider will take back.
+  #[tokio::test]
+  async fn a_turn_cut_off_mid_stream_keeps_what_it_said_and_asks_for_nothing() {
+    let runtime = scripted(vec![vec![said("Let me look. "), asks("call_1", "echo one")]], true);
+    let messages = stop_at(runtime, Control::default(), "look", |event| {
+      // Stopped once the call has been written but before the stream that
+      // was writing it ever ends.
+      matches!(event, AgentEvent::ToolCallDelta { .. })
+    })
+    .await;
+    assert_eq!(shapes(&messages), ["user look", "said \"Let me look. \""]);
+  }
+
+  /// Every call a stopped run had out is answered, whether it was running
+  /// or had not been reached.
+  #[tokio::test]
+  async fn every_call_a_stopped_run_had_out_is_answered() {
+    let runtime = scripted(
+      vec![vec![
+        said("Three things. "),
+        asks("call_1", "echo one"),
+        asks("call_2", "sleep 60"),
+        asks("call_3", "echo three"),
+      ]],
+      false,
+    );
+    let messages = stop_at(runtime, Control::default(), "do three things", |event| {
+      // Stopped while the second is running, which leaves the third
+      // waiting its turn and never started.
+      matches!(event, AgentEvent::ToolCall { call, .. } if call == "call_2")
+    })
+    .await;
+    assert_eq!(
+      shapes(&messages),
+      [
+        "user do three things".to_string(),
+        "said \"Three things. \" + call call_1 + call call_2 + call call_3".to_string(),
+        // The one that finished answers with what it said; the one it was
+        // stopped in the middle of and the one it never reached both
+        // answer all the same.
+        format!("result call_1 one + result call_2 {ABORTED} + result call_3 {ABORTED}"),
+      ]
+    );
+  }
+
+  /// What was typed while a turn ran is read at the top of the next one,
+  /// in the order it was typed, and lands in the conversation before the
+  /// turn that answers it rather than after the whole run.
+  #[tokio::test]
+  async fn what_was_typed_mid_run_is_read_before_the_next_turn() {
+    let runtime = scripted(
+      vec![
+        // The call takes long enough that what is typed while it runs is
+        // reliably typed before the turn that reads it.
+        vec![said("Working. "), asks("call_1", "sleep 0.5; echo one")],
+        vec![said("Answered them all.")],
+      ],
+      false,
+    );
+    let control = Control::default();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let handle = start_run(runtime, control.clone(), Vec::new(), Some(Message::user("start")), tx);
+    let mut steered = false;
+    let messages = loop {
+      let event = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+        .await
+        .expect("an event within 10s")
+        .expect("the channel open");
+      // Typed while the first turn's call is running, which is the run at
+      // its least interruptible.
+      if !steered && matches!(&event, AgentEvent::ToolCall { call, .. } if call == "call_1") {
+        steered = true;
+        control.steer("and this".into());
+        control.steer("and this too".into());
+      }
+      if let AgentEvent::Done { messages } | AgentEvent::Ended { messages } = event {
+        handle.await.expect("the run to finish");
+        break messages;
+      }
+    };
+    assert_eq!(
+      shapes(&messages),
+      [
+        "user start",
+        "said \"Working. \" + call call_1",
+        "result call_1 one",
+        // Both, in the order they were typed, and before the turn that
+        // reads them — not appended after the answer.
+        "user and this",
+        "user and this too",
+        "said \"Answered them all.\"",
+      ]
+    );
+    assert!(!control.steering(), "nothing is left waiting once it has been read");
   }
 
   const TEST_SETTINGS: Settings = Settings {
@@ -817,7 +1252,7 @@ mod tests {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let agent = build_agents(&cfg, Path::new("/tmp"), tx.clone(), &Default::default())
       .unwrap()
-      .agent;
+      .runtime;
 
     // 1. Plain streamed text.
     let events = collect(&agent, vec![], "hi", &mut rx, &tx).await;
@@ -859,7 +1294,7 @@ mod tests {
           format!("result:{}", if *is_error { "err" } else { "ok" })
         }
         AgentEvent::Done { .. } => "done".into(),
-        AgentEvent::Turn { .. } => "turn".into(),
+        AgentEvent::Steered(_) => "steered".into(),
         AgentEvent::Usage { .. } => "usage".into(),
         AgentEvent::Error(e) => format!("error:{e}"),
         AgentEvent::Ended { .. } => "ended".into(),
@@ -1013,19 +1448,9 @@ mod tests {
 
   /// The provider counts what it was sent; only what has been said since is
   /// guessed at. Nothing a request was charged for is estimated a second
-  /// time, and a figure counted against one run's history is not carried into
-  /// the next, whose history compaction may have rewritten underneath it.
+  /// time.
   #[test]
   fn the_context_is_the_providers_own_count_plus_what_it_has_not_seen_yet() {
-    let (tx, _rx) = mpsc::unbounded_channel();
-    let hook = UiHook {
-      tx,
-      waiting: Waiting::default(),
-      tools: None,
-      compaction: TEST_SETTINGS,
-      overflow: Overflow::default(),
-      tally: Mutex::default(),
-    };
     let result = |text: &str| Message::User {
       content: vec![UserContent::tool_result(
         "call",
@@ -1035,38 +1460,38 @@ mod tests {
     };
     let asked = Message::user("x".repeat(400));
     let answered = Message::assistant("y".repeat(400));
+    let mut weigh = Weigh::default();
 
     // Nothing counted yet: the whole request is the estimate, 400 chars of
     // it to the hundred tokens.
-    assert_eq!(hook.weigh_request(&[], &asked, 1), 100);
-    // The provider's figure covers the message it was sent and the answer it
-    // gave, so the next request estimates neither: only the result that came
-    // back after it.
-    assert_eq!(
-      hook.record(&Usage {
+    assert_eq!(weigh.request(std::slice::from_ref(&asked)), 100);
+    // The provider's figure covers the message it was sent and the answer
+    // it gave, so the next request estimates neither: only the result that
+    // came back after it.
+    weigh.answered(
+      &Usage {
         input_tokens: 500,
         output_tokens: 20,
         ..Usage::new()
-      }),
-      520
+      },
+      1,
     );
-    let history = vec![asked.clone(), answered.clone()];
-    assert_eq!(hook.weigh_request(&history, &result(&"z".repeat(800)), 2), 520 + 200);
-    // Two results in the same turn: the one in the history is estimated
-    // alongside the one being sent, and still nothing before them.
-    let history = vec![asked.clone(), answered.clone(), result(&"z".repeat(800))];
-    assert_eq!(
-      hook.weigh_request(&history, &result(&"z".repeat(400)), 2),
-      520 + 200 + 100
-    );
+    let chat = vec![asked.clone(), answered.clone(), result(&"z".repeat(800))];
+    assert_eq!(weigh.request(&chat), 520 + 200);
+    // Two results in the same turn: both are estimated, and still nothing
+    // before them.
+    let chat = vec![
+      asked.clone(),
+      answered.clone(),
+      result(&"z".repeat(800)),
+      result(&"z".repeat(400)),
+    ];
+    assert_eq!(weigh.request(&chat), 520 + 200 + 100);
 
-    // A provider that says nothing leaves the last weighing standing rather
+    // A provider that says nothing leaves the last figure standing rather
     // than reporting the context as empty.
-    assert_eq!(hook.record(&Usage::new()), 520 + 200 + 100);
-
-    // The next run is weighed from scratch: after a compaction the history
-    // those figures were counted against is not this one.
-    assert_eq!(hook.weigh_request(&[], &Message::user("x".repeat(40)), 1), 10);
+    weigh.answered(&Usage::new(), 9);
+    assert_eq!(weigh.request(&chat), 520 + 200 + 100);
   }
 
   #[test]
@@ -1186,7 +1611,7 @@ mod tests {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let agent = build_agents(&cfg, Path::new("/tmp"), tx.clone(), &Default::default())
       .unwrap()
-      .agent;
+      .runtime;
     // The mock turns "image <path>" into a `read` tool call for that path,
     // then answers the follow-up request with plain text. If the relay did
     // not work, rig would reject the image in the tool message and the run
@@ -1233,7 +1658,7 @@ mod tests {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let agent = build_agents(&cfg, Path::new("/tmp"), tx.clone(), &Default::default())
       .unwrap()
-      .agent;
+      .runtime;
     let events = collect(&agent, vec![], &format!("image {}", path.display()), &mut rx, &tx).await;
     assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error(_))), "{events:?}");
     let text: String = events

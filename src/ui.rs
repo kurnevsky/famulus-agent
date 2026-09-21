@@ -1,7 +1,7 @@
 //! Ratatui front-end: a scrolling transcript, a multi-line input box and a
 //! one-line footer.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -15,7 +15,9 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Scrollbar, Scrollb
 use ratatui::{DefaultTerminal, Frame};
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 use rig_core::completion::{Message, Usage};
-use rig_core::message::{AssistantContent, ToolCall, ToolResult, ToolResultContent, UserContent};
+#[cfg(test)]
+use rig_core::message::ToolResultContent;
+use rig_core::message::{AssistantContent, ToolCall, ToolResult, UserContent};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -51,7 +53,6 @@ const SCROLLBAR_HIDE_DELAY: Duration = Duration::from_millis(1000);
 const DOUBLE_ESC: Duration = Duration::from_millis(500);
 /// What a tool call the user stopped is answered with, so the model knows it
 /// did not simply go unheard.
-const ABORTED: &str = "Aborted by the user.";
 /// Rows an overlay list moves per `PageUp`/`PageDown`.
 const OVERLAY_PAGE: usize = 10;
 
@@ -120,116 +121,6 @@ struct Match {
 struct Completion {
   items: Vec<Match>,
   selected: usize,
-}
-
-/// The run in flight, kept so an abort can still record what the user saw.
-struct InFlight {
-  /// Trailing history messages this run re-sent as its prompt (`/continue`).
-  /// They are in `done` like any other, and in the history already too, so
-  /// they are dropped rather than stored twice when the run is recorded.
-  resumed: usize,
-  /// Everything this run has added to the conversation, its prompt first.
-  ///
-  /// A run only hands its transcript back when it reaches an end it can
-  /// report, so a run whose task was dropped where it stood would otherwise
-  /// leave nothing behind — while every file its tools touched stays
-  /// touched. Kept as it happens, so an abort keeps the work rather than
-  /// only the memory of it.
-  ///
-  /// Rig says the same thing in its own words at every turn boundary, and
-  /// `boundary` puts that in place of what was pieced together here. So what
-  /// an abort leaves is rig's own messages for every turn but the one it
-  /// landed in, and only that turn is this side's reckoning of it.
-  done: Vec<Message>,
-  /// What the model has said in the turn being streamed.
-  text: String,
-  /// The calls it has made in that turn.
-  calls: Vec<AssistantContent>,
-  /// Calls made and not yet answered, by the id each will be answered with
-  /// and the tool each ran. Held by id rather than counted, so a result is
-  /// matched to its own call however many are in flight and whatever order
-  /// they come back in.
-  pending: Vec<(String, String)>,
-}
-
-impl InFlight {
-  fn new(prompt: Message, resumed: usize) -> Self {
-    Self {
-      resumed,
-      done: vec![prompt],
-      text: String::new(),
-      calls: Vec::new(),
-      pending: Vec::new(),
-    }
-  }
-
-  /// Rig's own account of every turn behind the one about to be asked for,
-  /// in place of the one pieced together from what was streamed.
-  ///
-  /// Nothing of the turn being streamed is lost to this: a boundary falls
-  /// before the model has said anything of the next turn, so there is never
-  /// a half-written one to overwrite.
-  fn boundary(&mut self, history: Vec<Message>) {
-    self.done = history;
-  }
-
-  fn said(&mut self, delta: &str) {
-    self.text.push_str(delta);
-  }
-
-  fn called(&mut self, call: &str, name: &str, args: serde_json::Value) {
-    self.calls.push(AssistantContent::tool_call(call, name, args));
-    self.pending.push((call.to_string(), name.to_string()));
-  }
-
-  /// A result closes the turn that asked for it: what the model said and the
-  /// call it made become a message, and the answer follows as its own.
-  fn answered(&mut self, call: &str, name: &str, output: String) {
-    self.turn();
-    self.pending.retain(|(pending, _)| pending != call);
-    self.done.push(Message::User {
-      content: vec![UserContent::tool_result(
-        call,
-        name,
-        vec![ToolResultContent::text(output)],
-      )],
-    });
-  }
-
-  /// Close off the turn being streamed, if it said anything at all.
-  fn turn(&mut self) {
-    let text = std::mem::take(&mut self.text);
-    let calls = std::mem::take(&mut self.calls);
-    let mut content: Vec<AssistantContent> = Vec::new();
-    if !text.trim().is_empty() {
-      content.push(AssistantContent::text(text));
-    }
-    content.extend(calls);
-    if !content.is_empty() {
-      self.done.push(Message::Assistant { id: None, content });
-    }
-  }
-
-  /// Everything this run got through, for a run that will not report it
-  /// itself.
-  ///
-  /// A call it was stopped in the middle of is answered as interrupted. The
-  /// model asked for it, so the transcript owes an answer — and a call left
-  /// hanging is a conversation no provider will take back, which would leave
-  /// the session unable to carry on from what it just kept.
-  fn recovered(mut self) -> Vec<Message> {
-    self.turn();
-    for (call, name) in std::mem::take(&mut self.pending) {
-      self.done.push(Message::User {
-        content: vec![UserContent::tool_result(
-          call,
-          name,
-          vec![ToolResultContent::text(ABORTED)],
-        )],
-      });
-    }
-    self.done
-  }
 }
 
 /// A list drawn over the transcript. Moving through one and dismissing it are
@@ -314,8 +205,8 @@ impl Overlay {
 /// A tool call whose arguments are still arriving, shown at the end of the
 /// transcript so the command can be read as the model writes it.
 ///
-/// It is replaced by a real entry when the call starts running, which is when
-/// `UiHook` reports it — not when the last of its text arrives.
+/// It is replaced by a real entry when the call starts running, which is
+/// when the run reports it — not when the last of its text arrives.
 struct Writing {
   id: String,
   name: String,
@@ -485,14 +376,14 @@ pub struct App {
   /// context window, and which carries on once there is some.
   resuming: bool,
   /// The run in flight, kept for abort recovery.
-  in_flight: Option<InFlight>,
+  /// Esc has been pressed and the run is on its way to stopping.
+  aborting: bool,
   /// Tool calls the model is still writing, oldest first.
   writing: Vec<Writing>,
   /// How this run's tool calls went, by the id the transcript names them
   /// with. Handed to the session so a reload draws them the same; the
   /// transcript itself records neither the verdict nor the diff.
   outcomes: HashMap<String, Outcome>,
-  queued: VecDeque<String>,
   /// Transcript position. `None` follows new output at the bottom; `Some`
   /// is a fixed offset from the top, so appended text does not move the view.
   anchor: Option<usize>,
@@ -561,10 +452,9 @@ impl App {
       run: None,
       compacting: false,
       resuming: false,
-      in_flight: None,
+      aborting: false,
       writing: Vec::new(),
       outcomes: HashMap::new(),
-      queued: VecDeque::new(),
       anchor: None,
       view: (0, 0),
       expand_thinking: false,
@@ -959,8 +849,10 @@ impl App {
     self.anchor = None;
 
     if self.run.is_some() && !matches!(text.as_str(), "/quit" | "/new") {
-      self.queued.push_back(text);
-      self.waiting();
+      // Handed to the run, which reads it at the top of its next turn
+      // rather than after the whole answer. It is kept there and nowhere
+      // else, so whoever gets to it first is the only one who can.
+      self.agents.control.steer(text);
       return;
     }
     self.dispatch(text);
@@ -1023,8 +915,7 @@ impl App {
   /// what it cost, where it was scrolled to, and anything typed at it that
   /// has not been sent.
   fn reset_conversation(&mut self) {
-    self.queued.clear();
-    self.waiting();
+    self.agents.control.take();
     self.overflowed();
     self.resuming = false;
     self.usage = Usage::new();
@@ -1184,32 +1075,27 @@ impl App {
   /// pressing it again after sending walks back through the queue in the
   /// order the messages would have gone out, last one first.
   fn unqueue(&mut self) {
-    let Some(text) = self.queued.pop_back() else { return };
-    self.waiting();
+    let Some(text) = self.agents.control.unsteer() else {
+      return;
+    };
     self.set_input(&text);
   }
 
+  /// Send what is still waiting once there is no run to hand it to.
+  ///
+  /// A run reads what was typed at it itself, so this is only ever the
+  /// remainder: a message typed in the moment between the run looking and
+  /// the run ending, or one typed while a compaction had the floor.
   fn next_queued(&mut self) {
-    if let Some(next) = self.queued.pop_front() {
-      self.waiting();
+    if let Some(next) = self.agents.control.take_next() {
       self.dispatch(next);
     }
-  }
-
-  /// Tell a run in flight whether anything is waiting behind it, so it can
-  /// stop at its next turn rather than finish an answer to a question the
-  /// user has already moved past.
-  fn waiting(&self) {
-    self
-      .agents
-      .waiting
-      .store(!self.queued.is_empty(), std::sync::atomic::Ordering::Relaxed);
   }
 
   /// Whether the run that just ended found the context window full — and
   /// clear the mark, since answering it is this side's half of the bargain.
   fn overflowed(&self) -> bool {
-    self.agents.overflow.swap(false, std::sync::atomic::Ordering::Relaxed)
+    self.agents.control.overflowed()
   }
 
   fn compact(&mut self) {
@@ -1233,13 +1119,13 @@ impl App {
     self.entries.push(Entry::User(prompt.clone()));
     let prompt = Message::user(prompt);
     let handle = start_run(
-      self.agents.agent.clone(),
+      self.agents.runtime.clone(),
+      self.agents.control.clone(),
       self.session.history.clone(),
-      prompt.clone(),
+      Some(prompt),
       self.tx.clone(),
     );
     self.run = Some(handle);
-    self.in_flight = Some(InFlight::new(prompt, 0));
   }
 
   /// Run the model again with no new user message, to pick the loop back up
@@ -1248,53 +1134,64 @@ impl App {
   /// already had: an unanswered user message is answered, and a half-written
   /// answer is continued.
   fn continue_run(&mut self) {
-    let mut history = self.session.history.clone();
-    let Some(prompt) = history.pop() else {
+    if self.session.history.is_empty() {
       self.entries.push(Entry::Info("Nothing to continue.".into()));
       self.next_queued();
       return;
-    };
-    let handle = start_run(self.agents.agent.clone(), history, prompt.clone(), self.tx.clone());
+    }
+    let handle = start_run(
+      self.agents.runtime.clone(),
+      self.agents.control.clone(),
+      self.session.history.clone(),
+      None,
+      self.tx.clone(),
+    );
     self.run = Some(handle);
-    // The message it resumed from leads what the run adds, the same as any
-    // other prompt — and is dropped again when the run is recorded, being in
-    // the history already.
-    self.in_flight = Some(InFlight::new(prompt, 1));
   }
 
+  /// Esc.
+  ///
+  /// A run is asked to stop rather than killed: it drops what it is in the
+  /// middle of, answers the calls it had out so nothing is left hanging,
+  /// and hands back everything it got through. So the work is kept exactly
+  /// as the model gave it, and `Ended` finishes the job here.
+  ///
+  /// A compaction has no loop of its own to ask, so it is still killed.
   fn abort(&mut self) {
-    // A question the run was waiting on has nobody left to answer to; closing
-    // it drops the channel, which is how the tool hears that.
+    // A question the run was waiting on has nobody left to answer to;
+    // closing it drops the channel, which is how the tool hears that.
     self.close_question();
-    let Some(handle) = self.run.take() else {
+    if self.run.is_none() {
       return;
-    };
-    handle.abort();
-    // A call the model had not finished writing was never run, and the
-    // results of this turn are not the next turn's to record.
-    self.writing.clear();
-    self.outcomes.clear();
+    }
     // Esc is the end of it: a run stopped to be compacted is not resumed
     // afterwards, and the next one starts with the window weighed afresh.
     self.overflowed();
     self.resuming = false;
     if self.compacting {
+      if let Some(handle) = self.run.take() {
+        handle.abort();
+      }
       self.compacting = false;
+      self.writing.clear();
+      self.outcomes.clear();
       self.entries.push(Entry::Info("Compaction aborted.".into()));
-    } else {
-      self.recover_in_flight();
-      self.finish_running_tool();
-      self.entries.push(Entry::Info("Aborted.".into()));
+      self.strand_queued();
+      return;
     }
-    // Esc stops everything, including what was waiting behind the run — but
-    // it was typed, so it is kept in the transcript rather than dropped out
-    // of sight.
-    for text in std::mem::take(&mut self.queued) {
+    self.aborting = true;
+    self.agents.control.cancel();
+  }
+
+  /// Esc stops everything, including what was waiting behind the run — but
+  /// it was typed, so it is kept in the transcript rather than dropped out
+  /// of sight.
+  fn strand_queued(&mut self) {
+    for text in self.agents.control.take() {
       self
         .entries
         .push(Entry::Info(format!("Not sent: {}", first_line(&text))));
     }
-    self.waiting();
   }
 
   /// Take down the model's questionnaire, if one is up. What it had been
@@ -1310,45 +1207,21 @@ impl App {
     finish_running(&mut self.entries);
   }
 
-  /// Record what a run that stopped short of its final response got through.
+  /// Record what a run added to the conversation.
   ///
-  /// A run stopped at a turn boundary — for a message waiting behind it, or
-  /// to make room in the context — hands its transcript back all the same,
-  /// and that copy is the one the next request will replay: the same
-  /// messages, holding what the provider was told the first time. Keeping it
-  /// verbatim is what makes that request an append to the one just stopped,
-  /// which is all a prompt cache asks for.
-  ///
-  /// A run that ended any other way — an error, an abort, a stream that
-  /// simply stopped — hands nothing back, and what the run itself kept is
-  /// all there is: rig's own turns as far as the last boundary, and the turn
-  /// it was cut off in as the screen told it.
+  /// However it ended — with its answer, stopped for room, or cancelled —
+  /// these are the messages the run itself held and sent, not a reckoning
+  /// of them made from what went past on screen. So the next request is the
+  /// last one with more on the end, which is all a prompt cache asks for.
   fn stopped(&mut self, messages: Vec<Message>) {
-    let Some(in_flight) = self.in_flight.take() else {
-      return;
-    };
-    let resumed = in_flight.resumed;
-    let messages = match messages.is_empty() {
-      true => in_flight.recovered(),
-      false => messages,
-    };
-    // A `/continue` run leads with the message it resumed from; that one is
-    // in the history already and is not stored twice.
-    let messages: Vec<Message> = messages.into_iter().skip(resumed).collect();
     if messages.is_empty() {
       return;
     }
-    // How those tool calls went goes with them, or the transcript they leave
-    // behind would forget which failed and what each changed.
+    // How those tool calls went goes with them, or the transcript they
+    // leave behind would forget which failed and what each changed.
     let outcomes = std::mem::take(&mut self.outcomes);
     let result = self.session.append_with(messages, &outcomes);
     self.report(result);
-  }
-
-  /// The run was killed where it stood, so nothing will report it: keep what
-  /// it got through.
-  fn recover_in_flight(&mut self) {
-    self.stopped(Vec::new());
   }
 
   // ------------------------------------------------------------ agent events
@@ -1358,23 +1231,14 @@ impl App {
       return; // stale event from an aborted run
     }
     match ev {
-      AgentEvent::Text(delta) => {
-        if let Some(in_flight) = &mut self.in_flight {
-          in_flight.said(&delta);
-        }
-        match self.entries.last_mut() {
-          Some(Entry::Assistant(text)) => text.push_str(&delta),
-          _ => self.entries.push(Entry::Assistant(delta)),
-        }
-      }
-      // Nothing to draw: the turns it speaks for are already on the screen.
-      // It is the run saying them again in the words the model used, for the
-      // abort that may be about to leave them the only record of it.
-      AgentEvent::Turn { history } => {
-        if let Some(in_flight) = &mut self.in_flight {
-          in_flight.boundary(history);
-        }
-      }
+      AgentEvent::Text(delta) => match self.entries.last_mut() {
+        Some(Entry::Assistant(text)) => text.push_str(&delta),
+        _ => self.entries.push(Entry::Assistant(delta)),
+      },
+      // The run has read one of the messages waiting behind it, so it stops
+      // being something on its way and becomes a prompt like any other —
+      // drawn where the run reached it, which is where it was sent from.
+      AgentEvent::Steered(text) => self.entries.push(Entry::User(text)),
       AgentEvent::Reasoning(delta) => match self.entries.last_mut() {
         Some(Entry::Reasoning(text)) => text.push_str(&delta),
         _ => self.entries.push(Entry::Reasoning(delta)),
@@ -1392,10 +1256,6 @@ impl App {
         // This call has stopped being a line the model is typing and become
         // one the transcript keeps — whichever of the pending lines it is.
         self.writing.retain(|writing| writing.id != internal);
-        // Part of the turn being streamed, so an abort keeps it.
-        if let Some(in_flight) = &mut self.in_flight {
-          in_flight.called(&call, &name, args.clone());
-        }
         let summary = summarize_args(&name, &args);
         self.entries.push(Entry::ToolCall {
           wrote: wrote_content(&name, &args),
@@ -1418,9 +1278,6 @@ impl App {
         call,
         diff,
       } => {
-        if let Some(in_flight) = &mut self.in_flight {
-          in_flight.answered(&call, &name, output.clone());
-        }
         // What the transcript will not carry on its own.
         if is_error || diff.is_some() {
           self.outcomes.insert(
@@ -1497,15 +1354,24 @@ impl App {
           self.compacting = false;
           self.resuming = false;
           self.outcomes.clear();
-        } else {
-          self.stopped(messages);
-          if full {
-            // The run stopped at a turn boundary to let this happen, and
-            // goes on once there is room again.
-            self.resuming = true;
-            self.compact();
-            return;
-          }
+          self.next_queued();
+          return;
+        }
+        self.stopped(messages);
+        // Esc asked for this. The run has stopped where it stood and said
+        // what it got through, so the rest of what Esc means happens here.
+        if std::mem::take(&mut self.aborting) {
+          self.finish_running_tool();
+          self.entries.push(Entry::Info("Aborted.".into()));
+          self.strand_queued();
+          return;
+        }
+        if full {
+          // The run stopped at a turn boundary to let this happen, and
+          // goes on once there is room again.
+          self.resuming = true;
+          self.compact();
+          return;
         }
         self.next_queued();
       }
@@ -1527,7 +1393,7 @@ impl App {
             // What was cut short to make this room carries on where it
             // stopped — unless the user has said something since, which is
             // what it would have read next anyway.
-            if resuming && self.queued.is_empty() {
+            if resuming && !self.agents.control.steering() {
               self.continue_run();
               return;
             }
@@ -1781,8 +1647,9 @@ impl App {
       left.push(Span::raw("  "));
       let verb = if self.compacting { "compacting" } else { "working" };
       left.push(Span::raw(format!("{} {verb} — esc to abort", SPINNER[self.tick % SPINNER.len()])).fg(Color::Yellow));
-      if !self.queued.is_empty() {
-        left.push(Span::raw(format!("  ({} queued)", self.queued.len())).dim());
+      let queued = self.agents.control.waiting().len();
+      if queued > 0 {
+        left.push(Span::raw(format!("  ({queued} queued)")).dim());
       }
     } else if let Some(anchor) = self.anchor {
       let behind = self.view.1 - anchor;
@@ -2054,9 +1921,10 @@ impl App {
     // What the user typed while the run was going, at the end because that is
     // where it will be sent from — under everything the run is still saying,
     // not above it.
-    if !self.queued.is_empty() {
+    let waiting = self.agents.control.waiting();
+    if !waiting.is_empty() {
       lines.push(Line::default());
-      for text in &self.queued {
+      for text in &waiting {
         lines.push(Line::styled(format!("Queued: {}", first_line(text)), dim.italic()));
       }
     }
@@ -3700,158 +3568,6 @@ mod tests {
       )],
     }]);
     assert_eq!(shapes(&entries_from_history(&session)), ["out bash orphan output"]);
-  }
-
-  #[test]
-  fn an_aborted_run_keeps_the_work_it_got_through() {
-    // A run only hands back its transcript when it reaches the end, so a run
-    // stopped part-way has to have kept it as it went — otherwise the tools
-    // have changed the files and the conversation denies all knowledge.
-    let mut run = InFlight::new(Message::user("fix it"), 0);
-    run.said("Let me look.");
-    run.called("c1", "read", serde_json::json!({ "path": "a.rs" }));
-    run.answered("c1", "read", "fn main() {}".into());
-    run.said("Now the edit.");
-    run.called("c2", "edit", serde_json::json!({ "path": "a.rs" }));
-    run.answered("c2", "edit", "Successfully replaced 1 block(s).".into());
-    // Stopped here: mid-sentence, with a third call still running.
-    run.said("And now I will");
-    run.called("c3", "bash", serde_json::json!({ "command": "sleep 30" }));
-
-    let shapes: Vec<String> = run
-      .recovered()
-      .iter()
-      .map(|message| match message {
-        Message::User { content } => match &content[..] {
-          [UserContent::Text(t)] => format!("user {}", t.text),
-          [UserContent::ToolResult(r)] => format!("result {}", r.name),
-          _ => "user ?".into(),
-        },
-        Message::Assistant { content, .. } => content
-          .iter()
-          .map(|c| match c {
-            AssistantContent::Text(t) => format!("said {:?}", t.text),
-            AssistantContent::ToolCall(call) => format!("call {}", call.function.name),
-            _ => "?".into(),
-          })
-          .collect::<Vec<_>>()
-          .join(" + "),
-        Message::System { .. } => "system".into(),
-      })
-      .collect();
-    assert_eq!(
-      shapes,
-      [
-        "user fix it",
-        "said \"Let me look.\" + call read",
-        "result read",
-        "said \"Now the edit.\" + call edit",
-        "result edit",
-        // The half-finished sentence is kept too, and the call it was in
-        // the middle of is answered rather than left hanging.
-        "said \"And now I will\" + call bash",
-        "result bash",
-      ]
-    );
-  }
-
-  #[test]
-  fn every_call_in_flight_is_answered_whichever_came_back() {
-    // Two calls out at once, the second answering first. Both have to end up
-    // answered — the one that came back with its own result, the one that
-    // did not with an interruption — or the history keeps a call nothing
-    // ever replied to, which is a conversation no provider will take back.
-    let mut run = InFlight::new(Message::user("both"), 0);
-    run.called("c1", "bash", serde_json::json!({ "command": "slow" }));
-    run.called("c2", "bash", serde_json::json!({ "command": "quick" }));
-    run.answered("c2", "bash", "quick done".into());
-
-    let recovered = run.recovered();
-    let answered: Vec<String> = recovered
-      .iter()
-      .filter_map(|message| match message {
-        Message::User { content } => match &content[..] {
-          [UserContent::ToolResult(r)] => Some(format!(
-            "{}: {}",
-            r.call.as_str(),
-            match &r.content[..] {
-              [ToolResultContent::Text(t)] => t.text.clone(),
-              _ => String::new(),
-            }
-          )),
-          _ => None,
-        },
-        _ => None,
-      })
-      .collect();
-    assert_eq!(answered, ["c2: quick done".to_string(), format!("c1: {ABORTED}")]);
-  }
-
-  #[test]
-  fn a_run_that_did_nothing_leaves_only_what_was_asked() {
-    let mut run = InFlight::new(Message::user("hello"), 0);
-    run.said("   ");
-    assert_eq!(run.recovered(), [Message::user("hello")]);
-    // A `/continue` run leads with the message it resumed from, like any
-    // other prompt. What keeps that one from being stored twice is the
-    // `resumed` count the caller drops it by, not its absence here.
-    let resumed = InFlight::new(Message::user("carry on"), 1);
-    assert_eq!(resumed.resumed, 1);
-    assert_eq!(resumed.recovered(), [Message::user("carry on")]);
-  }
-
-  #[test]
-  fn a_turn_boundary_puts_the_runs_own_words_in_place_of_the_screens() {
-    // Everything behind the turn a run is cut off in is the model's own, as
-    // the run kept it — reasoning, grouping and all — rather than this
-    // side's reckoning of what went past on screen. Only the turn the abort
-    // landed in is pieced back together, because that one was never
-    // finished for anyone to have a copy of.
-    let mut run = InFlight::new(Message::user("fix it"), 0);
-    run.said("Let me look.");
-    run.called("c1", "read", serde_json::json!({ "path": "a.rs" }));
-    run.answered("c1", "read", "fn main() {}".into());
-    // What rig would hand back for the same two messages, which is not what
-    // the stream alone could have said: the reasoning is on it.
-    run.boundary(vec![
-      Message::user("fix it"),
-      Message::Assistant {
-        id: Some("msg_1".into()),
-        content: vec![
-          AssistantContent::text("Let me look."),
-          AssistantContent::tool_call("c1", "read", serde_json::json!({ "path": "a.rs" })),
-        ],
-      },
-      Message::User {
-        content: vec![UserContent::tool_result(
-          "c1",
-          "read",
-          vec![ToolResultContent::text("fn main() {}")],
-        )],
-      },
-    ]);
-    // And then it is stopped in the middle of the turn after.
-    run.said("Now the edit.");
-    run.called("c2", "edit", serde_json::json!({ "path": "a.rs" }));
-
-    let recovered = run.recovered();
-    assert_eq!(recovered.len(), 5, "{recovered:?}");
-    assert!(
-      matches!(&recovered[1], Message::Assistant { id, .. } if id.as_deref() == Some("msg_1")),
-      "the turn behind it is the one the run kept: {:?}",
-      recovered[1]
-    );
-    assert!(
-      matches!(&recovered[3], Message::Assistant { id, .. } if id.is_none()),
-      "the turn it stopped in is this side's: {:?}",
-      recovered[3]
-    );
-    assert!(
-      matches!(&recovered[4], Message::User { content }
-        if matches!(&content[..], [UserContent::ToolResult(r)] if r.call.as_str() == "c2")),
-      "with the call it was in the middle of answered: {:?}",
-      recovered[4]
-    );
   }
 
   /// The text of each line, and the colours it carries.

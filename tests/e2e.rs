@@ -692,6 +692,17 @@ fn a_command_is_written_then_run_and_its_output_lands_under_it() {
     lines[call + 1].contains("written-and-run"),
     "output under its call: {lines:?}"
   );
+  // And the line it was being written on is gone: the call it became is
+  // the only one left, not a second copy under everything else.
+  assert!(
+    !screen.contains('\u{258C}'),
+    "nothing is still being written once it has run:\n{screen}"
+  );
+  assert_eq!(
+    lines.iter().filter(|l| l.contains("\u{2699} bash")).count(),
+    1,
+    "the call is drawn once: {lines:?}"
+  );
 }
 
 #[test]
@@ -1034,6 +1045,88 @@ fn an_abort_leaves_the_turns_behind_it_as_the_model_gave_them() {
   );
 }
 
+/// A call being written is taken off the screen by the call it becomes.
+///
+/// Rig mints its own id for a call so the fragments of one stay followable
+/// before the provider has named it, and that is the id the half-written
+/// line is keyed by — not the id the finished call carries. Dispatch has to
+/// say both, or every call the run makes leaves its draft behind it.
+/// A command's output, while it is still running, lands under the call that
+/// asked for it.
+///
+/// Nothing tells the command which call it is. It reports down a channel the
+/// dispatcher bound to that call before handing it over, so getting this
+/// wrong would show the output adrift rather than under its own line.
+#[test]
+fn live_output_lands_under_the_call_that_asked_for_it() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "First. ",
+      tool: "bash",
+      args: serde_json::json!({ "command": "echo alpha; sleep 30" }),
+    },
+    Turn::Say("Done."),
+  ]);
+  let term = Term::start("live-output", &provider, &["--no-session"]);
+  term.submit("go");
+  // Its output, while the command it came from is still running: the only
+  // window in which the live channel is what put it there.
+  term.wait_for("alpha");
+  term.settle();
+  let screen = term.screen();
+  let lines: Vec<&str> = screen.lines().map(str::trim_end).filter(|l| !l.is_empty()).collect();
+  let call = lines
+    .iter()
+    .position(|line| line.contains("\u{2699} bash"))
+    .expect("the call");
+  assert!(
+    lines[call + 1].contains("alpha"),
+    "output under the call that asked for it, not adrift: {lines:?}"
+  );
+}
+
+#[test]
+fn a_call_being_written_is_replaced_by_the_call_it_becomes() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "One. ",
+      tool: "bash",
+      args: serde_json::json!({ "command": "echo one" }),
+    },
+    Turn::Call {
+      say: "Two. ",
+      tool: "bash",
+      args: serde_json::json!({ "command": "sleep 60" }),
+    },
+    Turn::Say("Done."),
+  ]);
+  let term = Term::start("written-once", &provider, &["--no-session"]);
+  term.submit("go");
+  // Mid-run, with one turn finished and the next one's call running: the
+  // moment a draft left behind would be visible.
+  term.wait_for("\u{2699} bash sleep 60");
+  term.settle();
+  let screen = term.screen();
+  let lines: Vec<&str> = screen.lines().map(str::trim_end).filter(|l| !l.is_empty()).collect();
+  assert!(
+    !screen.contains('\u{258C}'),
+    "nothing is still being written once it has run:\n{screen}"
+  );
+  for command in ["echo one", "sleep 60"] {
+    assert_eq!(
+      lines.iter().filter(|line| line.contains(command)).count(),
+      1,
+      "{command:?} is drawn once, not as a call and a draft of one: {lines:?}"
+    );
+  }
+}
+
 #[test]
 fn a_message_typed_mid_run_waits_at_the_bottom_and_goes_at_the_next_turn() {
   if !have_tmux() {
@@ -1198,6 +1291,60 @@ fn a_message_sent_mid_run_leaves_everything_before_it_untouched() {
     last.to_string().contains("and this too"),
     "the waiting message is the last thing asked: {last}"
   );
+}
+
+/// Two typed while the run was going both go, in the order they were typed
+/// and in the one request — they were said before the turn that reads them,
+/// so that is where the model sees them.
+#[test]
+fn everything_typed_while_a_run_went_goes_at_the_next_turn_in_order() {
+  if !have_tmux() {
+    return;
+  }
+  let file = (1..=400).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "Working. ",
+      tool: "write",
+      args: serde_json::json!({ "path": "notes.txt", "content": file }),
+    },
+    Turn::Say("Answered them all."),
+  ]);
+  let term = Term::start("queue-two", &provider, &["--no-session"]);
+  term.submit("start something slow");
+  term.wait_for("\u{2699} write notes.txt");
+  term.submit("first extra");
+  term.submit("second extra");
+  term.wait_for("Queued: second extra");
+  term.wait_for("Answered them all.");
+  term.settle();
+
+  let request = provider.request("first extra");
+  assert!(
+    request.contains("second extra"),
+    "both go in the one request: {request}"
+  );
+  let (first, second) = (
+    request.find("first extra").expect("the first"),
+    request.find("second extra").expect("the second"),
+  );
+  assert!(first < second, "in the order they were typed");
+  assert!(
+    !request.contains("Answered them all."),
+    "read at the next turn, not after the answer: {request}"
+  );
+  let screen = term.screen();
+  assert!(
+    !screen.contains("Queued:"),
+    "nothing is left waiting once the run has read it:\n{screen}"
+  );
+  for typed in ["first extra", "second extra"] {
+    assert_eq!(
+      screen.lines().filter(|line| line.contains(typed)).count(),
+      1,
+      "{typed:?} is drawn once, not queued and sent:\n{screen}"
+    );
+  }
 }
 
 #[test]
