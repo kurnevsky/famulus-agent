@@ -97,8 +97,14 @@ pub enum AgentEvent {
     questions: Vec<crate::ask::Question>,
     reply: oneshot::Sender<crate::ask::Outcome>,
   },
-  /// The run ended without a final response (after an `Error`).
-  Ended,
+  /// The run ended without a final response: stopped at a turn boundary, or
+  /// gave up after an `Error`. `messages` is what it got through, in the same
+  /// shape and holding the same thing `Done` carries — empty when the run
+  /// ended somewhere with nothing to hand back, which leaves the transcript
+  /// the only record of it.
+  Ended {
+    messages: Vec<Message>,
+  },
   /// Compaction finished; `None` means there was nothing to compact.
   Compacted(Option<Compacted>),
   Error(String),
@@ -593,11 +599,17 @@ pub fn start_run(
   tx: mpsc::UnboundedSender<AgentEvent>,
 ) -> JoinHandle<()> {
   tokio::spawn(async move {
+    // What the request already carried. A run hands its whole conversation
+    // back when it is stopped, and only the part of it this run added is the
+    // session's to record.
+    let carried = history.len();
     let mut stream = agent.stream_prompt(prompt).history(history).await;
     let mut sent_done = false;
     // The stream stopped for a reason the UI has already been told, so there
     // is nothing left to say about it when the loop falls out.
     let mut explained = false;
+    // What a stopped run got through, as rig kept it.
+    let mut stopped: Vec<Message> = Vec::new();
     // Arguments arrive a few characters at a time and each fragment carries
     // only what is new, so the run holds what has arrived per call and sends
     // the whole of it. The UI then has nothing to reassemble.
@@ -652,8 +664,18 @@ pub fn start_run(
         // A cancelled run is this app cutting in with the message the user
         // typed while it ran, not something that went wrong, so it ends the
         // way an abort does — quietly, keeping what it got through.
+        //
+        // What it got through comes back with the cancellation: rig's own
+        // messages, down to the reasoning each turn carried and the way it
+        // grouped the results of calls made together. Keeping those rather
+        // than piecing the run back together from what the UI saw is what
+        // leaves the next request an append to the one just stopped — and so
+        // leaves the provider's cache of everything before it standing.
         Err(StreamingError::Prompt(err)) if matches!(*err, PromptError::PromptCancelled { .. }) => {
           explained = true;
+          if let PromptError::PromptCancelled { chat_history, .. } = *err {
+            stopped = chat_history.into_iter().skip(carried).collect();
+          }
           None
         }
         Err(err) => {
@@ -671,7 +693,7 @@ pub fn start_run(
       if !explained {
         let _ = tx.send(AgentEvent::Error("stream ended without a final response".into()));
       }
-      let _ = tx.send(AgentEvent::Ended);
+      let _ = tx.send(AgentEvent::Ended { messages: stopped });
     }
   })
 }
@@ -689,7 +711,7 @@ pub fn start_compaction(
       Ok(result) => AgentEvent::Compacted(result),
       Err(err) => {
         let _ = tx.send(AgentEvent::Error(format!("compaction failed: {err}")));
-        AgentEvent::Ended
+        AgentEvent::Ended { messages: Vec::new() }
       }
     };
     let _ = tx.send(event);
@@ -797,7 +819,7 @@ mod tests {
         AgentEvent::Done { .. } => "done".into(),
         AgentEvent::Usage { .. } => "usage".into(),
         AgentEvent::Error(e) => format!("error:{e}"),
-        AgentEvent::Ended => "ended".into(),
+        AgentEvent::Ended { .. } => "ended".into(),
         AgentEvent::Compacted(_) => "compacted".into(),
         AgentEvent::AskUser { .. } => "asking".into(),
       })

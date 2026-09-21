@@ -33,6 +33,15 @@ enum Turn {
   Say(&'static str),
   /// Think aloud first, then say this — what a local reasoning server sends.
   Think { thought: &'static str, say: &'static str },
+  /// Think aloud, then call a tool: a reasoning model working, rather than
+  /// answering. What the turn thought is part of it, and a conversation that
+  /// carries on past it has to carry that too.
+  ThinkCall {
+    thought: &'static str,
+    say: &'static str,
+    tool: &'static str,
+    args: serde_json::Value,
+  },
   /// Answer with the question, so the two ways a conversation went can be
   /// told apart on screen by what was asked down each.
   Echo,
@@ -149,7 +158,7 @@ fn serve(mut stream: TcpStream, script: &[Turn], seen: &Mutex<Vec<String>>) -> s
       Turn::Say(text) => text.to_string(),
       Turn::Think { say, .. } => say.to_string(),
       Turn::Echo => answer_to(&body),
-      Turn::Call { say, .. } => say.to_string(),
+      Turn::Call { say, .. } | Turn::ThinkCall { say, .. } => say.to_string(),
     };
     return answer_outright(&mut stream, &text);
   }
@@ -181,29 +190,15 @@ fn serve(mut stream: TcpStream, script: &[Turn], seen: &Mutex<Vec<String>>) -> s
       chunk(serde_json::json!({}), Some("stop"))?;
     }
     Turn::Call { say, tool, args } => {
-      if !say.is_empty() {
-        chunk(serde_json::json!({ "role": "assistant", "content": say }), None)?;
-      }
-      let args = args.to_string();
-      chunk(
-        serde_json::json!({
-          "tool_calls": [{ "index": 0, "id": format!("call_{done}"), "type": "function",
-                           "function": { "name": tool, "arguments": "" } }]
-        }),
-        None,
-      )?;
-      // A few characters at a time, as a provider streams them — which is
-      // what the transcript draws as the call being written.
-      for part in args.as_bytes().chunks(8) {
-        chunk(
-          serde_json::json!({
-            "tool_calls": [{ "index": 0, "function": { "arguments": String::from_utf8_lossy(part) } }]
-          }),
-          None,
-        )?;
-        std::thread::sleep(Duration::from_millis(15));
-      }
-      chunk(serde_json::json!({}), Some("tool_calls"))?;
+      call(&mut chunk, None, say, tool, &args, done)?;
+    }
+    Turn::ThinkCall {
+      thought,
+      say,
+      tool,
+      args,
+    } => {
+      call(&mut chunk, Some(thought), say, tool, &args, done)?;
     }
   }
   // What the turn cost, in the usage-only chunk a provider sends last when
@@ -220,6 +215,46 @@ fn serve(mut stream: TcpStream, script: &[Turn], seen: &Mutex<Vec<String>>) -> s
   stream.write_all(format!("data: {payload}\n\n").as_bytes())?;
   stream.write_all(b"data: [DONE]\n\n")?;
   stream.flush()
+}
+
+/// Stream a turn that calls a tool, with whatever it thought on the way there.
+fn call(
+  chunk: &mut impl FnMut(serde_json::Value, Option<&str>) -> std::io::Result<()>,
+  thought: Option<&str>,
+  say: &str,
+  tool: &str,
+  args: &serde_json::Value,
+  done: usize,
+) -> std::io::Result<()> {
+  if let Some(thought) = thought {
+    chunk(
+      serde_json::json!({ "role": "assistant", "reasoning_content": thought }),
+      None,
+    )?;
+  }
+  if !say.is_empty() {
+    chunk(serde_json::json!({ "role": "assistant", "content": say }), None)?;
+  }
+  let args = args.to_string();
+  chunk(
+    serde_json::json!({
+      "tool_calls": [{ "index": 0, "id": format!("call_{done}"), "type": "function",
+                       "function": { "name": tool, "arguments": "" } }]
+    }),
+    None,
+  )?;
+  // A few characters at a time, as a provider streams them — which is what
+  // the transcript draws as the call being written.
+  for part in args.as_bytes().chunks(8) {
+    chunk(
+      serde_json::json!({
+        "tool_calls": [{ "index": 0, "function": { "arguments": String::from_utf8_lossy(part) } }]
+      }),
+      None,
+    )?;
+    std::thread::sleep(Duration::from_millis(15));
+  }
+  chunk(serde_json::json!({}), Some("tool_calls"))
 }
 
 /// What the mock says every turn costs to write.
@@ -1009,6 +1044,94 @@ fn a_message_typed_mid_run_waits_at_the_bottom_and_goes_at_the_next_turn() {
     .position(|l| l.contains("❯ and this too"))
     .expect("the prompt it became");
   assert!(prompt > call, "it becomes a prompt where it waited: {lines:?}");
+}
+
+/// A run cut short for a waiting message leaves the conversation exactly as it
+/// stood, so the request carrying that message is the last one with more on
+/// the end — and everything before it is a prefix the provider has already
+/// weighed and cached.
+///
+/// The run being stopped is the one place the conversation is not the model's
+/// own words handed back: there is no final response to take them from. Piece
+/// the run back together from what the screen showed and the turns come out
+/// almost right — no reasoning on them, the text of a turn run together, the
+/// results of one turn split across several messages — and almost right is a
+/// cache miss on every token of the conversation from the first turn of that
+/// run onwards.
+#[test]
+fn a_message_sent_mid_run_leaves_everything_before_it_untouched() {
+  if !have_tmux() {
+    return;
+  }
+  // Two turns that think before they work, so the run is stopped with turns
+  // behind it that the screen alone could not put back.
+  let file = (1..=400).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+  let provider = Provider::start(vec![
+    Turn::ThinkCall {
+      thought: "Notes first.",
+      say: "Working. ",
+      tool: "write",
+      args: serde_json::json!({ "path": "notes.txt", "content": "one" }),
+    },
+    Turn::ThinkCall {
+      thought: "And the long one.",
+      say: "Still working. ",
+      tool: "write",
+      args: serde_json::json!({ "path": "more.txt", "content": file }),
+    },
+    Turn::Say("Answered them both."),
+  ]);
+  let term = Term::start("steer-prefix", &provider, &["--no-session"]);
+  term.submit("start something slow");
+  // The second turn is under way, so the first is behind the run and has to
+  // survive it.
+  term.wait_for("⚙ write more.txt");
+  let stopped = wait_bodies(&provider, 2).last().expect("the second request").clone();
+  term.submit("and this too");
+  term.wait_for("Answered them both.");
+  term.settle();
+
+  // What the stopped run had asked for, and what the message waiting behind
+  // it asked for once it went.
+  let steered = provider.request("and this too");
+  let messages = |body: &str| -> Vec<serde_json::Value> {
+    let body: serde_json::Value = serde_json::from_str(body).expect("a JSON request");
+    body["messages"].as_array().expect("messages").clone()
+  };
+  let (stopped, steered) = (messages(&stopped), messages(&steered));
+  assert!(
+    steered.len() > stopped.len(),
+    "the message and the turn it waited for are on the end: {} then {}",
+    stopped.len(),
+    steered.len()
+  );
+  for (at, (before, after)) in stopped.iter().zip(&steered).enumerate() {
+    assert_eq!(
+      before,
+      after,
+      "message {at} of {} was rewritten by the run being stopped",
+      stopped.len()
+    );
+  }
+
+  // And the turn it was stopped in the middle of is on the end whole, thought
+  // and all, followed by the message that stopped it.
+  let added: Vec<&serde_json::Value> = steered.iter().skip(stopped.len()).collect();
+  let reasoned = added.iter().any(|m| {
+    m["reasoning_content"]
+      .as_str()
+      .is_some_and(|r| r.contains("And the long one."))
+  });
+  assert!(
+    reasoned,
+    "the stopped turn kept what it thought: {:?}",
+    added.iter().map(|m| &m["role"]).collect::<Vec<_>>()
+  );
+  let last = added.last().expect("the message that was waiting");
+  assert!(
+    last.to_string().contains("and this too"),
+    "the waiting message is the last thing asked: {last}"
+  );
 }
 
 #[test]

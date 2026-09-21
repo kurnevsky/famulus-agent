@@ -1296,9 +1296,35 @@ impl App {
     finish_running(&mut self.entries);
   }
 
-  /// The run never reached its final response, so rig did not hand back the
-  /// updated transcript. Keep what the user saw. The messages a `/continue`
-  /// resumed from are already in the history and stay there.
+  /// Record what a run that stopped short of its final response got through.
+  ///
+  /// A run stopped at a turn boundary — for a message waiting behind it, or
+  /// to make room in the context — hands its transcript back all the same,
+  /// and that copy is the one the next request will replay: the same
+  /// messages, holding what the provider was told the first time. Keeping it
+  /// verbatim is what makes that request an append to the one just stopped,
+  /// which is all a prompt cache asks for.
+  ///
+  /// A run that ended any other way — an error, or a stream that simply
+  /// stopped — hands nothing back, and what the user saw is all there is.
+  fn stopped(&mut self, messages: Vec<Message>) {
+    if messages.is_empty() {
+      self.recover_in_flight();
+      return;
+    }
+    // A `/continue` run echoes back the messages it resumed from; they are
+    // already in the history, the same as when a run reaches its answer.
+    let resumed = self.in_flight.take().map_or(0, |f| f.resumed);
+    let outcomes = std::mem::take(&mut self.outcomes);
+    let result = self
+      .session
+      .append_with(messages.into_iter().skip(resumed).collect(), &outcomes);
+    self.report(result);
+  }
+
+  /// The run never reached its final response and had no transcript to hand
+  /// back. Keep what the user saw. The messages a `/continue` resumed from
+  /// are already in the history and stay there.
   fn recover_in_flight(&mut self) {
     let Some(in_flight) = self.in_flight.take() else {
       return;
@@ -1430,14 +1456,7 @@ impl App {
         self.run = None;
         self.writing.clear();
         self.close_question();
-        // A `/continue` run echoes back the messages it resumed from; they
-        // are already in the history.
-        let resumed = self.in_flight.take().map_or(0, |f| f.resumed);
-        let outcomes = std::mem::take(&mut self.outcomes);
-        let result = self
-          .session
-          .append_with(messages.into_iter().skip(resumed).collect(), &outcomes);
-        self.report(result);
+        self.stopped(messages);
         // The run ended with its answer, so there is nothing to pick back
         // up; a context that outgrew the window is still made room in,
         // before the next message is sent into it.
@@ -1448,10 +1467,9 @@ impl App {
           self.next_queued();
         }
       }
-      AgentEvent::Ended => {
+      AgentEvent::Ended { messages } => {
         self.run = None;
         self.writing.clear();
-        self.outcomes.clear();
         self.close_question();
         let full = self.overflowed();
         if self.compacting {
@@ -1459,8 +1477,9 @@ impl App {
           // the next turn: the room it was going to make is not coming.
           self.compacting = false;
           self.resuming = false;
+          self.outcomes.clear();
         } else {
-          self.recover_in_flight();
+          self.stopped(messages);
           if full {
             // The run stopped at a turn boundary to let this happen, and
             // goes on once there is room again.
