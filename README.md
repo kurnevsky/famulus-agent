@@ -1,8 +1,10 @@
-# fa
+# famulus-agent
 
 A minimal terminal coding agent in Rust, in the spirit of [pi](https://pi.dev):
 one streaming transcript, one input box, five tools (`read`, `write`, `edit`,
-`bash`, `ask`). Built on [rig](https://crates.io/crates/rig-core) for the LLM loop and
+`bash`, `ask`). The crate is `famulus-agent`; the binary it installs — and the
+name used for it throughout this file — is `fa`.
+Built on [rig](https://crates.io/crates/rig-core) for the LLM loop and
 [ratatui](https://ratatui.rs) + [ratatui-textarea](https://crates.io/crates/ratatui-textarea)
 for the interface. Talks to any OpenAI-compatible chat completions endpoint,
 or to Google Gemini.
@@ -676,8 +678,13 @@ reach. The mock decides which turn to play from the request rather than
 counting, so a resumed session picks up where the last one left off. Without
 tmux installed these skip rather than fail.
 
-`src/agent.rs` also has an end-to-end test against a mock server when
-`FA_TEST_BASE_URL` is set; without it the test is skipped.
+`src/agent.rs` also has end-to-end tests against a mock server, gated on an
+environment variable each: `FA_TEST_BASE_URL` for the OpenAI-compatible ones
+(streaming, tool calls, compaction, image input) and `FA_TEST_GEMINI_BASE_URL`
+for the Gemini image one. Unset, each test prints why and returns, so
+`cargo test` passes without them. The server is not part of the repository —
+point these at one you are running, answering as the provider would; the model
+is sent as `mock`.
 
 ```sh
 FA_TEST_BASE_URL=http://127.0.0.1:8123/v1 cargo test

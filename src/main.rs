@@ -23,7 +23,8 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::supports_keyboard_enhancement;
 use tokio::sync::mpsc;
 
-/// fa: a minimal terminal coding agent for OpenAI-compatible APIs and Gemini.
+/// famulus-agent: a minimal terminal coding agent for OpenAI-compatible APIs
+/// and Gemini.
 #[derive(Parser)]
 #[command(name = "fa", version)]
 struct Cli {

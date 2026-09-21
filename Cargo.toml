@@ -1,7 +1,12 @@
 [package]
-name = "fa"
+name = "famulus-agent"
 version = "0.1.0"
 edition = "2024"
+
+# The crate is `famulus-agent`; the thing you type is `fa`.
+[[bin]]
+name = "fa"
+path = "src/main.rs"
 
 # Every grammar is a C parser that has to be compiled, so each one is a feature
 # of its own: `--no-default-features` builds with no tree-sitter at all, and
