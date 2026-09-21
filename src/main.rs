@@ -52,10 +52,6 @@ struct Cli {
   #[arg(long, env = "FA_SYSTEM_PROMPT")]
   system_prompt: Option<String>,
 
-  /// Maximum model calls (tool rounds) per user message
-  #[arg(long, default_value_t = 50)]
-  max_turns: usize,
-
   /// Context window of the model in tokens; compaction triggers near this limit
   #[arg(long, env = "FA_CONTEXT_WINDOW", default_value_t = 128_000)]
   context_window: u64,
@@ -152,7 +148,6 @@ async fn main() -> Result<()> {
     api_key,
     model: cli.model,
     system_prompt: cli.system_prompt,
-    max_turns: cli.max_turns,
     vision: !cli.no_vision,
     // Worked out below, once the MCP servers have said what they brought.
     tools: None,

@@ -31,7 +31,6 @@ GEMINI_API_KEY=... ./target/release/fa --provider gemini -m gemini-2.5-pro
 | `--api-key` | `FA_API_KEY` | `OPENAI_API_KEY` / `GEMINI_API_KEY`, else `none` | API key (any value for servers without auth) |
 | `-m, --model` | `FA_MODEL` | required | Model name |
 | `--system-prompt` | `FA_SYSTEM_PROMPT` | built-in | Replace the system prompt |
-| `--max-turns` | | `50` | Max model calls per user message |
 | `--context-window` | `FA_CONTEXT_WINDOW` | `128000` | Model context size in tokens |
 | `--reserve-tokens` | | `16384` | Compact when fewer tokens than this remain |
 | `--keep-recent-tokens` | | `20000` | Recent tokens kept verbatim when compacting |

@@ -275,7 +275,6 @@ pub struct Runtime {
   model: Arc<dyn Model>,
   tools: ToolServerHandle,
   preamble: String,
-  max_turns: usize,
   compaction: Settings,
   /// The tool names this session was held to, or all of them.
   allowed: Option<Vec<String>>,
@@ -327,7 +326,6 @@ pub struct Config {
   pub api_key: String,
   pub model: String,
   pub system_prompt: Option<String>,
-  pub max_turns: usize,
   pub compaction: Settings,
   /// Whether the model accepts image input.
   pub vision: bool,
@@ -393,7 +391,6 @@ pub fn build_agents(
       model: model.clone(),
       tools,
       preamble,
-      max_turns: cfg.max_turns,
       compaction: cfg.compaction,
       allowed: cfg.tools.clone(),
       relay_images,
@@ -504,7 +501,9 @@ async fn run(
   };
   let mut weigh = Weigh::default();
 
-  for turn in 1..=rt.max_turns {
+  let mut first = true;
+
+  loop {
     // Anything typed while the last turn ran is read before this one, so it
     // lands where the user meant it rather than after the whole answer.
     for prompt in control.take() {
@@ -533,10 +532,11 @@ async fn run(
       control.overflowed_now();
       // Never before the first call, where the run has done nothing yet:
       // it would be handed the same conversation again and stop again.
-      if turn > 1 {
+      if !first {
         return Some(Stop::Overflow);
       }
     }
+    first = false;
 
     let sent = chat.len();
     let request = CompletionRequest {
@@ -642,7 +642,6 @@ async fn run(
       return Some(Stop::Cancelled);
     }
   }
-  Some(Stop::Failed(format!("stopped after {} turns", rt.max_turns)))
 }
 
 /// The turn as far as it has been streamed.
@@ -1061,7 +1060,6 @@ mod tests {
       }),
       tools,
       preamble: String::new(),
-      max_turns: 10,
       compaction: TEST_SETTINGS,
       allowed: None,
       relay_images: false,
@@ -1254,7 +1252,6 @@ mod tests {
       api_key: "test".into(),
       model: "mock".into(),
       system_prompt: None,
-      max_turns: 5,
       compaction: TEST_SETTINGS,
       vision: true,
       tools: None,
@@ -1399,7 +1396,6 @@ mod tests {
       api_key: "test".into(),
       model: "mock".into(),
       system_prompt: None,
-      max_turns: 5,
       compaction: TEST_SETTINGS,
       vision: true,
       tools: None,
@@ -1613,7 +1609,6 @@ mod tests {
       api_key: "test".into(),
       model: "mock".into(),
       system_prompt: None,
-      max_turns: 5,
       compaction: TEST_SETTINGS,
       vision: true,
       tools: None,
@@ -1660,7 +1655,6 @@ mod tests {
       api_key: "test".into(),
       model: "mock".into(),
       system_prompt: None,
-      max_turns: 5,
       compaction: TEST_SETTINGS,
       vision: true,
       tools: None,
