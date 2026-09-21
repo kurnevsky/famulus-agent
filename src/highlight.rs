@@ -14,7 +14,7 @@
 use ratatui::text::Span;
 
 #[cfg(feature = "syntax")]
-use std::sync::OnceLock;
+use std::{borrow::Cow, sync::OnceLock};
 
 #[cfg(feature = "syntax")]
 use ratatui::style::{Color, Modifier, Style};
@@ -119,6 +119,32 @@ const HASKELL_HIGHLIGHTS: &str = r#"
 (apply function: (variable) @function)
 "#;
 
+/// Gleam's function names, said again after its own query takes them back.
+///
+/// That query ends on a bare `(identifier) @variable`, which under the
+/// last-match-wins rule wins over the `@function` captured for a name earlier
+/// in the file — and `variable` is not a name we style, so every function in
+/// the block came out the code's default colour. Appended rather than replacing
+/// the query, so the rest of it stays whatever upstream makes it.
+#[cfg(feature = "lang-gleam")]
+const GLEAM_FUNCTIONS: &str = r#"
+(function name: (identifier) @function)
+(external_function name: (identifier) @function)
+(function_call function: (identifier) @function)
+"#;
+
+/// The rule that tells SQL's numbers from its strings, in this engine's dialect.
+///
+/// `tree-sitter-sequel` calls every literal a string and then narrows that with
+/// `(#match? @number "^[-+]?%d+$")` — a Lua pattern, where `%d` is a digit.
+/// `#match?` here is a regex, in which `%d` is a literal per cent, so the
+/// pattern never fires and numbers stay string-green.
+#[cfg(feature = "lang-sql")]
+const SQL_NUMBERS: &str = r#"
+((literal) @number (#match? @number "^[-+]?[0-9]+$"))
+((literal) @number (#match? @number "^[-+]?[0-9]*\\.[0-9]*$"))
+"#;
+
 /// Spans for each line of `source`, or `None` when `lang` is not one we can
 /// parse — in which case the caller draws the block in its fallback colour.
 ///
@@ -208,12 +234,64 @@ fn grammar(lang: &str) -> Option<&'static HighlightConfiguration> {
     }
     #[cfg(feature = "lang-c")]
     "c" | "h" => config!("c", tree_sitter_c::LANGUAGE, tree_sitter_c::HIGHLIGHT_QUERY),
+    #[cfg(feature = "lang-c-sharp")]
+    "csharp" | "c#" | "cs" => config!(
+      "c-sharp",
+      tree_sitter_c_sharp::LANGUAGE,
+      tree_sitter_c_sharp::HIGHLIGHTS_QUERY
+    ),
+    #[cfg(feature = "lang-cmake")]
+    "cmake" => config!(
+      "cmake",
+      tree_sitter_cmake::LANGUAGE,
+      tree_sitter_cmake::HIGHLIGHTS_QUERY,
+      tree_sitter_cmake::INJECTIONS_QUERY,
+      ""
+    ),
     #[cfg(feature = "lang-cpp")]
     "cpp" | "c++" | "cc" | "cxx" | "hpp" => {
       config!("cpp", tree_sitter_cpp::LANGUAGE, tree_sitter_cpp::HIGHLIGHT_QUERY)
     }
     #[cfg(feature = "lang-css")]
     "css" => config!("css", tree_sitter_css::LANGUAGE, tree_sitter_css::HIGHLIGHTS_QUERY),
+    #[cfg(feature = "lang-dart")]
+    "dart" => config!(
+      "dart",
+      tree_sitter_dart::LANGUAGE,
+      tree_sitter_dart::HIGHLIGHTS_QUERY,
+      "",
+      tree_sitter_dart::LOCALS_QUERY
+    ),
+    #[cfg(feature = "lang-diff")]
+    "diff" | "patch" => config!("diff", tree_sitter_diff::LANGUAGE, tree_sitter_diff::HIGHLIGHTS_QUERY),
+    #[cfg(feature = "lang-elixir")]
+    "elixir" | "ex" | "exs" => config!(
+      "elixir",
+      tree_sitter_elixir::LANGUAGE,
+      tree_sitter_elixir::HIGHLIGHTS_QUERY,
+      tree_sitter_elixir::INJECTIONS_QUERY,
+      ""
+    ),
+    #[cfg(feature = "lang-erlang")]
+    "erlang" | "erl" => config!(
+      "erlang",
+      tree_sitter_erlang::LANGUAGE,
+      tree_sitter_erlang::HIGHLIGHTS_QUERY
+    ),
+    #[cfg(feature = "lang-fortran")]
+    "fortran" | "f90" | "f95" => config!(
+      "fortran",
+      tree_sitter_fortran::LANGUAGE,
+      tree_sitter_fortran::HIGHLIGHTS_QUERY
+    ),
+    #[cfg(feature = "lang-gleam")]
+    "gleam" => config!(
+      "gleam",
+      tree_sitter_gleam::LANGUAGE,
+      [tree_sitter_gleam::HIGHLIGHT_QUERY, GLEAM_FUNCTIONS].concat(),
+      "",
+      tree_sitter_gleam::LOCALS_QUERY
+    ),
     #[cfg(feature = "lang-go")]
     "go" | "golang" => config!("go", tree_sitter_go::LANGUAGE, tree_sitter_go::HIGHLIGHTS_QUERY),
     #[cfg(feature = "lang-haskell")]
@@ -232,6 +310,8 @@ fn grammar(lang: &str) -> Option<&'static HighlightConfiguration> {
       tree_sitter_html::INJECTIONS_QUERY,
       ""
     ),
+    #[cfg(feature = "lang-ini")]
+    "ini" | "cfg" => config!("ini", tree_sitter_ini::LANGUAGE, tree_sitter_ini::HIGHLIGHTS_QUERY),
     #[cfg(feature = "lang-java")]
     "java" => config!("java", tree_sitter_java::LANGUAGE, tree_sitter_java::HIGHLIGHTS_QUERY),
     #[cfg(feature = "lang-javascript")]
@@ -248,13 +328,99 @@ fn grammar(lang: &str) -> Option<&'static HighlightConfiguration> {
       tree_sitter_javascript::INJECTIONS_QUERY,
       tree_sitter_javascript::LOCALS_QUERY
     ),
+    // Reached through JavaScript's injections, which hand a comment to this
+    // grammar; a `jsdoc` fence is nobody's habit but costs nothing to accept.
+    #[cfg(feature = "lang-jsdoc")]
+    "jsdoc" => config!(
+      "jsdoc",
+      tree_sitter_jsdoc::LANGUAGE,
+      tree_sitter_jsdoc::HIGHLIGHTS_QUERY
+    ),
     #[cfg(feature = "lang-json")]
     "json" | "jsonc" => config!("json", tree_sitter_json::LANGUAGE, tree_sitter_json::HIGHLIGHTS_QUERY),
+    #[cfg(feature = "lang-kotlin")]
+    "kotlin" | "kt" | "kts" => config!(
+      "kotlin",
+      tree_sitter_kotlin_sg::LANGUAGE,
+      tree_sitter_kotlin_sg::HIGHLIGHTS_QUERY
+    ),
+    #[cfg(feature = "lang-lua")]
+    "lua" => config!(
+      "lua",
+      tree_sitter_lua::LANGUAGE,
+      tree_sitter_lua::HIGHLIGHTS_QUERY,
+      tree_sitter_lua::INJECTIONS_QUERY,
+      tree_sitter_lua::LOCALS_QUERY
+    ),
+    #[cfg(feature = "lang-make")]
+    "make" | "makefile" | "mk" => config!("make", tree_sitter_make::LANGUAGE, tree_sitter_make::HIGHLIGHTS_QUERY),
+    #[cfg(feature = "lang-nix")]
+    "nix" => config!(
+      "nix",
+      tree_sitter_nix::LANGUAGE,
+      tree_sitter_nix::HIGHLIGHTS_QUERY,
+      tree_sitter_nix::INJECTIONS_QUERY,
+      ""
+    ),
+    #[cfg(feature = "lang-ocaml")]
+    "ocaml" | "ml" => config!(
+      "ocaml",
+      tree_sitter_ocaml::LANGUAGE_OCAML,
+      tree_sitter_ocaml::HIGHLIGHTS_QUERY,
+      "",
+      tree_sitter_ocaml::LOCALS_QUERY
+    ),
+    // An `.mli` is a different grammar in the same crate, sharing the query.
+    #[cfg(feature = "lang-ocaml")]
+    "ocaml_interface" | "mli" => config!(
+      "ocaml_interface",
+      tree_sitter_ocaml::LANGUAGE_OCAML_INTERFACE,
+      tree_sitter_ocaml::HIGHLIGHTS_QUERY,
+      "",
+      tree_sitter_ocaml::LOCALS_QUERY
+    ),
+    #[cfg(feature = "lang-php")]
+    "php" => config!(
+      "php",
+      tree_sitter_php::LANGUAGE_PHP,
+      tree_sitter_php::HIGHLIGHTS_QUERY,
+      tree_sitter_php::INJECTIONS_QUERY,
+      ""
+    ),
+    #[cfg(feature = "lang-powershell")]
+    "powershell" | "pwsh" | "ps1" => config!(
+      "powershell",
+      tree_sitter_powershell::LANGUAGE,
+      tree_sitter_powershell::HIGHLIGHTS_QUERY
+    ),
     #[cfg(feature = "lang-python")]
     "python" | "py" => config!(
       "python",
       tree_sitter_python::LANGUAGE,
       tree_sitter_python::HIGHLIGHTS_QUERY
+    ),
+    #[cfg(feature = "lang-r")]
+    "r" | "rscript" => config!(
+      "r",
+      tree_sitter_r::LANGUAGE,
+      tree_sitter_r::HIGHLIGHTS_QUERY,
+      "",
+      tree_sitter_r::LOCALS_QUERY
+    ),
+    // JavaScript injects this one into every regex literal.
+    #[cfg(feature = "lang-regex")]
+    "regex" | "regexp" => config!(
+      "regex",
+      tree_sitter_regex::LANGUAGE,
+      tree_sitter_regex::HIGHLIGHTS_QUERY
+    ),
+    #[cfg(feature = "lang-ruby")]
+    "ruby" | "rb" => config!(
+      "ruby",
+      tree_sitter_ruby::LANGUAGE,
+      tree_sitter_ruby::HIGHLIGHTS_QUERY,
+      "",
+      tree_sitter_ruby::LOCALS_QUERY
     ),
     #[cfg(feature = "lang-rust")]
     "rust" | "rs" => config!(
@@ -271,6 +437,21 @@ fn grammar(lang: &str) -> Option<&'static HighlightConfiguration> {
       tree_sitter_scala::HIGHLIGHTS_QUERY,
       "",
       tree_sitter_scala::LOCALS_QUERY
+    ),
+    // Dialect-agnostic: the grammar takes MySQL, Postgres and SQLite alike.
+    #[cfg(feature = "lang-sql")]
+    "sql" | "mysql" | "postgresql" | "sqlite" => config!(
+      "sql",
+      tree_sitter_sequel::LANGUAGE,
+      [tree_sitter_sequel::HIGHLIGHTS_QUERY, SQL_NUMBERS].concat()
+    ),
+    #[cfg(feature = "lang-swift")]
+    "swift" => config!(
+      "swift",
+      tree_sitter_swift::LANGUAGE,
+      tree_sitter_swift::HIGHLIGHTS_QUERY,
+      tree_sitter_swift::INJECTIONS_QUERY,
+      tree_sitter_swift::LOCALS_QUERY
     ),
     #[cfg(feature = "lang-toml")]
     "toml" => config!(
@@ -306,10 +487,41 @@ fn grammar(lang: &str) -> Option<&'static HighlightConfiguration> {
       tree_sitter_javascript::INJECTIONS_QUERY,
       tree_sitter_typescript::LOCALS_QUERY
     ),
+    // The crate carries a DTD grammar as well, which no fence asks for.
+    #[cfg(feature = "lang-xml")]
+    "xml" | "svg" | "xsd" => config!(
+      "xml",
+      tree_sitter_xml::LANGUAGE_XML,
+      tree_sitter_xml::XML_HIGHLIGHT_QUERY
+    ),
     #[cfg(feature = "lang-yaml")]
     "yaml" | "yml" => config!("yaml", tree_sitter_yaml::LANGUAGE, tree_sitter_yaml::HIGHLIGHTS_QUERY),
+    #[cfg(feature = "lang-zig")]
+    "zig" => config!(
+      "zig",
+      tree_sitter_zig::LANGUAGE,
+      tree_sitter_zig::HIGHLIGHTS_QUERY,
+      tree_sitter_zig::INJECTIONS_QUERY,
+      ""
+    ),
     _ => None,
   }
+}
+
+/// A query with neovim's spell-checking captures taken out.
+///
+/// Queries written for neovim mark where prose lives by capturing a node twice
+/// — `(comment) @comment @spell`. Of several captures on one node the last one
+/// wins here, and `@spell` is not a name we style, so left in it silences the
+/// `@comment` in front of it and comments come out plain. Removing the name
+/// leaves the pattern itself, and its other captures, exactly as they were.
+#[cfg(feature = "syntax")]
+fn without_spell(query: &str) -> Cow<'_, str> {
+  if !query.contains("@spell") && !query.contains("@nospell") {
+    return Cow::Borrowed(query);
+  }
+  // `@nospell` first: it ends in the shorter name.
+  Cow::Owned(query.replace("@nospell", "").replace("@spell", ""))
 }
 
 /// Compiles a grammar's queries, or gives up on it for good.
@@ -328,11 +540,22 @@ fn build(
   let mut config = HighlightConfiguration::new(
     language,
     name,
-    highlights.as_ref(),
+    &without_spell(highlights.as_ref()),
     injections.as_ref(),
     locals.as_ref(),
   )
   .ok()?;
+  // A pattern can be guarded by a predicate this query engine has never heard
+  // of — neovim's `#lua-match?`, nearly always — and an unknown predicate is
+  // ignored rather than refused, so the pattern fires everywhere it was meant
+  // to be held back. Zig's query is the clearest case: its rule for capitalised
+  // identifiers, unguarded, makes a type of every identifier in the block.
+  // Dropping those patterns loses a little colour and keeps the rest honest.
+  for pattern in 0..config.query.pattern_count() {
+    if !config.query.general_predicates(pattern).is_empty() {
+      config.query.disable_pattern(pattern);
+    }
+  }
   let names: Vec<&str> = THEME.iter().map(|(name, _)| *name).collect();
   config.configure(&names);
   Some(config)
@@ -435,40 +658,136 @@ mod tests {
       "bash",
       #[cfg(feature = "lang-c")]
       "c",
+      #[cfg(feature = "lang-c-sharp")]
+      "csharp",
+      #[cfg(feature = "lang-cmake")]
+      "cmake",
       #[cfg(feature = "lang-cpp")]
       "cpp",
       #[cfg(feature = "lang-css")]
       "css",
+      #[cfg(feature = "lang-dart")]
+      "dart",
+      #[cfg(feature = "lang-diff")]
+      "diff",
+      #[cfg(feature = "lang-elixir")]
+      "elixir",
+      #[cfg(feature = "lang-erlang")]
+      "erlang",
+      #[cfg(feature = "lang-fortran")]
+      "fortran",
+      #[cfg(feature = "lang-gleam")]
+      "gleam",
       #[cfg(feature = "lang-go")]
       "go",
       #[cfg(feature = "lang-haskell")]
       "haskell",
       #[cfg(feature = "lang-html")]
       "html",
+      #[cfg(feature = "lang-ini")]
+      "ini",
       #[cfg(feature = "lang-java")]
       "java",
       #[cfg(feature = "lang-javascript")]
       "javascript",
+      #[cfg(feature = "lang-jsdoc")]
+      "jsdoc",
       #[cfg(feature = "lang-json")]
       "json",
+      #[cfg(feature = "lang-kotlin")]
+      "kotlin",
+      #[cfg(feature = "lang-lua")]
+      "lua",
+      #[cfg(feature = "lang-make")]
+      "make",
+      #[cfg(feature = "lang-nix")]
+      "nix",
+      #[cfg(feature = "lang-ocaml")]
+      "ocaml",
+      #[cfg(feature = "lang-ocaml")]
+      "mli",
+      #[cfg(feature = "lang-php")]
+      "php",
+      #[cfg(feature = "lang-powershell")]
+      "powershell",
       #[cfg(feature = "lang-python")]
       "python",
+      #[cfg(feature = "lang-r")]
+      "r",
+      #[cfg(feature = "lang-regex")]
+      "regex",
+      #[cfg(feature = "lang-ruby")]
+      "ruby",
       #[cfg(feature = "lang-rust")]
       "rust",
       #[cfg(feature = "lang-scala")]
       "scala",
+      #[cfg(feature = "lang-sql")]
+      "sql",
+      #[cfg(feature = "lang-swift")]
+      "swift",
       #[cfg(feature = "lang-toml")]
       "toml",
       #[cfg(feature = "lang-typescript")]
       "typescript",
       #[cfg(feature = "lang-typescript")]
       "tsx",
+      #[cfg(feature = "lang-xml")]
+      "xml",
       #[cfg(feature = "lang-yaml")]
       "yaml",
+      #[cfg(feature = "lang-zig")]
+      "zig",
     ];
     for lang in enabled {
       assert!(grammar(lang).is_some(), "{lang} queries did not compile");
     }
+  }
+
+  #[test]
+  #[cfg(feature = "lang-swift")]
+  fn a_spell_capture_does_not_silence_the_comment_in_front_of_it() {
+    // Swift's query says `(comment) @comment @spell`, and of two captures on
+    // one node the last one wins: with `@spell` left in, comments went plain.
+    let lines = highlight("swift", "// note\nfunc f() {}").unwrap();
+    assert_eq!(style_of(&lines, "// note").unwrap().fg, Some(Color::DarkGray));
+  }
+
+  #[test]
+  #[cfg(feature = "lang-zig")]
+  fn a_pattern_we_cannot_check_does_not_fire() {
+    // Zig's `(identifier) @type` is guarded by a `#lua-match?` on a leading
+    // capital. The guard means nothing to this engine, so the pattern is
+    // dropped instead — otherwise every identifier in the block is a type.
+    let lines = highlight("zig", "pub fn main() void { const x = other; }").unwrap();
+    assert_eq!(style_of(&lines, "void").unwrap().fg, Some(Color::Yellow));
+    // Nothing styled `other`, so it comes back inside a plain run rather than
+    // a span of its own: what matters is that no span calling it a type does.
+    assert!(
+      !lines
+        .iter()
+        .flatten()
+        .any(|s| s.content.contains("other") && s.style.fg == Some(Color::Yellow)),
+      "{lines:?}"
+    );
+  }
+
+  #[test]
+  #[cfg(feature = "lang-gleam")]
+  fn gleam_function_names_outlive_the_catch_all() {
+    // The grammar's query ends on `(identifier) @variable`, which would take
+    // back the `@function` it gave the name two dozen patterns earlier.
+    let lines = highlight("gleam", "pub fn add(a: Int) -> Int { a + 1 }").unwrap();
+    assert_eq!(style_of(&lines, "add").unwrap().fg, Some(Color::Blue));
+  }
+
+  #[test]
+  #[cfg(feature = "lang-sql")]
+  fn sql_numbers_are_not_strings() {
+    // Every literal is a string to the grammar's query until a `#match?` says
+    // otherwise, and the one it ships is a Lua pattern that never matches.
+    let lines = highlight("sql", "SELECT name FROM t WHERE id = 1;").unwrap();
+    assert_eq!(style_of(&lines, "1").unwrap().fg, Some(Color::Cyan));
   }
 
   #[test]

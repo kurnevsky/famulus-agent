@@ -344,10 +344,18 @@ cargo build --release --no-default-features --features lang-rust,lang-python
 cargo build --release --no-default-features
 ```
 
-`lang-bash`, `lang-c`, `lang-cpp`, `lang-css`, `lang-go`, `lang-haskell`,
-`lang-html`, `lang-java`, `lang-javascript`, `lang-json`, `lang-python`,
-`lang-rust`, `lang-scala`, `lang-toml`, `lang-typescript` (TypeScript and TSX),
-`lang-yaml`.
+`lang-bash`, `lang-c`, `lang-c-sharp`, `lang-cmake`, `lang-cpp`, `lang-css`,
+`lang-dart`, `lang-diff`, `lang-elixir`, `lang-erlang`, `lang-fortran`,
+`lang-gleam`, `lang-go`, `lang-haskell`, `lang-html`, `lang-ini`, `lang-java`,
+`lang-javascript`, `lang-jsdoc`, `lang-json`, `lang-kotlin`, `lang-lua`,
+`lang-make`, `lang-nix`, `lang-ocaml` (implementation and interface),
+`lang-php`, `lang-powershell`, `lang-python`, `lang-r`, `lang-regex`,
+`lang-ruby`, `lang-rust`, `lang-scala`, `lang-sql`, `lang-swift`, `lang-toml`,
+`lang-typescript` (TypeScript and TSX), `lang-xml`, `lang-yaml`, `lang-zig`.
+
+`lang-jsdoc` and `lang-regex` are grammars nobody writes a fence for:
+JavaScript injects them into its doc comments and its regex literals, so they
+only add colour to blocks that were already highlighted.
 
 ## Sessions
 
