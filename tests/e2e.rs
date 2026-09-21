@@ -615,8 +615,8 @@ impl Term {
     (rows, on)
   }
 
-  /// Walk the overlay's cursor onto the row that says `needle` and take it.
-  fn choose(&self, needle: &str) {
+  /// Walk the overlay's cursor onto the row that says `needle`.
+  fn point_at(&self, needle: &str) {
     for _ in 0..30 {
       let (rows, on) = self.overlay();
       let at = rows
@@ -624,13 +624,18 @@ impl Term {
         .position(|row| row.contains(needle))
         .unwrap_or_else(|| panic!("a row saying {needle:?}: {rows:?}"));
       if at == on {
-        self.type_in("Enter");
         return;
       }
       self.type_in(if at < on { "Up" } else { "Down" });
       std::thread::sleep(Duration::from_millis(60));
     }
     panic!("could not put the cursor on {needle:?}");
+  }
+
+  /// Walk the overlay's cursor onto the row that says `needle` and take it.
+  fn choose(&self, needle: &str) {
+    self.point_at(needle);
+    self.type_in("Enter");
   }
 
   /// Whether the terminal has been rung since anyone last looked at it. tmux
@@ -1524,6 +1529,77 @@ fn up_walks_back_through_the_prompts_and_a_resumed_session_brings_its_own() {
   term.type_in("Up");
   term.settle();
   assert_eq!(term.typed(), "pear", "the resumed session's last prompt");
+}
+
+/// A session file is the only copy of the conversation in it, so the picker
+/// asks before it removes one — and the session on screen, which is still
+/// writing to its file, is not one it will remove at all.
+#[test]
+fn the_picker_deletes_a_session_once_it_has_asked_about_it() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![Turn::Echo]);
+  let term = Term::start("delete", &provider, &[]);
+  term.submit("apple");
+  term.wait_for("Answer to apple.");
+  // A second session, so the one being deleted is not the one on screen.
+  term.submit("/new");
+  term.wait_for("New session.");
+  term.submit("pear");
+  term.wait_for("Answer to pear.");
+  assert_eq!(term.session_files().len(), 2);
+
+  // `DC` is what tmux calls the Delete key.
+  term.submit("/resume");
+  term.wait_for("Esc cancel");
+  term.point_at("pear");
+  term.type_in("DC");
+  term.wait_for("delete? Del to confirm");
+  term.type_in("DC");
+  term.settle();
+  let (rows, _) = term.overlay();
+  assert!(
+    rows.iter().any(|row| row.contains("pear")),
+    "the session on screen stays: {rows:?}"
+  );
+  assert_eq!(term.session_files().len(), 2, "and so does its file");
+
+  // Anything but a second Delete answers no, and only puts the question away.
+  term.point_at("apple");
+  term.type_in("DC");
+  term.wait_for("delete? Del to confirm");
+  term.type_in("Up");
+  term.settle();
+  let screen = term.screen();
+  assert!(
+    !screen.contains("delete? Del to confirm"),
+    "the question is answered:\n{screen}"
+  );
+  assert_eq!(term.session_files().len(), 2, "and nothing is deleted");
+
+  term.point_at("apple");
+  term.type_in("DC");
+  term.wait_for("delete? Del to confirm");
+  term.type_in("DC");
+  term.settle();
+  let (rows, _) = term.overlay();
+  assert!(
+    !rows.iter().any(|row| row.contains("apple")),
+    "the row goes with the file: {rows:?}"
+  );
+  let files = term.session_files();
+  assert_eq!(files.len(), 1);
+  assert!(files[0].1.contains("pear"), "the one that was kept: {files:?}");
+
+  // What the picker did, and would not do, is said behind it once it is out
+  // of the way.
+  term.type_in("Escape");
+  let screen = term.wait_for("Deleted session apple.");
+  assert!(
+    screen.contains("start another with /new"),
+    "why the session on screen was kept:\n{screen}"
+  );
 }
 
 /// Which row of an overlay says `needle`.

@@ -166,6 +166,17 @@ impl Store {
     self.list().into_iter().next()
   }
 
+  /// Delete a session file, for good.
+  ///
+  /// Only a file of this store's: the picker hands back a path it read from
+  /// the directory, and anything else is not this store's to remove.
+  pub fn delete(&self, path: &Path) -> Result<()> {
+    if path.parent() != Some(self.dir.as_path()) {
+      bail!("{} is not a session of {}", path.display(), self.dir.display());
+    }
+    std::fs::remove_file(path).with_context(|| format!("cannot delete {}", path.display()))
+  }
+
   /// Resolve `--session`: a file path, or a session id (or unique id prefix).
   pub fn find(&self, needle: &str) -> Option<PathBuf> {
     let as_path = Path::new(needle);
@@ -808,6 +819,31 @@ mod tests {
     let mut loaded = loaded;
     loaded.append(vec![Message::assistant("more")]).unwrap();
     assert_eq!(Session::load(&path).unwrap().history.len(), 5);
+    std::fs::remove_dir_all(&store.dir).unwrap();
+  }
+
+  #[test]
+  fn deleting_takes_a_session_off_the_listing_and_only_this_store_s_files() {
+    let store = temp_store("delete");
+    let mut session = Session::new(Some(&store), Path::new("/work"), "mock");
+    session.append(vec![Message::user("first")]).unwrap();
+    let path = session.path().unwrap().to_path_buf();
+    let mut other = Session::new(Some(&store), Path::new("/work"), "mock");
+    other.append(vec![Message::user("second")]).unwrap();
+    assert_eq!(store.list().len(), 2);
+
+    // A file of somebody else's is not this store's to remove.
+    let elsewhere = std::env::temp_dir().join(format!("fa-not-a-session-{}.jsonl", std::process::id()));
+    std::fs::write(&elsewhere, "{}\n").unwrap();
+    assert!(store.delete(&elsewhere).is_err());
+    assert!(elsewhere.is_file());
+    std::fs::remove_file(&elsewhere).unwrap();
+
+    store.delete(&path).unwrap();
+    assert!(!path.exists());
+    let left = store.list();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].id, other.id);
     std::fs::remove_dir_all(&store.dir).unwrap();
   }
 

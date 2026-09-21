@@ -285,6 +285,12 @@ of them is answered however many were in flight, since a call left hanging is
 a transcript no provider will take back. Because entries name their parent, one file holds every
 branch the conversation took, not only the one it is on.
 
+A session is deleted from the picker: `Delete` on a row asks, and a second
+`Delete` removes the file. Since that is the only copy of the conversation, it
+is asked about first, and any other key answers no. The session on screen is
+not one of them — it is still writing to its file — so deleting it means
+starting another with `/new` first.
+
 - `src/session.rs` – store, session file, listing, and replay. Tool results
   travel in a message of their own, after the one that asked for them, so
   rebuilding the transcript pairs each with the call it answers rather than
@@ -634,7 +640,7 @@ what it spent.
 | `/compact` | Summarize older history now |
 | `/continue` | Run the model again with no new message |
 | `/new` | Start a new session |
-| `/resume` | Pick a saved session to resume |
+| `/resume` | Pick a saved session to resume — `Delete` removes the selected one, a second `Delete` confirms |
 | `/tree` | Move to another point in this session, on any branch |
 | `/fork` | Branch a new session from an earlier prompt |
 | `/name <name>` | Name the current session |

@@ -241,7 +241,13 @@ struct Overlay {
 
 enum OverlayList {
   /// `/resume`: every saved session, most recent first.
-  Sessions(Vec<SessionInfo>),
+  Sessions {
+    sessions: Vec<SessionInfo>,
+    /// `Delete` has been pressed on the selected row and the deletion is
+    /// waiting to be confirmed. A session file is gone for good, so it is
+    /// asked about first.
+    confirming: bool,
+  },
   /// `/tree`: every point this session can go back to, oldest first.
   Tree(Vec<Point>),
   /// `/fork`: the prompts, to start a new session from one of them.
@@ -279,13 +285,13 @@ impl Overlay {
   fn points(&self) -> &[Point] {
     match &self.list {
       OverlayList::Tree(points) | OverlayList::Fork(points) => points,
-      OverlayList::Sessions(_) | OverlayList::Question { .. } => &[],
+      OverlayList::Sessions { .. } | OverlayList::Question { .. } => &[],
     }
   }
 
   fn len(&self) -> usize {
     match &self.list {
-      OverlayList::Sessions(sessions) => sessions.len(),
+      OverlayList::Sessions { sessions, .. } => sessions.len(),
       OverlayList::Question { .. } => 0,
       _ => self.points().len(),
     }
@@ -293,7 +299,10 @@ impl Overlay {
 
   fn title(&self) -> &'static str {
     match &self.list {
-      OverlayList::Sessions(_) => " Resume session — ↑↓ select · Enter resume · Esc cancel ",
+      // A deletion waiting to be confirmed says so where the keys are said,
+      // since the keys it is waiting for are not the usual ones.
+      OverlayList::Sessions { confirming: true, .. } => " Delete session? — Del confirm · Esc cancel ",
+      OverlayList::Sessions { .. } => " Resume session — ↑↓ select · Enter resume · Del delete · Esc cancel ",
       OverlayList::Tree(_) => " Tree — ↑↓ PgUp/PgDn select · Enter go there · Esc cancel ",
       OverlayList::Fork(_) => " Fork — ↑↓ PgUp/PgDn select · Enter fork · Esc cancel ",
       // The dialog says which keys do what along its own bottom, where the
@@ -1060,6 +1069,9 @@ impl App {
 
   fn handle_overlay_key(&mut self, code: KeyCode, ctrl: bool) {
     let len = self.overlay.as_ref().map_or(0, Overlay::len);
+    if !ctrl && self.handle_delete_key(code) {
+      return;
+    }
     match code {
       KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
       KeyCode::Char('c') if ctrl => self.quit = true,
@@ -1099,7 +1111,7 @@ impl App {
           return;
         };
         match list {
-          OverlayList::Sessions(sessions) => {
+          OverlayList::Sessions { sessions, .. } => {
             if let Some(info) = sessions.get(selected) {
               self.load_session(&info.path.clone());
             }
@@ -1110,6 +1122,70 @@ impl App {
         }
       }
       _ => {}
+    }
+  }
+
+  /// The keys that delete a session from the picker, answering whether this
+  /// was one of them.
+  ///
+  /// `Delete` asks, and a second `Delete` goes through with it. Anything
+  /// else is not an answer to the question: it puts the question away and
+  /// then means what it usually means — apart from `Esc`, which was the
+  /// answer no and leaves the picker open.
+  fn handle_delete_key(&mut self, code: KeyCode) -> bool {
+    let Some(overlay) = &mut self.overlay else {
+      return false;
+    };
+    let OverlayList::Sessions { confirming, .. } = &mut overlay.list else {
+      return false;
+    };
+    match (code, *confirming) {
+      (KeyCode::Delete, false) => *confirming = true,
+      (KeyCode::Delete, true) => self.delete_selected(),
+      (_, true) => {
+        *confirming = false;
+        return code == KeyCode::Esc;
+      }
+      _ => return false,
+    }
+    true
+  }
+
+  /// Delete the session the picker is on, and take its row out of the list.
+  fn delete_selected(&mut self) {
+    let Some(overlay) = &mut self.overlay else {
+      return;
+    };
+    let OverlayList::Sessions { sessions, confirming } = &mut overlay.list else {
+      return;
+    };
+    *confirming = false;
+    let Some(info) = sessions.get(overlay.selected) else {
+      return;
+    };
+    let (path, title) = (info.path.clone(), info.title().to_string());
+    // The conversation on screen goes on writing to its file, so deleting it
+    // from under itself would only leave a shorter one behind.
+    if self.session.path() == Some(path.as_path()) {
+      self.entries.push(Entry::Info(
+        "That is this session — start another with /new before deleting it.".into(),
+      ));
+      return;
+    }
+    let Some(store) = &self.store else { return };
+    if let Err(err) = store.delete(&path) {
+      self
+        .entries
+        .push(Entry::Error(format!("Could not delete session: {err:#}")));
+      return;
+    }
+    sessions.remove(overlay.selected);
+    overlay.selected = overlay.selected.min(sessions.len().saturating_sub(1));
+    let emptied = sessions.is_empty();
+    self.entries.push(Entry::Info(format!("Deleted session {title}.")));
+    // Nothing left to pick from is nothing to keep a picker open for.
+    if emptied {
+      self.overlay = None;
     }
   }
 
@@ -1475,7 +1551,10 @@ impl App {
       return;
     }
     self.overlay = Some(Overlay {
-      list: OverlayList::Sessions(sessions),
+      list: OverlayList::Sessions {
+        sessions,
+        confirming: false,
+      },
       selected: 0,
     });
   }
@@ -2144,15 +2223,21 @@ impl App {
     // Each row is a title and a dim note about it, the title clipped so the
     // note always fits.
     let rows: Vec<(String, String)> = match &overlay.list {
-      OverlayList::Sessions(sessions) => sessions
+      OverlayList::Sessions { sessions, confirming } => sessions
         .iter()
-        .map(|s| {
-          let note = format!(
-            "{}  {} msgs  {}",
-            shorten_home(Path::new(&s.cwd)),
-            s.message_count,
-            s.age()
-          );
+        .enumerate()
+        .map(|(i, s)| {
+          // The row being asked about says what it is being asked, where it
+          // otherwise says what it is.
+          let note = match *confirming && i == overlay.selected {
+            true => "delete? Del to confirm".to_string(),
+            false => format!(
+              "{}  {} msgs  {}",
+              shorten_home(Path::new(&s.cwd)),
+              s.message_count,
+              s.age()
+            ),
+          };
           (s.title().to_string(), note)
         })
         .collect(),
