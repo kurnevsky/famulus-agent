@@ -645,12 +645,27 @@ impl Weigh {
   /// Take the provider's word for what the answered request held. One that
   /// reports nothing leaves the last figure standing.
   fn answered(&mut self, usage: &Usage, sent: usize) {
-    let reported = usage.input_tokens + usage.output_tokens;
+    let reported = weight(usage);
     if reported > 0 {
       self.reported = reported;
       self.counted = sent + 1;
     }
   }
+}
+
+/// What a provider says the request it answered came to, prompt and answer
+/// together.
+///
+/// `input_tokens` is only the part of the prompt a provider charged as new.
+/// Anthropic counts what it read back from its cache, and what it wrote
+/// there, under fields of their own — so on a conversation that is mostly
+/// cached, which is what a long one becomes, the prompt and the answer added
+/// up come to a small fraction of what was actually sent. `total_tokens` is
+/// the figure the provider reports, or the one rig adds up from the parts for
+/// the providers that report only parts, and it is the whole request wherever
+/// there is one. The sum stands in where there is not.
+fn weight(usage: &Usage) -> u64 {
+  usage.total_tokens.max(usage.input_tokens + usage.output_tokens)
 }
 
 /// Why a run stopped short of an answer.
@@ -1713,6 +1728,41 @@ mod tests {
     // than reporting the context as empty.
     weigh.answered(&Usage::new(), 9);
     assert_eq!(weigh.request(&chat), 520 + 200 + 100);
+  }
+
+  /// A cached prompt is still a prompt: what the provider read back from its
+  /// cache was in the request, and a context that leaves it out is the size
+  /// of a long conversation short by nearly all of it.
+  #[test]
+  fn the_context_counts_what_was_cached_as_well_as_what_was_charged() {
+    let cached = Usage {
+      input_tokens: 12,
+      output_tokens: 40,
+      cached_input_tokens: 30_000,
+      cache_creation_input_tokens: 2_000,
+      total_tokens: 32_052,
+      ..Usage::new()
+    };
+    assert_eq!(weight(&cached), 32_052);
+
+    // A provider that reports no total is taken at the sum of its parts.
+    let plain = Usage {
+      input_tokens: 500,
+      output_tokens: 20,
+      ..Usage::new()
+    };
+    assert_eq!(weight(&plain), 520);
+
+    // And one whose total says less than the prompt and the answer it also
+    // reported is believed about neither: the larger of the two is the one
+    // that leaves nothing out.
+    let short = Usage {
+      total_tokens: 100,
+      ..plain
+    };
+    assert_eq!(weight(&short), 520);
+
+    assert_eq!(weight(&Usage::new()), 0);
   }
 
   #[test]

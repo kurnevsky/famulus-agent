@@ -1818,6 +1818,12 @@ fn a_compacted_conversation_reaches_the_model_as_its_summary() {
     .count();
   assert_eq!(summarizing, 1, "a whole turn is summarized once");
   assert!(!screen.contains("Turn Context"), "with nothing about a split turn");
+  // The room a compaction made is the thing to see, so the footer says how
+  // much there is rather than going blank until the next call comes back.
+  assert!(
+    screen.contains("ctx 0%"),
+    "the context is estimated until a call has weighed it:\n{screen}"
+  );
 
   // What the model is given next is the summary in place of what it stands
   // for — the point of compacting at all.
@@ -1996,12 +2002,16 @@ fn a_context_window_with_little_left_in_it_says_so_in_colour() {
   );
   let screen = term.screen();
   assert!(
-    !screen.contains("ctx "),
-    "nothing to say before the first answer: {screen}"
+    screen.contains("ctx 0%"),
+    "an empty conversation weighs nothing, and the footer says so rather than \
+     going blank: {screen}"
   );
 
   term.submit(&format!("remember the kumquat {}", "x".repeat(600)));
-  term.wait_for("ctx ");
+  // What the answer cost is written at the same time as what the request
+  // came to, so waiting for the one waits for the other — and the figure
+  // under test is the provider's rather than the estimate standing in.
+  term.wait_for(&format!("{SPENT}↓"));
   let screen = term.coloured();
   let footer = screen.lines().find(|line| line.contains("ctx ")).expect("a footer");
   assert!(
@@ -2616,17 +2626,81 @@ fn a_reopened_session_asks_for_byte_for_byte_what_it_would_have_asked_for() {
     asked
   };
 
+  same_request(&asked(false), &asked(true));
+}
+
+/// The same, for a session a compaction has been through.
+///
+/// A checkpoint is the one thing on disk that is not a message: the turns
+/// above it are still in the file, and what the model is given in their place
+/// has to be built back out of the checkpoint alone. Getting that wrong is
+/// quiet — the screen redraws correctly either way — and costs either the
+/// whole summarized history read again, or the summary and the history both.
+#[test]
+fn a_reopened_compacted_session_asks_for_byte_for_byte_what_it_would_have_asked_for() {
+  if !have_tmux() {
+    return;
+  }
+  // A tool call in the first turn, which is the turn the compaction takes
+  // away: a walk that does not stop at the checkpoint puts it back.
+  let script = vec![
+    Turn::Call {
+      say: "",
+      tool: "bash",
+      args: serde_json::json!({ "command": "echo kumquat" }),
+    },
+    Turn::Echo,
+  ];
+
+  let asked = |reopened: bool| -> String {
+    let provider = Provider::start(script.clone());
+    let term = Term::start("reopened-compacted", &provider, &[]);
+    term.submit("remember the kumquat");
+    term.wait_for("Answer to remember the kumquat.");
+    term.submit("and the pomelo");
+    term.wait_for("Answer to and the pomelo.");
+    term.submit("/compact");
+    term.wait_for("into a summary");
+    term.settle();
+
+    let so_far = provider.bodies().len();
+    let term = match reopened {
+      true => {
+        let term = term.reopen(&provider, &["-c"]);
+        term.wait_for("Resumed session");
+        term
+      }
+      false => term,
+    };
+    term.submit("carry on");
+    let asked = wait_bodies(&provider, so_far + 1).last().expect("a request").clone();
+    term.settle();
+    asked
+  };
+
   let unbroken = asked(false);
   let reopened = asked(true);
+  // Both ask for the summary in place of what it stands for — a comparison
+  // of two requests that were each wrong the same way would pass otherwise.
+  assert!(
+    reopened.contains("Fruit was discussed.") && !reopened.contains("echo kumquat"),
+    "the checkpoint stands where the turns it summarized were: {reopened}"
+  );
+  same_request(&unbroken, &reopened);
+}
+
+/// Assert two requests are the same request.
+///
+/// Only the window around the parting is worth printing: the whole of either
+/// is the system prompt and every tool schema again. Where the two part
+/// company is a byte, which need not be where a character starts.
+fn same_request(unbroken: &str, reopened: &str) {
   let common = unbroken
     .as_bytes()
     .iter()
     .zip(reopened.as_bytes())
     .take_while(|(one, other)| one == other)
     .count();
-  // Only the window around the parting is worth printing: the whole of either
-  // request is the system prompt and every tool schema again. Where the two
-  // part company is a byte, which need not be where a character starts.
   let window = |text: &str| {
     let boundary = |mut at: usize| {
       while !text.is_char_boundary(at) {
@@ -2640,8 +2714,8 @@ fn a_reopened_session_asks_for_byte_for_byte_what_it_would_have_asked_for() {
   assert!(
     unbroken == reopened,
     "the reopened session asks for something else from byte {common}:\n  unbroken: {}\n  reopened: {}",
-    window(&unbroken),
-    window(&reopened),
+    window(unbroken),
+    window(reopened),
   );
 }
 

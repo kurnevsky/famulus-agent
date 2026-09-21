@@ -26,7 +26,7 @@ use tokio::task::JoinHandle;
 use crate::agent::{self, AgentEvent, Agents, ModelInfo, start_compaction, start_run};
 use crate::ask::{self, Dialog};
 use crate::attach::{self, Prompt, Token};
-use crate::compaction::{DEFAULT_CONTEXT_WINDOW, SUMMARY_PREFIX, SUMMARY_SUFFIX};
+use crate::compaction::{DEFAULT_CONTEXT_WINDOW, SUMMARY_PREFIX, SUMMARY_SUFFIX, estimate_tokens};
 use crate::session::{Node, NodeKind, Outcome, Session, SessionInfo, Store};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
@@ -584,8 +584,9 @@ pub struct App {
   markdown: HashMap<(u64, u16, bool), Vec<Line<'static>>>,
   usage: Usage,
   /// Size of the last completion request, for the footer. `None` until a
-  /// call has come back: after a compaction the figure is hidden rather than
-  /// left saying what the context no longer holds.
+  /// call has come back, and again after a compaction: what that call was
+  /// weighed at is about a conversation that no longer exists, and what the
+  /// footer says instead is an estimate of the one that does.
   context_tokens: Option<u64>,
   tick: usize,
   quit: bool,
@@ -2575,6 +2576,27 @@ impl App {
     f.render_widget(Paragraph::new(lines), inner);
   }
 
+  /// What the context comes to.
+  ///
+  /// The figure the last call was weighed at wherever there is one. Where
+  /// there is not — before the first answer, and after a compaction, when the
+  /// last figure is about a conversation that has been replaced — the same
+  /// chars/4 estimate the cut point is chosen with, which is better than the
+  /// footer going blank at the moment the room made is the thing to see.
+  ///
+  /// Nothing here is marked as a guess, because a figure that is nothing but
+  /// the provider's own count is the exception rather than the rule: it is
+  /// one turn behind whatever has happened since, it is a chars/4 estimate
+  /// wherever the estimate ran higher, and it is an estimate throughout for a
+  /// provider that reports no usage at all. A mark that honest would be on
+  /// almost every figure, which is the same as being on none of them.
+  fn context(&self) -> u64 {
+    match self.context_tokens {
+      Some(tokens) => tokens,
+      None => estimate_tokens(&self.session.history),
+    }
+  }
+
   fn draw_footer(&self, f: &mut Frame, footer_area: Rect) {
     let cwd = shorten_home(&self.cwd);
     let mut left = vec![
@@ -2599,9 +2621,8 @@ impl App {
       left.push(Span::raw("  "));
       left.push(Span::raw(format!("↑ {behind} lines — pgdn to follow")).dim());
     }
-    let context = self
-      .context_tokens
-      .and_then(|tokens| (tokens * 100).checked_div(self.cfg.compaction.context_window))
+    let context = (self.context() * 100)
+      .checked_div(self.cfg.compaction.context_window)
       .map(|pct| (format!("ctx {pct}%  "), pct));
     let tokens = format!("{}↑ {}↓", self.usage.input_tokens, self.usage.output_tokens);
     let width = context.as_ref().map_or(0, |(text, _)| text.chars().count()) + tokens.chars().count();

@@ -144,7 +144,14 @@ pub fn should_compact(context_tokens: u64, settings: &Settings) -> bool {
 /// Conservative chars/4 estimate, used when the provider reports no usage and
 /// for choosing the cut point.
 pub fn estimate_tokens(messages: &[Message]) -> u64 {
-  messages.iter().map(|m| message_chars(m) as u64 / 4).sum()
+  messages.iter().map(message_tokens).sum()
+}
+
+/// One message at chars/4, rounded up. Rounded down, anything shorter than
+/// four characters is free, and a tail of small messages — a long run of
+/// little calls — is walked further back than the budget it is held to.
+fn message_tokens(message: &Message) -> u64 {
+  (message_chars(message) as u64).div_ceil(4)
 }
 
 fn message_chars(message: &Message) -> usize {
@@ -240,7 +247,7 @@ pub fn cut_point(history: &[Message], keep_recent_tokens: u64) -> Option<usize> 
   let mut accumulated = 0u64;
   let mut exceeded_at = None;
   for i in (first..history.len()).rev() {
-    accumulated += message_chars(&history[i]) as u64 / 4;
+    accumulated += message_tokens(&history[i]);
     if accumulated >= keep_recent_tokens {
       exceeded_at = Some(i);
       break;
@@ -591,7 +598,11 @@ mod tests {
       assistant("d"),
     ];
     assert_eq!(previous_summary(&history[0]), Some("old summary"));
-    assert_eq!(cut_point(&history, 1), Some(3));
+    // A budget the last message fills on its own: the tail is that message.
+    assert_eq!(cut_point(&history, 1), Some(4));
+    // And one nothing here comes near keeps the last turn. Either way the
+    // cut is past the summary, which is not summarized a second time.
+    assert_eq!(cut_point(&history, 1_000), Some(3));
   }
 
   #[test]
