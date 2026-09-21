@@ -25,6 +25,7 @@ use tokio::task::JoinHandle;
 
 use crate::agent::{AgentEvent, Agents, start_compaction, start_run};
 use crate::ask::{self, Dialog};
+use crate::attach::{self, Prompt, Token};
 use crate::compaction::{SUMMARY_PREFIX, SUMMARY_SUFFIX, Settings};
 use crate::session::{Node, NodeKind, Outcome, Session, SessionInfo, Store};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
@@ -178,6 +179,9 @@ pub struct Options {
   pub mcp: (usize, usize),
   /// Whether a question the model asks rings the terminal.
   pub bell: bool,
+  /// Whether the model can be sent images, which is what decides if an
+  /// `@image` in the input box is attached or refused.
+  pub vision: bool,
 }
 
 /// Slash commands offered by the `/` popup: name, description, takes an argument.
@@ -194,17 +198,38 @@ const COMMANDS: &[(&str, &str, bool)] = &[
 ];
 /// Rows shown in the command popup.
 const COMPLETION_ROWS: usize = 5;
+/// Paths gathered for the `@` popup before it is cut to what fits. More than
+/// the rows shown, so scrolling the list has somewhere to go, and few enough
+/// that a directory of a thousand images is not measured a keystroke.
+const PATH_ROWS: usize = 20;
 
-/// One popup row: index into `COMMANDS` plus the matched character positions.
-struct Match {
-  index: usize,
-  highlights: Vec<u32>,
+/// One popup row, with the characters the query matched in it picked out.
+enum Match {
+  /// Index into `COMMANDS`.
+  Command { index: usize, highlights: Vec<u32> },
+  /// A path an `@token` is reaching for: what the token becomes when it is
+  /// taken, how the row reads, and what the right-hand column says about it.
+  Path {
+    /// The whole token, `@` and quotes and all.
+    insert: String,
+    /// The part of it the row shows and the query matched against.
+    name: String,
+    highlights: Vec<u32>,
+    /// Dimensions for an image, and nothing for a directory.
+    meta: String,
+    /// A directory, which is carried on into rather than attached.
+    dir: bool,
+  },
 }
 
-/// The `/` command popup, best match first.
+/// The popup under the input box, best match first: `/` commands, or the
+/// files an `@` is reaching for.
 struct Completion {
   items: Vec<Match>,
   selected: usize,
+  /// The byte range accepting a row replaces. `None` for the command list,
+  /// which replaces the whole line.
+  replacing: Option<(usize, usize)>,
 }
 
 /// A list drawn over the transcript. Moving through one and dismissing it are
@@ -299,7 +324,13 @@ struct Writing {
 }
 
 enum Entry {
-  User(String),
+  User {
+    text: String,
+    /// Images the prompt attached, drawn under it as half-blocks — the same
+    /// bytes the model was given, kept as bytes because what they are drawn
+    /// as depends on how wide the transcript is when they are drawn.
+    images: Vec<Vec<u8>>,
+  },
   Assistant(String),
   Reasoning(String),
   ToolCall {
@@ -450,6 +481,11 @@ pub struct App {
   last_escape: Option<Instant>,
   entries: Vec<Entry>,
   input: TextArea<'static>,
+  /// The `@path` tokens standing in the input box, resolved as they are
+  /// typed so the box can say what it found before Enter is pressed.
+  attachments: Vec<Token>,
+  /// Whether the model takes images at all.
+  vision: bool,
   /// What `Up` and `Down` walk back through from the input box.
   prompts: Prompts,
   tx: mpsc::UnboundedSender<AgentEvent>,
@@ -518,12 +554,15 @@ impl App {
       notes,
       mcp,
       bell,
+      vision,
     } = options;
     let mut input = TextArea::default();
     input.set_cursor_line_style(Style::default());
     // Not a list of commands: `/` opens one that is complete and filters
     // itself, where three names picked out here only ever go stale.
-    input.set_placeholder_text("Ask anything. Enter sends, Alt+Enter a newline, / commands, Ctrl+C quits.");
+    // Kept inside eighty columns, which is the narrowest terminal worth
+    // drawing for: the hint is no use to anyone if its end is cut off.
+    input.set_placeholder_text("Enter sends, Alt+Enter a newline, / commands, @ images, Ctrl+C quits.");
     // The terminal's own grey rather than a dimmed foreground, which some
     // terminals ignore and others render as the text colour proper.
     input.set_placeholder_style(Style::default().fg(Color::DarkGray));
@@ -547,6 +586,8 @@ impl App {
       last_escape: None,
       entries: Vec::new(),
       input,
+      attachments: Vec::new(),
+      vision,
       prompts: Prompts::default(),
       tx,
       run: None,
@@ -715,12 +756,12 @@ impl App {
       (KeyCode::Enter, _) if is_newline(&key) => {
         self.prompts.stop();
         self.input.insert_newline();
-        self.refresh_completion();
+        self.input_changed();
       }
       (KeyCode::Char('j'), true) => {
         self.prompts.stop();
         self.input.insert_newline();
-        self.refresh_completion();
+        self.input_changed();
       }
       (KeyCode::Enter, _) => self.submit(),
       _ => {
@@ -730,9 +771,16 @@ impl App {
           // and Down is no longer a way back out of it.
           self.prompts.stop();
         }
-        self.refresh_completion();
+        self.input_changed();
       }
     }
+  }
+
+  /// The input text has changed: resolve its `@tokens` again, and then the
+  /// popup, which is chosen by the token the cursor is in.
+  fn input_changed(&mut self) {
+    self.refresh_attachments();
+    self.refresh_completion();
   }
 
   /// A bracketed paste: text the user never typed, so its newlines are text
@@ -754,9 +802,18 @@ impl App {
       return;
     }
     self.prompts.stop();
+    // Dropping an image on the terminal pastes its path, which is the
+    // gesture people reach for first. Written down as a token, it attaches
+    // rather than sitting there as a path nothing reads.
+    let text = self.as_token(&text).unwrap_or(text);
     self.input.insert_str(&text);
     self.completion_dismissed = false;
-    self.refresh_completion();
+    self.input_changed();
+  }
+
+  /// A pasted path to an image, as the token that attaches it.
+  fn as_token(&self, text: &str) -> Option<String> {
+    as_token(text, &self.cwd)
   }
 
   /// Keys consumed by the `/` popup. Returns false to let the key fall
@@ -775,18 +832,47 @@ impl App {
         let Some(c) = self.completion.take() else {
           return false;
         };
-        let Some(index) = c.items.get(c.selected).map(|m| m.index) else {
+        let Some(item) = c.items.get(c.selected) else {
           return false;
         };
-        let (name, _, takes_arg) = COMMANDS[index];
-        self.set_input(&format!("/{name}{}", if takes_arg { " " } else { "" }));
-        // The completed command is exact; keep the popup closed until
-        // the user edits the text again.
-        self.completion_dismissed = true;
+        match item {
+          Match::Command { index, .. } => {
+            let (name, _, takes_arg) = COMMANDS[*index];
+            self.set_input(&format!("/{name}{}", if takes_arg { " " } else { "" }));
+            // The completed command is exact; keep the popup closed until
+            // the user edits the text again.
+            self.completion_dismissed = true;
+          }
+          Match::Path { insert, dir, .. } => {
+            let Some((from, to)) = c.replacing else {
+              return false;
+            };
+            // A directory is a step on the way rather than an answer, so the
+            // popup stays up and lists what is inside it.
+            self.completion_dismissed = !dir;
+            self.replace_token(from, to, insert.clone());
+          }
+        }
       }
       _ => return false,
     }
     true
+  }
+
+  /// Put `insert` in place of the bytes `from..to` of the input, and leave
+  /// the cursor just after it.
+  fn replace_token(&mut self, from: usize, to: usize, insert: String) {
+    let text = self.input.lines().join("\n");
+    let (head, tail) = (&text[..from], &text[to.min(text.len())..]);
+    let cursor = head.len() + insert.len();
+    let replaced = format!("{head}{insert}{tail}");
+    self.set_input(&replaced);
+    let before = &replaced[..cursor];
+    let row = before.matches('\n').count();
+    let col = before.rsplit('\n').next().unwrap_or("").chars().count();
+    self.input.move_cursor(CursorMove::Jump(row as u16, col as u16));
+    self.refresh_attachments();
+    self.refresh_completion();
   }
 
   fn move_completion(&mut self, delta: isize) {
@@ -796,20 +882,34 @@ impl App {
     }
   }
 
-  /// Show the command popup while the input is a single `/word` prefix.
+  /// Show the command popup while the input is a single `/word` prefix, and
+  /// the file popup while an `@token` is being typed.
   fn refresh_completion(&mut self) {
     let lines = self.input.lines();
-    let query = match lines {
-      [line] if line.starts_with('/') && !line.contains(char::is_whitespace) => &line[1..],
-      _ => {
-        self.completion = None;
-        return;
-      }
+    let commands = match lines {
+      [line] if line.starts_with('/') && !line.contains(char::is_whitespace) => Some(line[1..].to_string()),
+      _ => None,
     };
     if self.completion_dismissed {
+      if commands.is_none() && self.completing_token().is_none() {
+        // Whatever was dismissed is no longer being typed, so the next one
+        // starts fresh.
+        self.completion_dismissed = false;
+      }
+      self.completion = None;
       return;
     }
-    let items = filter_commands(&mut self.matcher, query);
+    let (items, replacing) = match commands {
+      Some(query) => (filter_commands(&mut self.matcher, &query), None),
+      None => match self.completing_token() {
+        Some(range) => {
+          let text = self.input.lines().join("\n");
+          let items = self.filter_paths(&text[range.0..range.1]);
+          (items, Some(range))
+        }
+        None => (Vec::new(), None),
+      },
+    };
     if items.is_empty() {
       self.completion = None;
       return;
@@ -817,10 +917,122 @@ impl App {
     let selected = self
       .completion
       .as_ref()
-      .and_then(|c| c.items.get(c.selected).map(|m| m.index))
-      .and_then(|prev| items.iter().position(|m| m.index == prev))
+      .and_then(|c| c.items.get(c.selected).map(key))
+      .and_then(|prev| items.iter().position(|m| key(m) == prev))
       .unwrap_or(0);
-    self.completion = Some(Completion { items, selected });
+    self.completion = Some(Completion {
+      items,
+      selected,
+      replacing,
+    });
+  }
+
+  /// The `@token` the cursor is at the end of, which is the one being typed.
+  /// Only that one: an `@` earlier in the sentence is settled.
+  ///
+  /// A token that already names an image is settled too, popup closed — so
+  /// `Enter` on a finished token sends the prompt rather than being taken by
+  /// a list offering the file that is already written there.
+  fn completing_token(&self) -> Option<(usize, usize)> {
+    let at = self.cursor_offset();
+    self
+      .attachments
+      .iter()
+      .find(|token| token.range.1 == at && !token.is_image())
+      .map(|token| token.range)
+  }
+
+  /// Where the cursor is, as a byte offset into the input.
+  fn cursor_offset(&self) -> usize {
+    let ratatui_textarea::DataCursor(row, col) = self.input.cursor();
+    let lines = self.input.lines();
+    let before: usize = lines.iter().take(row).map(|line| line.len() + 1).sum();
+    let line = lines.get(row).map_or("", |l| l.as_str());
+    before + line.char_indices().nth(col).map_or(line.len(), |(i, _)| i)
+  }
+
+  /// The paths an `@token` could be reaching for: what is in the directory
+  /// it names, narrowed to images and the directories on the way to them.
+  fn filter_paths(&mut self, token: &str) -> Vec<Match> {
+    // The token as a path, with the sigil and any quoting taken off.
+    let typed = token.trim_start_matches('@').trim_matches('"');
+    // Everything up to the last separator names the directory to look in;
+    // what is left is what the name has to match.
+    let (dir, prefix) = match typed.rfind('/') {
+      Some(cut) => (&typed[..=cut], &typed[cut + 1..]),
+      None => ("", typed),
+    };
+    let base = match dir.is_empty() {
+      true => self.cwd.clone(),
+      false => crate::tools::resolve(&self.cwd, dir),
+    };
+    let Ok(entries) = std::fs::read_dir(&base) else {
+      return Vec::new();
+    };
+    let mut candidates: Vec<(u32, String, bool)> = Vec::new();
+    let pattern = Pattern::parse(prefix, CaseMatching::Ignore, Normalization::Smart);
+    let mut buf = Vec::new();
+    for entry in entries.flatten() {
+      let name = entry.file_name().to_string_lossy().into_owned();
+      // Hidden files only when they are being asked for by name.
+      if name.starts_with('.') && !prefix.starts_with('.') {
+        continue;
+      }
+      let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+      if !is_dir && !attach::looks_like_image(&entry.path()) {
+        continue;
+      }
+      let Some(score) = pattern.score(Utf32Str::new(&name, &mut buf), &mut self.matcher) else {
+        continue;
+      };
+      candidates.push((score, name, is_dir));
+    }
+    // Best match first, directories after the images they sit beside at the
+    // same score, and then alphabetically so the list does not jitter.
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.2.cmp(&b.2)).then(a.1.cmp(&b.1)));
+    candidates.truncate(PATH_ROWS);
+    candidates
+      .into_iter()
+      .map(|(_, name, is_dir)| {
+        let mut buf = Vec::new();
+        let mut highlights = Vec::new();
+        pattern.indices(Utf32Str::new(&name, &mut buf), &mut self.matcher, &mut highlights);
+        highlights.sort_unstable();
+        highlights.dedup();
+        let path = format!("{dir}{name}{}", if is_dir { "/" } else { "" });
+        // A path with a space in it has to come back quoted, or the token
+        // would end at the space.
+        let insert = match path.contains(' ') {
+          true => format!("@\"{path}\""),
+          false => format!("@{path}"),
+        };
+        let meta = match is_dir {
+          true => String::new(),
+          false => match attach::dimensions(&base.join(&name)) {
+            Some((w, h)) => format!("{w}×{h}"),
+            None => String::new(),
+          },
+        };
+        Match::Path {
+          insert,
+          name,
+          highlights,
+          meta,
+          dir: is_dir,
+        }
+      })
+      .collect()
+  }
+
+  /// Resolve the `@path` tokens in the input box, so the border can say what
+  /// they found. Called wherever the text changes.
+  fn refresh_attachments(&mut self) {
+    let text = self.input.lines().join("\n");
+    self.attachments = match text.contains('@') {
+      true => attach::tokens(&text, &self.cwd),
+      // The overwhelmingly common case, and worth not touching the disk for.
+      false => Vec::new(),
+    };
   }
 
   /// A key while the model's questionnaire is open. It is the dialog's to
@@ -1062,6 +1274,10 @@ impl App {
     self.input.cut();
     self.input.set_yank_text("");
     self.input.insert_str(text);
+    // Only the tokens: a prompt handed back by `/tree` or walked back to
+    // should say what it attaches, but it should not open a popup over a
+    // box nobody has typed in yet.
+    self.refresh_attachments();
   }
 
   /// `Up`: the cursor while it has a line above it, and the prompts already
@@ -1117,18 +1333,32 @@ impl App {
     self.completion = None;
     self.anchor = None;
 
+    // Read here rather than wherever the prompt is finally sent: the file
+    // is what it was when Enter was pressed, not what it becomes while a
+    // run works through the queue ahead of it.
+    let prompt = self.attach(&text);
+
     if self.run.is_some() && !matches!(text.as_str(), "/quit" | "/new") {
       // Handed to the run, which reads it at the top of its next turn
       // rather than after the whole answer. It is kept there and nowhere
       // else, so whoever gets to it first is the only one who can.
-      self.agents.control.steer(text);
+      self.agents.control.steer(prompt);
       return;
     }
-    self.dispatch(text);
+    self.dispatch(prompt);
+  }
+
+  /// Load the images the prompt's `@tokens` name, saying in the transcript
+  /// what could not be sent and why.
+  fn attach(&mut self, text: &str) -> Prompt {
+    let (prompt, notes) = attach_images(text, &self.cwd, self.vision);
+    self.entries.extend(notes.into_iter().map(Entry::Info));
+    prompt
   }
 
   /// Run a prompt or slash command now.
-  fn dispatch(&mut self, text: String) {
+  fn dispatch(&mut self, prompt: Prompt) {
+    let text = prompt.text.clone();
     match text.as_str() {
       "/quit" => self.quit = true,
       "/new" => self.new_session(),
@@ -1167,7 +1397,7 @@ impl App {
           self.entries.push(Entry::Info(format!("Session named \"{name}\".")));
         }
       }
-      _ => self.start(text),
+      _ => self.start(prompt),
     }
   }
 
@@ -1344,10 +1574,12 @@ impl App {
   /// pressing it again after sending walks back through the queue in the
   /// order the messages would have gone out, last one first.
   fn unqueue(&mut self) {
-    let Some(text) = self.agents.control.unsteer() else {
+    let Some(prompt) = self.agents.control.unsteer() else {
       return;
     };
-    self.set_input(&text);
+    // The text is what goes back in the box; its attachments are read again
+    // when it is sent again, from the tokens still written in it.
+    self.set_input(&prompt.text);
   }
 
   /// Send what is still waiting once there is no run to hand it to.
@@ -1384,9 +1616,12 @@ impl App {
     ));
   }
 
-  fn start(&mut self, prompt: String) {
-    self.entries.push(Entry::User(prompt.clone()));
-    let prompt = Message::user(prompt);
+  fn start(&mut self, prompt: Prompt) {
+    self.entries.push(Entry::User {
+      text: prompt.text.clone(),
+      images: prompt.preview(),
+    });
+    let prompt = prompt.message();
     let handle = start_run(
       self.agents.runtime.clone(),
       self.agents.control.clone(),
@@ -1459,7 +1694,7 @@ impl App {
     for text in self.agents.control.take() {
       self
         .entries
-        .push(Entry::Info(format!("Not sent: {}", first_line(&text))));
+        .push(Entry::Info(format!("Not sent: {}", first_line(&text.text))));
     }
   }
 
@@ -1507,7 +1742,7 @@ impl App {
       // The run has read one of the messages waiting behind it, so it stops
       // being something on its way and becomes a prompt like any other —
       // drawn where the run reached it, which is where it was sent from.
-      AgentEvent::Steered(text) => self.entries.push(Entry::User(text)),
+      AgentEvent::Steered { text, images } => self.entries.push(Entry::User { text, images }),
       AgentEvent::Reasoning(delta) => match self.entries.last_mut() {
         Some(Entry::Reasoning(text)) => text.push_str(&delta),
         _ => self.entries.push(Entry::Reasoning(delta)),
@@ -1712,12 +1947,17 @@ impl App {
     } else {
       Color::Gray
     };
-    self.input.set_block(
-      Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(border_color)),
-    );
+    let mut block = Block::default()
+      .borders(Borders::ALL)
+      .border_type(BorderType::Rounded)
+      .border_style(Style::default().fg(border_color));
+    // What the `@tokens` in the box found, said along the bottom border
+    // rather than on a line of its own: it costs the transcript nothing,
+    // and it is gone again the moment the tokens are.
+    if let Some(strip) = self.attachment_strip(input_area.width) {
+      block = block.title_bottom(strip);
+    }
+    self.input.set_block(block);
     f.render_widget(&self.input, input_area);
     self.draw_footer(f, footer_area);
   }
@@ -1793,11 +2033,27 @@ impl App {
     }
   }
 
+  /// What the input box's `@tokens` resolved to, for the bottom border.
+  fn attachment_strip(&self, width: u16) -> Option<Line<'static>> {
+    attachment_strip(&self.attachments, self.vision, width)
+  }
+
   fn draw_completion(&self, f: &mut Frame, area: Rect) {
     let Some(c) = &self.completion else { return };
     let rows = area.height as usize;
     let first = c.selected.saturating_sub(rows.saturating_sub(1));
-    let name_width = COMMANDS.iter().map(|(n, ..)| n.len() + 1).max().unwrap_or(0);
+    let command_width = COMMANDS.iter().map(|(n, ..)| n.len() + 1).max().unwrap_or(0);
+    // A file list is as wide as its longest name, so the sizes line up in a
+    // column of their own.
+    let path_width = c
+      .items
+      .iter()
+      .filter_map(|m| match m {
+        Match::Path { name, dir, .. } => Some(name.chars().count() + usize::from(*dir) + 1),
+        Match::Command { .. } => None,
+      })
+      .max()
+      .unwrap_or(0);
     let dim = Style::default().add_modifier(Modifier::DIM);
     let lines: Vec<Line> = c
       .items
@@ -1806,7 +2062,6 @@ impl App {
       .skip(first)
       .take(rows)
       .map(|(i, m)| {
-        let (name, description, _) = COMMANDS[m.index];
         let selected = i == c.selected;
         let base = if selected {
           Style::default().bold()
@@ -1814,24 +2069,47 @@ impl App {
           Style::default()
         };
         let hit = base.fg(Color::Cyan).underlined();
-        let mut spans = vec![
-          Span::styled(
-            if selected { "› " } else { "  " },
-            Style::default().fg(Color::Cyan).bold(),
+        let mut spans = vec![Span::styled(
+          if selected { "› " } else { "  " },
+          Style::default().fg(Color::Cyan).bold(),
+        )];
+        let (sigil, name, highlights, trailing, width, right) = match m {
+          Match::Command { index, highlights } => {
+            let (name, description, _) = COMMANDS[*index];
+            (
+              "/",
+              name.to_string(),
+              highlights,
+              String::new(),
+              command_width,
+              description.to_string(),
+            )
+          }
+          Match::Path {
+            name,
+            highlights,
+            meta,
+            dir,
+            ..
+          } => (
+            "",
+            name.clone(),
+            highlights,
+            if *dir { "/".to_string() } else { String::new() },
+            path_width,
+            meta.clone(),
           ),
-          Span::styled("/", base),
-        ];
+        };
+        spans.push(Span::styled(sigil, base));
         // Matched letters get their own styled spans.
         for (pos, ch) in name.chars().enumerate() {
-          let style = if m.highlights.contains(&(pos as u32)) {
-            hit
-          } else {
-            base
-          };
+          let style = if highlights.contains(&(pos as u32)) { hit } else { base };
           spans.push(Span::styled(ch.to_string(), style));
         }
-        spans.push(Span::raw(" ".repeat(name_width - name.chars().count())));
-        spans.push(Span::styled(description, dim));
+        let shown = name.chars().count() + trailing.chars().count();
+        spans.push(Span::styled(trailing, base.fg(Color::Cyan)));
+        spans.push(Span::raw(" ".repeat(width.saturating_sub(shown))));
+        spans.push(Span::styled(right, dim));
         Line::from(spans)
       })
       .collect();
@@ -1982,7 +2260,7 @@ impl App {
     let streaming = self.run.is_some().then(|| self.entries.len().saturating_sub(1));
     for (at, entry) in self.entries.iter().enumerate() {
       match entry {
-        Entry::User(text) => {
+        Entry::User { text, images } => {
           lines.push(Line::default());
           for (i, l) in text.lines().enumerate() {
             let prefix = if i == 0 { "❯ " } else { "  " };
@@ -1990,6 +2268,29 @@ impl App {
               Span::styled(prefix, Style::default().fg(Color::Cyan).bold()),
               Span::styled(l.to_string(), Style::default().bold()),
             ]));
+          }
+          // What was attached, under the prompt that attached it and drawn
+          // the same way a tool's picture is: at the width the transcript
+          // has, folded, and cached by its bytes and that width.
+          for image in images {
+            let cols = width.saturating_sub(3);
+            let key = (hash_bytes(IMAGE_KIND, image), cols, false);
+            let drawn = match cached.remove(&key) {
+              Some(drawn) => drawn,
+              None => crate::images::blocks(image, cols, IMAGE_MAX_LINES)
+                .unwrap_or_else(|| vec![Line::styled("[image could not be drawn]", dim)]),
+            };
+            Preview {
+              body: drawn.iter().map(|line| line.spans.clone()).collect(),
+              gutter: Span::styled("│", Style::default().fg(Color::Cyan)),
+              cap: IMAGE_LINES,
+              expanded: self.expand_tools,
+              width: width as usize,
+              from_end: false,
+              cursor: false,
+            }
+            .draw(&mut lines);
+            live.insert(key, drawn);
           }
         }
         Entry::Assistant(text) => {
@@ -2279,10 +2580,141 @@ pub fn is_newline(key: &KeyEvent) -> bool {
 
 /// Commands matching `query` (the text after `/`), best first. An empty
 /// query lists everything in table order.
+/// What the input box's `@tokens` resolved to, as the bottom border reads
+/// it: each attachment named with the size it will be sent at, and each
+/// token that found nothing marked as the mistake it probably is.
+///
+/// `None` when there is nothing to say, which leaves the border plain.
+fn attachment_strip(tokens: &[Token], vision: bool, width: u16) -> Option<Line<'static>> {
+  if tokens.is_empty() {
+    return None;
+  }
+  let mut spans = vec![Span::raw("─ ")];
+  // Two for the corners, two for the lead-in, one for the trailing space.
+  let room = usize::from(width).saturating_sub(5);
+  let mut used = 0;
+  let mut dropped = 0;
+  for token in tokens {
+    let (text, style) = match token.state {
+      attach::State::Image { width, height } => (
+        format!("▣ {} {width}×{height}", token.name()),
+        match vision {
+          true => Style::default().fg(Color::Cyan),
+          // It resolved, but this model will not be sent it.
+          false => Style::default().fg(Color::DarkGray),
+        },
+      ),
+      // Not a mistake: a path still being completed reads as a directory
+      // right up until it names a file, and the popup below is already
+      // listing what is in it.
+      attach::State::Directory => (
+        format!("▤ {}/", token.name()),
+        Style::default().add_modifier(Modifier::DIM),
+      ),
+      attach::State::Missing => (
+        format!("⚠ {} not found", token.name()),
+        Style::default().fg(Color::Yellow),
+      ),
+      attach::State::NotAnImage => (
+        format!("⚠ {} not an image", token.name()),
+        Style::default().fg(Color::Yellow),
+      ),
+    };
+    let sep = if used == 0 { 0 } else { 2 };
+    let wide = text.chars().count() + sep;
+    // What will not fit is counted rather than cut in half.
+    if used + wide > room.saturating_sub(if dropped > 0 { 3 } else { 0 }) {
+      dropped += 1;
+      continue;
+    }
+    if sep > 0 {
+      spans.push(Span::raw("  "));
+    }
+    spans.push(Span::styled(text, style));
+    used += wide;
+  }
+  if dropped > 0 {
+    spans.push(Span::styled(
+      format!(" +{dropped}"),
+      Style::default().fg(Color::DarkGray),
+    ));
+  }
+  spans.push(Span::raw(" "));
+  Some(Line::from(spans))
+}
+
+/// Read the images `text`'s `@tokens` name. The notes are for the
+/// transcript: what could not be attached, and why.
+///
+/// A slash command is only ever its text, and text with no `@` in it never
+/// touches the disk.
+fn attach_images(text: &str, cwd: &Path, vision: bool) -> (Prompt, Vec<String>) {
+  if text.starts_with('/') || !text.contains('@') {
+    return (Prompt::text(text.to_string()), Vec::new());
+  }
+  let tokens = attach::tokens(text, cwd);
+  let mut images = Vec::new();
+  let mut notes = Vec::new();
+  for token in &tokens {
+    match &token.state {
+      attach::State::Image { .. } if !vision => notes.push(format!(
+        "Not attached — {}: this model does not take images (--no-vision).",
+        token.text
+      )),
+      attach::State::Image { .. } => match attach::load(token) {
+        Ok(image) => images.push(image),
+        Err(reason) => notes.push(format!("Not attached — {reason}")),
+      },
+      // A token that resolved to nothing is worth saying out loud: it reads
+      // like an attachment in the prompt, and nothing else would say that
+      // the model was never given one.
+      attach::State::Directory => notes.push(format!("Not attached — {}: that is a directory.", token.text)),
+      attach::State::Missing => notes.push(format!("Not attached — {}: no such file.", token.text)),
+      attach::State::NotAnImage => notes.push(format!("Not attached — {}: not an image fa can send.", token.text)),
+    }
+  }
+  (
+    Prompt {
+      text: text.to_string(),
+      images,
+    },
+    notes,
+  )
+}
+
+/// A pasted path to an image, as the token that attaches it — relative to
+/// the working directory when it is under it, and quoted when it has a space
+/// in it. `None` for a paste that is anything else, which is nearly every
+/// paste.
+fn as_token(text: &str, cwd: &Path) -> Option<String> {
+  let trimmed = text.trim();
+  // One path and nothing else. A pasted paragraph that mentions a file is
+  // not a request to attach it.
+  if trimmed.is_empty() || trimmed.contains('\n') || trimmed.starts_with('@') {
+    return None;
+  }
+  let path = crate::tools::resolve(cwd, trimmed);
+  attach::dimensions(&path)?;
+  let shown = path.strip_prefix(cwd).unwrap_or(&path).to_string_lossy().into_owned();
+  Some(match shown.contains(' ') {
+    true => format!("@\"{shown}\" "),
+    false => format!("@{shown} "),
+  })
+}
+
+/// What a popup row is, for keeping the selection on the same row as the
+/// list is filtered down.
+fn key(item: &Match) -> String {
+  match item {
+    Match::Command { index, .. } => COMMANDS[*index].0.to_string(),
+    Match::Path { insert, .. } => insert.clone(),
+  }
+}
+
 fn filter_commands(matcher: &mut Matcher, query: &str) -> Vec<Match> {
   if query.is_empty() {
     return (0..COMMANDS.len())
-      .map(|index| Match {
+      .map(|index| Match::Command {
         index,
         highlights: Vec::new(),
       })
@@ -2298,10 +2730,10 @@ fn filter_commands(matcher: &mut Matcher, query: &str) -> Vec<Match> {
       let score = pattern.indices(Utf32Str::new(name, &mut buf), matcher, &mut highlights)?;
       highlights.sort_unstable();
       highlights.dedup();
-      Some((score, Match { index, highlights }))
+      Some((score, Match::Command { index, highlights }))
     })
     .collect();
-  scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.index.cmp(&b.1.index)));
+  scored.sort_by(|a, b| b.0.cmp(&a.0).then(key(&a.1).cmp(&key(&b.1))));
   scored.into_iter().map(|(_, m)| m).collect()
 }
 
@@ -2888,6 +3320,22 @@ fn entries_from_history(session: &Session) -> Vec<Entry> {
     match message {
       Message::System { .. } => {}
       Message::User { content } => {
+        // A prompt that attached images is one text part, then a note and an
+        // image for each: the images belong to the prompt, and the notes are
+        // what was said to the model about them rather than anything the
+        // transcript has to repeat.
+        let mut attached: Vec<Vec<u8>> = content
+          .iter()
+          .filter_map(|c| match c {
+            UserContent::Image(image) => crate::images::source_bytes(&image.data),
+            _ => None,
+          })
+          .collect();
+        // Asked before the images are handed to the prompt, which empties
+        // the list: what decides whether a later text part is a note is
+        // that there were images, not that there still are.
+        let attachments = !attached.is_empty();
+        let mut prompt_seen = false;
         for c in content {
           match c {
             UserContent::Text(t) => {
@@ -2895,9 +3343,17 @@ fn entries_from_history(session: &Session) -> Vec<Entry> {
                 .text
                 .strip_prefix(SUMMARY_PREFIX)
                 .and_then(|r| r.strip_suffix(SUMMARY_SUFFIX));
-              entries.push(match summary {
-                Some(s) => Entry::Summary(s.to_string()),
-                None => Entry::User(t.text.clone()),
+              if let Some(s) = summary {
+                entries.push(Entry::Summary(s.to_string()));
+                continue;
+              }
+              if prompt_seen && attachments {
+                continue;
+              }
+              prompt_seen = true;
+              entries.push(Entry::User {
+                text: t.text.clone(),
+                images: std::mem::take(&mut attached),
               });
             }
             // An output nothing claimed — a result whose call is not in this
@@ -3375,7 +3831,13 @@ mod tests {
   }
 
   fn names(matches: &[Match]) -> Vec<&'static str> {
-    matches.iter().map(|m| COMMANDS[m.index].0).collect()
+    matches
+      .iter()
+      .map(|m| match m {
+        Match::Command { index, .. } => COMMANDS[*index].0,
+        Match::Path { .. } => "path",
+      })
+      .collect()
   }
 
   /// The text of a block of spans, line by line.
@@ -3466,8 +3928,10 @@ mod tests {
     assert_eq!(names(&filter_commands(&mut matcher, "se"))[0], "session");
     assert!(filter_commands(&mut matcher, "zzz").is_empty());
     // Highlights point at the matched letters: n-a-m-e for "nm".
-    let m = &filter_commands(&mut matcher, "nm")[0];
-    assert_eq!(m.highlights, [0, 2]);
+    let Match::Command { highlights, .. } = &filter_commands(&mut matcher, "nm")[0] else {
+      panic!("a command")
+    };
+    assert_eq!(highlights, &[0, 2]);
   }
 
   /// A history of one prompt, a tool call answered, and a final answer.
@@ -3904,7 +4368,10 @@ mod tests {
     entries
       .iter()
       .map(|entry| match entry {
-        Entry::User(text) => format!("user {text}"),
+        Entry::User { text, images } => match images.len() {
+          0 => format!("user {text}"),
+          n => format!("user {text} +{n} image"),
+        },
         Entry::Assistant(text) => format!("said {text}"),
         Entry::ToolCall { name, summary, .. } => format!("call {name} {summary}"),
         Entry::ToolResult { name, output, .. } => format!("out {name} {}", first_line(output)),
@@ -4189,5 +4656,129 @@ mod tests {
         ("two".into(), 4, None, false),
       ]
     );
+  }
+
+  // ------------------------------------------------- attachments
+
+  /// A directory with one small PNG in it, and its bytes.
+  fn with_png(name: &str) -> (PathBuf, Vec<u8>) {
+    let dir = std::env::temp_dir().join(format!("fa-ui-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let image = image::ImageBuffer::from_pixel(6, 4, image::Rgb([9u8, 200, 60]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image)
+      .write_to(&mut bytes, image::ImageFormat::Png)
+      .unwrap();
+    let bytes = bytes.into_inner();
+    std::fs::write(dir.join("shot.png"), &bytes).unwrap();
+    (dir, bytes)
+  }
+
+  /// The bottom border's summary as it reads, spans joined.
+  fn strip(text: &str, dir: &Path, vision: bool, width: u16) -> Option<String> {
+    attachment_strip(&attach::tokens(text, dir), vision, width)
+      .map(|line| line.spans.iter().map(|s| s.content.to_string()).collect())
+  }
+
+  #[test]
+  fn the_border_says_what_a_token_found() {
+    let (dir, _) = with_png("strip");
+    assert_eq!(
+      strip("why does @shot.png do that?", &dir, true, 60).as_deref(),
+      Some("─ ▣ shot.png 6×4 ")
+    );
+  }
+
+  #[test]
+  fn the_border_says_when_a_token_found_nothing() {
+    let (dir, _) = with_png("missing");
+    assert_eq!(
+      strip("look at @gone.png", &dir, true, 60).as_deref(),
+      Some("─ ⚠ gone.png not found ")
+    );
+    std::fs::write(dir.join("notes.txt"), "words").unwrap();
+    assert_eq!(
+      strip("read @notes.txt", &dir, true, 60).as_deref(),
+      Some("─ ⚠ notes.txt not an image ")
+    );
+    // And nothing at all to say when there is no token.
+    assert!(strip("look at nothing", &dir, true, 60).is_none());
+  }
+
+  #[test]
+  fn the_border_drops_what_will_not_fit_and_counts_it() {
+    let (dir, _) = with_png("narrow");
+    let narrow = strip("@shot.png @shot.png @shot.png", &dir, true, 30).expect("a strip");
+    assert!(narrow.contains("+2"), "the rest are counted: {narrow:?}");
+    assert!(narrow.chars().count() <= 30, "it fits the border: {narrow:?}");
+  }
+
+  #[test]
+  fn a_prompt_carries_its_image_and_the_transcript_draws_the_same_bytes() {
+    let (dir, bytes) = with_png("prompt");
+    let (prompt, notes) = attach_images("what is @shot.png", &dir, true);
+    assert_eq!(prompt.images.len(), 1);
+    assert_eq!(prompt.preview(), vec![bytes]);
+    assert!(notes.is_empty(), "it resolved, so there is nothing to report");
+  }
+
+  #[test]
+  fn a_token_that_resolved_to_nothing_is_reported_rather_than_passed_over() {
+    let (dir, _) = with_png("report");
+    let (prompt, notes) = attach_images("look at @gone.png", &dir, true);
+    assert!(prompt.images.is_empty());
+    // The text still goes as typed; only the attachment is missing.
+    assert_eq!(prompt.text, "look at @gone.png");
+    assert_eq!(notes, ["Not attached — @gone.png: no such file."]);
+  }
+
+  #[test]
+  fn a_model_without_vision_is_told_rather_than_sent_the_image() {
+    let (dir, _) = with_png("novision");
+    let (prompt, notes) = attach_images("what is @shot.png", &dir, false);
+    assert!(prompt.images.is_empty());
+    assert_eq!(notes.len(), 1);
+    assert!(notes[0].contains("--no-vision"), "{notes:?}");
+  }
+
+  #[test]
+  fn a_slash_command_never_attaches_anything() {
+    let (dir, _) = with_png("command");
+    let (prompt, notes) = attach_images("/name @shot.png", &dir, true);
+    assert!(prompt.images.is_empty());
+    assert!(notes.is_empty());
+  }
+
+  #[test]
+  fn a_pasted_image_path_is_written_down_as_a_token() {
+    let (dir, _) = with_png("paste");
+    // A full path under the working directory comes back relative to it.
+    let dropped = dir.join("shot.png").display().to_string();
+    assert_eq!(as_token(&dropped, &dir).as_deref(), Some("@shot.png "));
+    // And stays a full path when it is not under the working directory.
+    let elsewhere = dir.parent().unwrap().join("fa-ui-paste-elsewhere");
+    assert_eq!(
+      as_token(&dropped, &elsewhere).as_deref(),
+      Some(format!("@{dropped} ").as_str())
+    );
+    // Anything that is not a lone path to an image is left alone.
+    assert!(as_token("shot.png is the one", &dir).is_none());
+    assert!(as_token(&dir.join("gone.png").display().to_string(), &dir).is_none());
+  }
+
+  #[test]
+  fn a_resumed_session_draws_the_image_its_prompt_attached() {
+    let (dir, bytes) = with_png("resume");
+    let (prompt, _) = attach_images("what is @shot.png", &dir, true);
+    let session = session_of(vec![prompt.message()]);
+    let entries = entries_from_history(&session);
+    // One prompt, carrying its image — and not a second entry for the note
+    // that labels it, which was written for the model rather than the screen.
+    assert_eq!(shapes(&entries), ["user what is @shot.png +1 image"]);
+    let Entry::User { images, .. } = &entries[0] else {
+      panic!("a prompt")
+    };
+    assert_eq!(images, &[bytes]);
   }
 }

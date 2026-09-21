@@ -27,6 +27,7 @@ use rig_core::streaming::{StreamedAssistantContent, StreamingCompletionResponse,
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
+use crate::attach::Prompt;
 use crate::compaction::{self, Compacted, Settings};
 use crate::tools::{AskTool, BUILT_IN, BashTool, EditDiff, EditTool, Output, ReadTool, WriteTool};
 
@@ -45,7 +46,11 @@ pub enum AgentEvent {
   /// A message the user typed mid-run, read by the run at the top of a turn.
   /// The UI has been drawing it as waiting; this is where it becomes part of
   /// the conversation.
-  Steered(String),
+  Steered {
+    text: String,
+    /// Images it attached, for the transcript to draw under it.
+    images: Vec<Vec<u8>>,
+  },
   ToolCall {
     name: String,
     args: serde_json::Value,
@@ -143,8 +148,10 @@ struct Signals {
   /// takes it back down once it has made the room.
   overflow: AtomicBool,
   /// What the user typed while the run was going, for the run to read at
-  /// the top of its next turn.
-  steer: Mutex<VecDeque<String>>,
+  /// the top of its next turn. Whole prompts rather than their text: an
+  /// attachment is read when Enter is pressed, not whenever the run gets
+  /// round to it.
+  steer: Mutex<VecDeque<Prompt>>,
   /// Woken when a run should look at the above rather than go on waiting
   /// for whatever it is in the middle of.
   wake: Notify,
@@ -184,23 +191,23 @@ impl Control {
   /// This is where a waiting message lives — there is no second copy of it
   /// anywhere. Whoever gets to it first takes it: the run, at the top of
   /// its next turn, or the UI once there is no run left to give it to.
-  pub fn steer(&self, text: String) {
-    self.held().push_back(text);
+  pub fn steer(&self, prompt: Prompt) {
+    self.held().push_back(prompt);
   }
 
   /// Take the newest back, for the input box to have it again.
-  pub fn unsteer(&self) -> Option<String> {
+  pub fn unsteer(&self) -> Option<Prompt> {
     self.held().pop_back()
   }
 
   /// Take the oldest, for the UI to send as a run of its own.
-  pub fn take_next(&self) -> Option<String> {
+  pub fn take_next(&self) -> Option<Prompt> {
     self.held().pop_front()
   }
 
   /// Take everything, in the order it was typed: the run reads them into
   /// the turn it is about to ask for, and Esc takes them out of its way.
-  pub fn take(&self) -> Vec<String> {
+  pub fn take(&self) -> Vec<Prompt> {
     self.held().drain(..).collect()
   }
 
@@ -210,10 +217,10 @@ impl Control {
 
   /// What is waiting, for the screen to say so.
   pub fn waiting(&self) -> Vec<String> {
-    self.held().iter().cloned().collect()
+    self.held().iter().map(|prompt| prompt.text.clone()).collect()
   }
 
-  fn held(&self) -> std::sync::MutexGuard<'_, VecDeque<String>> {
+  fn held(&self) -> std::sync::MutexGuard<'_, VecDeque<Prompt>> {
     self.0.steer.lock().expect("a queue nobody panicked holding")
   }
 
@@ -500,9 +507,12 @@ async fn run(
   for turn in 1..=rt.max_turns {
     // Anything typed while the last turn ran is read before this one, so it
     // lands where the user meant it rather than after the whole answer.
-    for text in control.take() {
-      let _ = tx.send(AgentEvent::Steered(text.clone()));
-      made.push(Message::user(text));
+    for prompt in control.take() {
+      let _ = tx.send(AgentEvent::Steered {
+        text: prompt.text.clone(),
+        images: prompt.preview(),
+      });
+      made.push(prompt.message());
     }
     if control.cancelled() {
       return Some(Stop::Cancelled);
@@ -1200,8 +1210,8 @@ mod tests {
       // its least interruptible.
       if !steered && matches!(&event, AgentEvent::ToolCall { call, .. } if call == "call_1") {
         steered = true;
-        control.steer("and this".into());
-        control.steer("and this too".into());
+        control.steer(Prompt::text("and this".into()));
+        control.steer(Prompt::text("and this too".into()));
       }
       if let AgentEvent::Done { messages } | AgentEvent::Ended { messages } = event {
         handle.await.expect("the run to finish");
@@ -1294,7 +1304,7 @@ mod tests {
           format!("result:{}", if *is_error { "err" } else { "ok" })
         }
         AgentEvent::Done { .. } => "done".into(),
-        AgentEvent::Steered(_) => "steered".into(),
+        AgentEvent::Steered { .. } => "steered".into(),
         AgentEvent::Usage { .. } => "usage".into(),
         AgentEvent::Error(e) => format!("error:{e}"),
         AgentEvent::Ended { .. } => "ended".into(),

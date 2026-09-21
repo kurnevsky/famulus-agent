@@ -491,6 +491,39 @@ That is what the transcript shows; what the model gets is the image itself. So
 `--no-vision` is a session with neither — `read` sends no image, and there is
 nothing left to draw.
 
+### Attaching one
+
+An image goes into a prompt as `@path`, which may be relative to the working
+directory, a full path, or `~/...`. A path with a space in it goes in quotes:
+`@"~/my shots/a.png"`. Dropping a file on the terminal pastes its path, and a
+lone path to an image is written down as a token by itself, so the gesture
+works without typing anything.
+
+```
+╭────────────────────────────────────────────────────────╮
+│ why does @shot.png render the sidebar twice?           │
+╰─ ▣ shot.png 1280×800 ──────────────────────────────────╯
+```
+
+The bottom border says what the tokens found, as they are typed — the size it
+will be sent at, or `⚠ shot.png not found` for one that resolved to nothing. It
+costs the transcript no room and is gone again the moment the tokens are. A
+half-typed token opens a popup of the images and directories it could mean, the
+same list the `/` commands use; `Tab` takes a row, and a directory is carried
+on into rather than attached. Once the token names a real image the popup
+closes, so `Enter` sends rather than being taken by the list.
+
+The token stays in the text that is sent. It is not the image — that travels as
+a content part of its own, behind a note naming it, the same shape `read`
+answers in — but the sentence has to read as one, the token says which image is
+which when there are several, and the session stores only what was sent. That
+last one is why: a prompt handed back by `/tree`, or walked back to with `Up`,
+brings its attachments with it because they are written in it.
+
+What could not be attached is said in the transcript rather than passed over,
+since a prompt that reads like it carries an image and does not is worse than
+one that says so. Under `--no-vision` that is every attachment.
+
 ## Compaction
 
 Every request is weighed against `context_window - reserve_tokens`, both as it
@@ -585,8 +618,9 @@ what it spent.
 | `Alt+↑` | Take the last queued message back for editing (empty input) |
 | `↑` / `↓` | Walk back through the prompts already sent, and forward again — from the first/last line of the input |
 | `/` | Command popup: type to fuzzy-filter, `↑`/`↓` move, `Tab`/`Enter` complete, `Esc` dismiss |
+| `@` | Attach an image: `@path`, `@/full/path`, `@~/shot.png`, `@"with a space.png"` — same popup, `Tab` completes, a directory is carried on into |
 | `Alt+Enter`, `Ctrl+J`, `Shift+Enter`* | Newline |
-| Paste | Goes in whole, newlines and all — a pasted snippet is not sent at its first line break |
+| Paste | Goes in whole, newlines and all — a pasted snippet is not sent at its first line break. A lone path to an image becomes an `@` token |
 | `Esc` | Abort the current run |
 | `Esc` `Esc` | Open `/tree` (empty input, within half a second) |
 | `PageUp` / `PageDown`, mouse wheel | Scroll transcript |

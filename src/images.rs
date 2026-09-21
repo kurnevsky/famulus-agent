@@ -22,18 +22,33 @@ const MAX_BASE64_BYTES: usize = (4.5 * 1024.0 * 1024.0) as usize;
 const JPEG_QUALITIES: [u8; 5] = [80, 85, 70, 55, 40];
 
 pub struct ProcessedImage {
-  pub base64: String,
+  /// The image as the model will be given it: PNG or JPEG, within the size
+  /// limits. Kept as bytes rather than as base64 because the transcript
+  /// draws the same image it sends, and drawing wants the bytes.
+  pub bytes: Vec<u8>,
   pub media_type: ImageMediaType,
   /// Notes for the model about conversion or resizing.
   pub hints: Vec<String>,
 }
 
-/// The image formats the `read` tool accepts: jpg, png, gif, webp, bmp.
-pub fn detect(bytes: &[u8]) -> Option<ImageFormat> {
-  match image::guess_format(bytes).ok()? {
-    f @ (ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif | ImageFormat::WebP | ImageFormat::Bmp) => Some(f),
-    _ => None,
+impl ProcessedImage {
+  /// The image as a provider takes it inline.
+  pub fn base64(&self) -> String {
+    STANDARD.encode(&self.bytes)
   }
+}
+
+/// Whether an image of this format can be sent inline.
+pub fn supported(format: ImageFormat) -> bool {
+  matches!(
+    format,
+    ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif | ImageFormat::WebP | ImageFormat::Bmp
+  )
+}
+
+/// The image formats fa accepts: jpg, png, gif, webp, bmp.
+pub fn detect(bytes: &[u8]) -> Option<ImageFormat> {
+  image::guess_format(bytes).ok().filter(|f| supported(*f))
 }
 
 pub fn mime_type(format: ImageFormat) -> &'static str {
@@ -73,7 +88,7 @@ pub fn process(bytes: &[u8], format: ImageFormat) -> Result<ProcessedImage, Stri
 
   if width <= MAX_WIDTH && height <= MAX_HEIGHT && base64_len(bytes.len()) < MAX_BASE64_BYTES {
     return Ok(ProcessedImage {
-      base64: STANDARD.encode(&bytes),
+      bytes,
       media_type,
       hints,
     });
@@ -86,7 +101,7 @@ pub fn process(bytes: &[u8], format: ImageFormat) -> Result<ProcessedImage, Stri
         "[Image: original {width}x{height}, displayed at {w}x{h}. Multiply coordinates by {scale:.2} to map to original image.]"
     ));
   Ok(ProcessedImage {
-    base64: STANDARD.encode(&encoded),
+    bytes: encoded,
     media_type,
     hints,
   })
@@ -163,7 +178,7 @@ pub fn split(content: &[ToolResultContent]) -> (String, Vec<Vec<u8>>) {
 }
 
 /// The bytes behind an image, for the sources that carry them.
-fn source_bytes(source: &DocumentSourceKind) -> Option<Vec<u8>> {
+pub fn source_bytes(source: &DocumentSourceKind) -> Option<Vec<u8>> {
   match source {
     DocumentSourceKind::Base64(data) => STANDARD.decode(data).ok(),
     DocumentSourceKind::Raw(bytes) => Some(bytes.clone()),
@@ -284,7 +299,7 @@ mod tests {
     let out = process(&bytes, ImageFormat::Png).unwrap();
     assert_eq!(out.media_type, ImageMediaType::PNG);
     assert!(out.hints.is_empty());
-    assert_eq!(STANDARD.decode(out.base64).unwrap(), bytes);
+    assert_eq!(out.bytes, bytes);
   }
 
   #[test]
@@ -297,10 +312,7 @@ mod tests {
     let out = process(&bmp.into_inner(), ImageFormat::Bmp).unwrap();
     assert_eq!(out.media_type, ImageMediaType::PNG);
     assert_eq!(out.hints, ["[Image converted from image/bmp to image/png.]"]);
-    assert_eq!(
-      image::guess_format(&STANDARD.decode(out.base64).unwrap()).unwrap(),
-      ImageFormat::Png
-    );
+    assert_eq!(image::guess_format(&out.bytes).unwrap(), ImageFormat::Png);
   }
 
   #[test]
@@ -396,7 +408,7 @@ mod tests {
   #[test]
   fn oversized_image_is_resized_with_a_note() {
     let out = process(&png(3000, 300), ImageFormat::Png).unwrap();
-    let decoded = image::load_from_memory(&STANDARD.decode(out.base64).unwrap()).unwrap();
+    let decoded = image::load_from_memory(&out.bytes).unwrap();
     assert_eq!(decoded.dimensions(), (2000, 200));
     assert_eq!(
       out.hints,

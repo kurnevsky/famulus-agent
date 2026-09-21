@@ -247,17 +247,27 @@ fn read_info(path: &Path) -> Result<SessionInfo> {
 ///
 /// Which is also what makes a message a point the session can be rewound to:
 /// the things the user typed, and nothing the loop put there itself.
+///
+/// A prompt that attached images is one text part, then a note and an image
+/// for each. Only the first is the user's: the notes were written to tell the
+/// model what it was being given, and a prompt handed back to the input box
+/// has to be the sentence that was typed, `@tokens` and all — which is what
+/// attaches the images again when it is sent again.
 pub fn user_text(message: &Message) -> Option<String> {
   let Message::User { content } = message else {
     return None;
   };
-  let text: Vec<&str> = content
+  let attachments = content.iter().any(|c| matches!(c, UserContent::Image(_)));
+  let mut text: Vec<&str> = content
     .iter()
     .filter_map(|c| match c {
       UserContent::Text(t) => Some(t.text.as_str()),
       _ => None,
     })
     .collect();
+  if attachments {
+    text.truncate(1);
+  }
   if text.is_empty() {
     return None;
   }
@@ -1024,5 +1034,30 @@ mod tests {
     assert_eq!(session.history.len(), 1);
     assert!(!session.persistent());
     assert!(session.path().is_none());
+  }
+
+  #[test]
+  fn a_prompt_that_attached_an_image_hands_back_only_what_was_typed() {
+    // The shape a prompt with an attachment travels in: the sentence, then
+    // a note and the image it labels.
+    let message = Message::User {
+      content: vec![
+        UserContent::text("what is @shot.png"),
+        UserContent::text("[Attached @shot.png — image/png]"),
+        UserContent::image_base64("aGk=".to_string(), None, None),
+      ],
+    };
+    // The note is the loop's, not the user's: `/tree` and `Up` hand back the
+    // sentence alone, whose `@token` attaches the image again when it is
+    // sent again.
+    assert_eq!(user_text(&message).as_deref(), Some("what is @shot.png"));
+  }
+
+  #[test]
+  fn a_prompt_of_several_text_parts_and_no_images_is_still_joined() {
+    let message = Message::User {
+      content: vec![UserContent::text("first"), UserContent::text("second")],
+    };
+    assert_eq!(user_text(&message).as_deref(), Some("first\nsecond"));
   }
 }

@@ -1,5 +1,6 @@
 mod agent;
 mod ask;
+mod attach;
 mod clipboard;
 mod compaction;
 mod edit;
@@ -244,6 +245,7 @@ async fn main() -> Result<()> {
       notes,
       mcp: servers.count(),
       bell: !cli.no_bell,
+      vision: !cli.no_vision,
     },
   );
 

@@ -122,7 +122,7 @@ fn schema<T: JsonSchema>() -> serde_json::Value {
 /// Path normalization: Unicode spaces folded, a leading `@` (chat file
 /// reference) stripped, `~` expanded, `file://` URLs accepted, then resolved
 /// against the working directory.
-fn resolve(cwd: &Path, path: &str) -> PathBuf {
+pub fn resolve(cwd: &Path, path: &str) -> PathBuf {
   let mut normalized: String = path
     .chars()
     .map(|c| match c {
@@ -520,7 +520,7 @@ fn read_image(bytes: &[u8], format: image::ImageFormat, vision: bool) -> Vec<Too
       }
       vec![
         ToolResultContent::text(note),
-        ToolResultContent::image_base64(image.base64, Some(image.media_type), None),
+        ToolResultContent::image_base64(image.base64(), Some(image.media_type), None),
       ]
     }
     Err(reason) => {

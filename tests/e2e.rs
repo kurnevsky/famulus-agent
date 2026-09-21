@@ -2617,3 +2617,74 @@ fn a_selection_dragged_off_the_top_scrolls_the_transcript_and_keeps_going() {
     "it ran further than the rows it was dragged over: {copied:?}"
   );
 }
+
+#[test]
+fn an_image_attached_to_a_prompt_is_sent_with_it_and_drawn_under_it() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![Turn::Say("A green rectangle.")]);
+  let term = Term::start("attach", &provider, &["--no-session"]);
+  // Sixteen pixels down is eight lines of half-blocks, sixteen across.
+  let green = image::ImageBuffer::from_pixel(16, 16, image::Rgb([20u8, 200, 90]));
+  image::DynamicImage::ImageRgb8(green)
+    .save(term.dir.join("shot.png"))
+    .expect("an image to attach");
+
+  // The border says what the token found, before anything is sent.
+  term.type_in("what is @shot.png");
+  term.wait_for("▣ shot.png 16×16");
+
+  term.type_in("Enter");
+  term.wait_for("A green rectangle.");
+
+  // The prompt went as typed, token and all, and the image went with it as
+  // a part of its own rather than as anything written into the text.
+  let request = provider.request("what is @shot.png");
+  assert!(
+    request.contains("image_url") && request.contains("data:image/png;base64,"),
+    "the image travels as its own content part:\n{request}"
+  );
+  assert!(
+    request.contains("[Attached @shot.png"),
+    "and behind a note naming it:\n{request}"
+  );
+
+  // And it is drawn under the prompt that attached it.
+  let screen = term.screen();
+  let drawn: Vec<&str> = screen.lines().filter(|line| line.contains('▄')).collect();
+  assert_eq!(drawn.len(), 8, "the image is drawn as half-blocks:\n{screen}");
+  assert!(
+    drawn.iter().all(|line| line.matches('▄').count() == 16),
+    "each line is the image's own width:\n{screen}"
+  );
+}
+
+#[test]
+fn the_at_popup_completes_a_path_and_a_full_path_attaches_too() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![Turn::Say("Seen.")]);
+  let term = Term::start("attach-popup", &provider, &["--no-session"]);
+  std::fs::create_dir_all(term.dir.join("shots")).expect("a directory");
+  let red = image::ImageBuffer::from_pixel(8, 8, image::Rgb([220u8, 20, 60]));
+  image::DynamicImage::ImageRgb8(red)
+    .save(term.dir.join("shots/red.png"))
+    .expect("an image to complete to");
+
+  // The popup lists what a half-typed token could mean, sizes and all.
+  term.type_in("look at @shots/r");
+  term.wait_for("red.png");
+  term.wait_for("8×8");
+  // Tab takes the row, and the border then says it resolved.
+  term.type_in("Tab");
+  term.wait_for("▣ red.png 8×8");
+  term.type_in("Enter");
+  term.wait_for("Seen.");
+  assert!(
+    provider.sent("@shots/red.png"),
+    "the completed token is what was sent:\n{:?}",
+    provider.bodies()
+  );
+}
