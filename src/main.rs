@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, bail};
 use clap::{Parser, ValueEnum};
 use ratatui::crossterm::event::{
-  DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-  PushKeyboardEnhancementFlags,
+  DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, KeyboardEnhancementFlags,
+  PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::supports_keyboard_enhancement;
@@ -250,6 +250,10 @@ async fn main() -> Result<()> {
   // Mouse wheel scrolls the transcript. Note: while captured, the terminal's
   // own drag-selection usually needs Shift held.
   let _ = execute!(stdout(), EnableMouseCapture);
+  // Pasted text arrives in one piece rather than as the keys it is made of,
+  // so a paste of several lines lands as several lines instead of sending the
+  // first one at its first newline.
+  let bracketed = execute!(stdout(), EnableBracketedPaste).is_ok();
   // Lets terminals that speak the kitty keyboard protocol report Shift+Enter.
   let enhanced = matches!(supports_keyboard_enhancement(), Ok(true))
     && execute!(
@@ -262,6 +266,9 @@ async fn main() -> Result<()> {
 
   if enhanced {
     let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
+  }
+  if bracketed {
+    let _ = execute!(stdout(), DisableBracketedPaste);
   }
   let _ = execute!(stdout(), DisableMouseCapture);
   ratatui::restore();

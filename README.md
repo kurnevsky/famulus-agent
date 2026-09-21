@@ -568,6 +568,7 @@ what it spent.
 | `↑` / `↓` | Walk back through the prompts already sent, and forward again — from the first/last line of the input |
 | `/` | Command popup: type to fuzzy-filter, `↑`/`↓` move, `Tab`/`Enter` complete, `Esc` dismiss |
 | `Alt+Enter`, `Ctrl+J`, `Shift+Enter`* | Newline |
+| Paste | Goes in whole, newlines and all — a pasted snippet is not sent at its first line break |
 | `Esc` | Abort the current run |
 | `Esc` `Esc` | Open `/tree` (empty input, within half a second) |
 | `PageUp` / `PageDown`, mouse wheel | Scroll transcript |

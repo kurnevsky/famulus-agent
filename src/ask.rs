@@ -276,6 +276,11 @@ impl Draft {
     self.cursor += c.len_utf8();
   }
 
+  fn insert_str(&mut self, s: &str) {
+    self.text.insert_str(self.cursor, s);
+    self.cursor += s.len();
+  }
+
   fn backspace(&mut self) {
     if let Some((at, _)) = self.text[..self.cursor].char_indices().next_back() {
       self.text.remove(at);
@@ -537,6 +542,15 @@ impl Dialog {
       false => {
         self.answers.insert(self.tab, Answer::Ticked(labels));
       }
+    }
+  }
+
+  /// Text the user pasted. It is only ever text, so it goes to the free-text
+  /// row and nowhere else — on a list of choices there is nothing for it to
+  /// mean, and the Enter inside it never picks one.
+  pub fn paste(&mut self, text: &str) {
+    if self.typing {
+      self.draft().insert_str(text);
     }
   }
 
@@ -1065,6 +1079,22 @@ mod tests {
     assert!(dialog.typing, "still in the draft");
     press(&mut dialog, KeyCode::Up);
     assert!(!dialog.typing, "out of the draft and up the list");
+  }
+
+  #[test]
+  fn a_pasted_answer_keeps_its_newlines_instead_of_confirming_at_them() {
+    let mut dialog = Dialog::new(vec![question("Which cache?", &["Memory", "Disk"], false)]);
+    press(&mut dialog, KeyCode::Up);
+    dialog.paste("one\ntwo");
+    assert_eq!(dialog.drafts[&0].text, "one\ntwo");
+    assert!(
+      dialog.typing,
+      "the paste answered nothing and the row still has the keys"
+    );
+    // On a row of choices there is nothing a paste could mean.
+    press(&mut dialog, KeyCode::Down);
+    dialog.paste("three");
+    assert_eq!(dialog.drafts[&0].text, "one\ntwo");
   }
 
   #[test]

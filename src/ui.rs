@@ -530,6 +530,10 @@ impl App {
   fn handle_terminal(&mut self, ev: Event) {
     let key = match ev {
       Event::Key(key) => key,
+      Event::Paste(text) => {
+        self.handle_paste(&text);
+        return;
+      }
       Event::Mouse(mouse) => {
         match mouse.kind {
           MouseEventKind::ScrollUp => self.scroll_by(WHEEL_LINES as isize),
@@ -621,6 +625,30 @@ impl App {
         self.refresh_completion();
       }
     }
+  }
+
+  /// A bracketed paste: text the user never typed, so its newlines are text
+  /// too. It goes in whole, and nothing in it is read as a key — the Enter
+  /// halfway through a pasted snippet is not a request to send it.
+  fn handle_paste(&mut self, text: &str) {
+    // Terminals are not of one mind about how a clipboard's line endings
+    // reach us; the box keeps `\n`.
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    if text.is_empty() {
+      return;
+    }
+    if let Some((dialog, _)) = self.overlay.as_mut().and_then(|o| o.dialog()) {
+      dialog.paste(&text);
+      return;
+    }
+    // The other overlays are lists to look through, with nowhere to put text.
+    if self.overlay.is_some() {
+      return;
+    }
+    self.prompts.stop();
+    self.input.insert_str(&text);
+    self.completion_dismissed = false;
+    self.refresh_completion();
   }
 
   /// Keys consumed by the `/` popup. Returns false to let the key fall
