@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
+use ratatui::crossterm::event::{
+  self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
@@ -67,6 +69,45 @@ pub enum ScrollbarMode {
   Hidden,
 }
 const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
+
+/// Where the last draw left the scrollbar, so the mouse can find its thumb:
+/// ratatui draws one but does not say where it put it.
+#[derive(Clone, Copy)]
+struct Thumb {
+  /// The single column the whole scrollbar occupies, track included.
+  track: Rect,
+  /// Rows from the top of the track to the top of the thumb.
+  start: u16,
+  /// Rows the thumb covers.
+  len: u16,
+}
+
+/// Where ratatui's `Scrollbar` draws its thumb within a track of `track` rows:
+/// the rows from the top of the track to the top of the thumb, and the rows it
+/// covers. Mirrors the widget's own arithmetic, which it keeps to itself.
+fn thumb_bounds(track: u16, max_scroll: usize, viewport: usize, offset: usize) -> (u16, u16) {
+  // The widget rounds to nearest rather than truncating.
+  let divide = |n: usize, d: usize| (n + d / 2) / d;
+  let track = track as usize;
+  // The scrollbar is told `max_scroll` as its content length, and counts
+  // positions from the last one rather than from one past it.
+  let span = max_scroll.saturating_sub(1) + viewport;
+  if track == 0 || span == 0 {
+    return (0, track as u16);
+  }
+  let len = divide(viewport * track, span).clamp(1, track);
+  let start = divide(offset.min(max_scroll.saturating_sub(1)) * track, span).min(track - len);
+  (start as u16, len as u16)
+}
+
+/// The scroll offset that puts the top of the thumb `start` rows down its
+/// track — the inverse of [`thumb_bounds`], mapped so that both ends of the
+/// track reach both ends of the transcript.
+fn thumb_offset(start: isize, thumb: Thumb, max_scroll: usize) -> usize {
+  let travel = (thumb.track.height.saturating_sub(thumb.len) as isize).max(1);
+  let start = start.clamp(0, travel) as usize;
+  (start * max_scroll + travel as usize / 2) / travel as usize
+}
 
 /// Which session to open at startup.
 pub enum SessionStart {
@@ -389,6 +430,11 @@ pub struct App {
   anchor: Option<usize>,
   /// Offset and maximum offset used by the last draw, for relative scrolling.
   view: (usize, usize),
+  /// Where the last draw put the scrollbar thumb, if it drew one at all.
+  thumb: Option<Thumb>,
+  /// A thumb drag in flight, holding how far down the thumb it was grabbed so
+  /// the cursor keeps hold of the same row of it.
+  dragging: Option<u16>,
   /// Ctrl+T shows reasoning blocks in full instead of their last few lines.
   expand_thinking: bool,
   /// Ctrl+O shows tool output in full instead of the preview.
@@ -457,6 +503,8 @@ impl App {
       outcomes: HashMap::new(),
       anchor: None,
       view: (0, 0),
+      thumb: None,
+      dragging: None,
       expand_thinking: false,
       expand_tools: false,
       markdown: HashMap::new(),
@@ -538,6 +586,9 @@ impl App {
         match mouse.kind {
           MouseEventKind::ScrollUp => self.scroll_by(WHEEL_LINES as isize),
           MouseEventKind::ScrollDown => self.scroll_by(-(WHEEL_LINES as isize)),
+          MouseEventKind::Down(MouseButton::Left) => self.grab_thumb(mouse.column, mouse.row),
+          MouseEventKind::Drag(MouseButton::Left) => self.drag_thumb(mouse.row),
+          MouseEventKind::Up(MouseButton::Left) => self.dragging = None,
           _ => {}
         }
         return;
@@ -795,11 +846,42 @@ impl App {
 
   /// Scroll the transcript up (positive) or down (negative) by `lines`.
   fn scroll_by(&mut self, lines: isize) {
-    let (offset, max_scroll) = self.view;
-    let target = offset.saturating_add_signed(-lines);
+    self.scroll_to(self.view.0.saturating_add_signed(-lines));
+  }
+
+  /// Scroll the transcript to `target` lines from its top.
+  fn scroll_to(&mut self, target: usize) {
     // Reaching the bottom re-attaches to the live end of the transcript.
-    self.anchor = (target < max_scroll).then_some(target);
+    self.anchor = (target < self.view.1).then_some(target);
     self.last_scroll = Some(Instant::now());
+  }
+
+  /// A left press on the scrollbar. On the thumb it takes hold of it; on the
+  /// bare track it pulls the thumb to the cursor first, so either way what
+  /// follows is a drag.
+  fn grab_thumb(&mut self, column: u16, row: u16) {
+    let Some(thumb) = self.thumb else { return };
+    if column != thumb.track.x || !(thumb.track.y..thumb.track.bottom()).contains(&row) {
+      return;
+    }
+    let top = thumb.track.y + thumb.start;
+    if (top..top + thumb.len).contains(&row) {
+      self.dragging = Some(row - top);
+    } else {
+      self.dragging = Some(thumb.len / 2);
+      self.drag_thumb(row);
+    }
+  }
+
+  /// Follow the cursor with the thumb it is holding. The offset comes from
+  /// where the cursor is rather than how far it moved, so a drag that runs off
+  /// the end of the track and back finds the transcript where it left it.
+  fn drag_thumb(&mut self, row: u16) {
+    let (Some(thumb), Some(grab)) = (self.thumb, self.dragging) else {
+      return;
+    };
+    let top = row as isize - thumb.track.y as isize - grab as isize;
+    self.scroll_to(thumb_offset(top, thumb, self.view.1));
   }
 
   /// The `auto` scrollbar is showing and will need a redraw to disappear.
@@ -1458,6 +1540,7 @@ impl App {
       self.draw_completion(f, popup_area);
     }
 
+    self.thumb = None;
     if self.overlay.is_some() {
       self.draw_overlay(f, transcript_area);
     } else {
@@ -1511,6 +1594,17 @@ impl App {
       ScrollbarMode::Hidden => false,
     };
     if show_scrollbar {
+      // A scrollbar with nothing to scroll draws neither track nor thumb, so
+      // there is nothing for the mouse to take hold of either.
+      if max_scroll > 0 && transcript_area.width > 0 {
+        let track = Rect {
+          x: transcript_area.right() - 1,
+          width: 1,
+          ..transcript_area
+        };
+        let (start, len) = thumb_bounds(track.height, max_scroll, viewport, offset);
+        self.thumb = Some(Thumb { track, start, len });
+      }
       let mut state = ScrollbarState::new(max_scroll)
         .position(offset)
         .viewport_content_length(viewport);
@@ -2969,6 +3063,62 @@ fn shorten_home(path: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  /// The rows ratatui itself paints the thumb on, for [`thumb_bounds`] to be
+  /// held against.
+  fn drawn_thumb(track: u16, max_scroll: usize, viewport: usize, offset: usize) -> (u16, u16) {
+    use ratatui::buffer::Buffer;
+    use ratatui::widgets::StatefulWidget;
+
+    let area = Rect::new(0, 0, 1, track);
+    let mut buf = Buffer::empty(area);
+    let mut state = ScrollbarState::new(max_scroll)
+      .position(offset)
+      .viewport_content_length(viewport);
+    Scrollbar::new(ScrollbarOrientation::VerticalRight)
+      .begin_symbol(None)
+      .end_symbol(None)
+      .track_symbol(Some("│"))
+      .thumb_symbol("┃")
+      .render(area, &mut buf, &mut state);
+    let rows: Vec<u16> = (0..track).filter(|&y| buf[(0, y)].symbol() == "┃").collect();
+    (rows[0], rows.len() as u16)
+  }
+
+  #[test]
+  fn the_thumb_is_looked_for_where_ratatui_draws_it() {
+    for track in [3_u16, 10, 40] {
+      for max_scroll in [1_usize, 5, 200, 5000] {
+        for viewport in [track as usize, track as usize * 2] {
+          for offset in [0, 1, max_scroll / 3, max_scroll - 1, max_scroll] {
+            assert_eq!(
+              thumb_bounds(track, max_scroll, viewport, offset),
+              drawn_thumb(track, max_scroll, viewport, offset),
+              "track {track}, max_scroll {max_scroll}, viewport {viewport}, offset {offset}"
+            );
+          }
+        }
+      }
+    }
+  }
+
+  #[test]
+  fn dragging_the_thumb_to_either_end_of_its_track_reaches_either_end_of_the_transcript() {
+    let (max_scroll, viewport, track) = (500, 30, 30_u16);
+    let (start, len) = thumb_bounds(track, max_scroll, viewport, 0);
+    let thumb = Thumb {
+      track: Rect::new(79, 0, 1, track),
+      start,
+      len,
+    };
+    assert_eq!(thumb_offset(-4, thumb, max_scroll), 0);
+    assert_eq!(thumb_offset(i16::MAX.into(), thumb, max_scroll), max_scroll);
+    // Halfway down the track is halfway down the transcript, and the thumb
+    // ends up back under the cursor that put it there.
+    let travel = (track - len) as isize;
+    let middle = thumb_offset(travel / 2, thumb, max_scroll);
+    assert_eq!(thumb_bounds(track, max_scroll, viewport, middle).0, travel as u16 / 2);
+  }
 
   fn names(matches: &[Match]) -> Vec<&'static str> {
     matches.iter().map(|m| COMMANDS[m.index].0).collect()

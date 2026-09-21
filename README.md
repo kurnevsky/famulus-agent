@@ -572,6 +572,7 @@ what it spent.
 | `Esc` | Abort the current run |
 | `Esc` `Esc` | Open `/tree` (empty input, within half a second) |
 | `PageUp` / `PageDown`, mouse wheel | Scroll transcript |
+| Drag the scrollbar | Scroll transcript — clicking its track jumps there, and keeps hold |
 | `Ctrl+C` | Abort if running, otherwise quit |
 | `Ctrl+D` | Quit (empty input) |
 | `Ctrl+T` | Thinking in full, or only its last lines |
@@ -589,8 +590,8 @@ what it spent.
 
 \* in terminals that support the kitty keyboard protocol.
 
-Mouse capture is enabled for wheel scrolling, so selecting text with the
-mouse usually requires holding `Shift`.
+Mouse capture is enabled for the wheel and the scrollbar, so selecting text
+with the mouse usually requires holding `Shift`.
 
 ## Layout
 
