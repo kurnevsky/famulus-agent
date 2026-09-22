@@ -1066,7 +1066,7 @@ impl Tool for BashTool {
     // builder, which is what lets this see the end of the output at all.
     let mut merged = tokio::net::unix::pipe::Receiver::from_owned_fd(reads.into())?;
 
-    let mut output = OutputAccumulator::new("fa-bash");
+    let mut output = OutputAccumulator::new();
     let mut throttle = UpdateThrottle::new(ctx.get::<Output>().cloned());
     let far_future = tokio::time::Instant::now() + Duration::from_secs(365 * 24 * 3600);
     let mut deadline = timeout.map(|t| tokio::time::Instant::now() + t);
@@ -1086,7 +1086,7 @@ impl Tool for BashTool {
           r = merged.read(&mut buf), if open => match r {
               Ok(n) if n > 0 => {
                   output.append(&buf[..n]);
-                  throttle.maybe_emit(&mut output);
+                  throttle.maybe_emit(&output);
               }
               _ => open = false,
           },
@@ -1115,8 +1115,7 @@ impl Tool for BashTool {
       guard.disarm();
     }
 
-    let snapshot = output.finish();
-    let text = format_output(&snapshot, &output, if timed_out { "" } else { "(no output)" });
+    let text = output.render(if timed_out { "" } else { "(no output)" });
     if timed_out {
       let secs = args.timeout.unwrap_or_default();
       return Err(ToolError(append_status(
@@ -1190,13 +1189,13 @@ impl UpdateThrottle {
     Self { sink, last: None }
   }
 
-  fn maybe_emit(&mut self, output: &mut OutputAccumulator) {
+  fn maybe_emit(&mut self, output: &OutputAccumulator) {
     let Some(Output(sink)) = &self.sink else { return };
     if self.last.is_some_and(|t| t.elapsed() < UPDATE_THROTTLE) {
       return;
     }
     self.last = Some(Instant::now());
-    sink(output.snapshot(false).content);
+    sink(output.tail());
   }
 }
 
@@ -1206,25 +1205,9 @@ enum TruncatedBy {
   Bytes,
 }
 
-struct Truncation {
-  truncated: bool,
-  truncated_by: Option<TruncatedBy>,
-  total_lines: usize,
-  output_lines: usize,
-  output_bytes: usize,
-  last_line_partial: bool,
-}
-
-struct Snapshot {
-  content: String,
-  truncation: Truncation,
-  full_output_path: Option<PathBuf>,
-}
-
 /// Streams command output, keeping only a rolling tail in memory and spilling
 /// the complete output to a temp file once it exceeds the model-facing limits.
 struct OutputAccumulator {
-  prefix: &'static str,
   tail: Vec<u8>,
   tail_starts_at_line_boundary: bool,
   total_bytes: usize,
@@ -1238,9 +1221,8 @@ struct OutputAccumulator {
 impl OutputAccumulator {
   const MAX_ROLLING_BYTES: usize = MAX_BYTES * 2;
 
-  fn new(prefix: &'static str) -> Self {
+  fn new() -> Self {
     Self {
-      prefix,
       tail: Vec::new(),
       tail_starts_at_line_boundary: true,
       total_bytes: 0,
@@ -1298,7 +1280,7 @@ impl OutputAccumulator {
     if self.temp.is_some() {
       return;
     }
-    let path = temp_path(self.prefix);
+    let path = temp_path("fa-bash");
     if let Ok(mut file) = std::fs::File::create(&path) {
       let _ = file.write_all(&self.pending);
       self.pending = Vec::new();
@@ -1317,39 +1299,51 @@ impl OutputAccumulator {
     }
   }
 
-  fn snapshot(&mut self, persist_if_truncated: bool) -> Snapshot {
-    let (content, tail_by, output_lines, output_bytes, last_line_partial) = truncate_tail(&self.visible_tail());
-    let truncated = self.exceeds_limits();
-    let truncated_by = truncated.then(|| {
-      tail_by.unwrap_or(if self.total_bytes > MAX_BYTES {
-        TruncatedBy::Bytes
-      } else {
-        TruncatedBy::Lines
-      })
-    });
-    if persist_if_truncated && truncated {
-      self.ensure_temp_file();
-    }
-    Snapshot {
-      content,
-      truncation: Truncation {
-        truncated,
-        truncated_by,
-        total_lines: self.total_lines(),
-        output_lines,
-        output_bytes,
-        last_line_partial,
-      },
-      full_output_path: self.temp.as_ref().map(|(p, _)| p.clone()),
-    }
+  /// The end of the output as it stands, for showing while it runs.
+  fn tail(&self) -> String {
+    truncate_tail(&self.visible_tail()).0
   }
 
-  fn finish(&mut self) -> Snapshot {
-    let snapshot = self.snapshot(true);
-    if let Some((_, file)) = &mut self.temp {
-      let _ = file.flush();
+  /// Model-facing rendering: the tail, then a note on what was cut and where
+  /// the full output lives.
+  fn render(&self, empty_text: &str) -> String {
+    let (content, by, output_lines, output_bytes, partial) = truncate_tail(&self.visible_tail());
+    let mut text = if content.is_empty() {
+      empty_text.to_string()
+    } else {
+      content
+    };
+    if !self.exceeds_limits() {
+      return text;
     }
-    snapshot
+    let path = self
+      .temp
+      .as_ref()
+      .map_or_else(|| "(unavailable)".to_string(), |(p, _)| p.display().to_string());
+    let total_lines = self.total_lines();
+    let start_line = total_lines - output_lines + 1;
+    let by = by.unwrap_or(if self.total_bytes > MAX_BYTES {
+      TruncatedBy::Bytes
+    } else {
+      TruncatedBy::Lines
+    });
+    if partial {
+      text.push_str(&format!(
+        "\n\n[Showing last {} of line {total_lines} (line is {}). Full output: {path}]",
+        format_size(output_bytes),
+        format_size(self.current_line_bytes)
+      ));
+    } else if by == TruncatedBy::Lines {
+      text.push_str(&format!(
+        "\n\n[Showing lines {start_line}-{total_lines} of {total_lines}. Full output: {path}]"
+      ));
+    } else {
+      text.push_str(&format!(
+        "\n\n[Showing lines {start_line}-{total_lines} of {total_lines} ({} limit). Full output: {path}]",
+        format_size(MAX_BYTES)
+      ));
+    }
+    text
   }
 }
 
@@ -1410,44 +1404,6 @@ fn format_size(bytes: usize) -> String {
   } else {
     format!("{:.1}MB", bytes as f64 / (1024.0 * 1024.0))
   }
-}
-
-/// Model-facing rendering: the tail, then a note on what was cut and where
-/// the full output lives.
-fn format_output(snapshot: &Snapshot, output: &OutputAccumulator, empty_text: &str) -> String {
-  let t = &snapshot.truncation;
-  let mut text = if snapshot.content.is_empty() {
-    empty_text.to_string()
-  } else {
-    snapshot.content.clone()
-  };
-  if t.truncated {
-    let path = snapshot
-      .full_output_path
-      .as_ref()
-      .map_or_else(|| "(unavailable)".to_string(), |p| p.display().to_string());
-    let start_line = t.total_lines - t.output_lines + 1;
-    let end_line = t.total_lines;
-    if t.last_line_partial {
-      text.push_str(&format!(
-        "\n\n[Showing last {} of line {end_line} (line is {}). Full output: {path}]",
-        format_size(t.output_bytes),
-        format_size(output.current_line_bytes)
-      ));
-    } else if t.truncated_by == Some(TruncatedBy::Lines) {
-      text.push_str(&format!(
-        "\n\n[Showing lines {start_line}-{end_line} of {}. Full output: {path}]",
-        t.total_lines
-      ));
-    } else {
-      text.push_str(&format!(
-        "\n\n[Showing lines {start_line}-{end_line} of {} ({} limit). Full output: {path}]",
-        t.total_lines,
-        format_size(MAX_BYTES)
-      ));
-    }
-  }
-  text
 }
 
 #[cfg(test)]
