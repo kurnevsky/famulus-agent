@@ -469,14 +469,14 @@ Stopping there would leave a call with no result behind it, which is a
 transcript no provider will accept — the tool results that answer it are the
 point just after, and the message before it the point just before.
 
-Nothing is deleted. Going back moves where the conversation ends; what it said
+Going back deletes nothing. It moves where the conversation ends; what it said
 down the path you left stays as a branch of its own, and the list shows it —
 indented under the point the two ways part, with the path you are on first. So
 you can go back, try something else, and later walk into the answer you
 abandoned:
 
 ```
-╭ Tree — ↑↓ PgUp/PgDn select · Enter go there · Esc cancel ──────────────────╮
+╭ Tree — ↑↓ PgUp/PgDn select · Enter go there · Ctrl+D delete · Esc cancel ──╮
 │  ❯ what does main.rs do?                                       0 messages  │
 │  ⚙ read                                                        3 messages  │
 │›   Actually it prints hi and exits 0.                                here  │
@@ -498,6 +498,13 @@ into the box under the list, which is the box a prompt is typed in and is
 edited with the same keys, and `Enter` goes to the row the filter left under
 the cursor.
 
+A branch you are done with is deleted from the list the way a session is from
+the picker: `Ctrl+D` on a row asks, and a second `Ctrl+D` removes that point and
+everything said after it. A tool call goes with the results that answer it,
+since on its own it is not something a conversation can hold. The conversation
+on screen is not one it will remove, since the next turn is written under its
+end, so to delete a point on it, go somewhere else first.
+
 `/fork` is the same list narrowed to your prompts, and it branches into a file
 instead of within one: the conversation up to that point is carried into a
 **new session**, the prompt goes back in the input box, and the session you
@@ -511,9 +518,12 @@ draws them.
 There is no branch summary — going back is a plain move, with nothing
 summarized and nothing lost.
 
-The session file stays append-only and is a tree rather than a list: every
+The session file is append-only and is a tree rather than a list: every
 message record names itself and its parent, going back writes the entry the
 conversation moved to, and replaying the file rebuilds the same branches.
+Deleting a branch is the one exception. It rewrites the file without the
+branch's entries, because an entry that was only marked as gone would still be
+there to read.
 
 ## Watching a tool call being written
 
@@ -767,7 +777,7 @@ what it spent.
 | `/model` | Pick the model from what the provider offers, asked for afresh each time — type to filter, or `/model <id>` to name one outright |
 | `/new` | Start a new session |
 | `/resume` | Pick a saved session to resume — type to filter, `Ctrl+D` removes the selected one, a second `Ctrl+D` confirms |
-| `/tree` | Move to another point in this session, on any branch — type to filter |
+| `/tree` | Move to another point in this session, on any branch — type to filter, `Ctrl+D` deletes the selected branch, a second `Ctrl+D` confirms |
 | `/fork` | Branch a new session from an earlier prompt — type to filter |
 | `/name <name>` | Name the current session |
 | `/session` | Show session id, file, and stats |

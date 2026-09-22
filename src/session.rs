@@ -1,6 +1,7 @@
 //! Session persistence: every conversation is an
 //! append-only JSONL file in one global directory, created lazily on the first
-//! persisted message, and resumable later.
+//! persisted message, and resumable later. Deleting a branch is the one thing
+//! that rewrites a file rather than adding to it.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -10,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local};
 use rig_core::completion::Message;
-use rig_core::message::{ToolResult, UserContent};
+use rig_core::message::{AssistantContent, ToolResult, UserContent};
 use serde::{Deserialize, Serialize};
 
 use crate::compaction;
@@ -321,6 +322,34 @@ fn call_ids(message: &Message) -> impl Iterator<Item = String> + '_ {
       _ => None,
     })
     .flat_map(result_ids)
+}
+
+/// Write the session file at `path` again without the entries in `gone`, and
+/// without the moves to them.
+///
+/// The lines that stay are copied as they are rather than written anew, so
+/// nothing but the removal changes. The copy is made beside the file and moved
+/// over it, so a failure part-way leaves the file as it was.
+///
+/// The replayed leaf comes out the same: it is set by the last message or move
+/// in the file, and one of those that is dropped named an entry in `gone`,
+/// which the session is not on.
+fn rewrite_without(path: &Path, gone: &HashSet<String>) -> Result<()> {
+  let text = std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
+  let mut kept = String::with_capacity(text.len());
+  for line in text.lines() {
+    let id = match serde_json::from_str::<Record>(line) {
+      Ok(Record::Message { id, .. } | Record::Compaction { id, .. } | Record::Leaf { id: Some(id) }) => Some(id),
+      _ => None,
+    };
+    if id.is_none_or(|id| !gone.contains(&id)) {
+      kept.push_str(line);
+      kept.push('\n');
+    }
+  }
+  let temp = path.with_extension("jsonl.tmp");
+  std::fs::write(&temp, kept).with_context(|| format!("cannot write {}", temp.display()))?;
+  std::fs::rename(&temp, path).with_context(|| format!("cannot replace {}", path.display()))
 }
 
 /// The compaction checkpoint as it travels in a history: a user message
@@ -681,6 +710,69 @@ impl Session {
     self.write_all(&[Record::Leaf { id: leaf }])
   }
 
+  /// Remove the entry `id` and everything under it, answering how many
+  /// entries went.
+  ///
+  /// This is the one thing that takes an entry out of the file rather than
+  /// adding to it, so it is the one thing written by rewriting the file: an
+  /// entry that is only marked as gone would still be there to read. The
+  /// conversation the session is on is not something it removes — the next
+  /// turn would be written under an entry that is no longer there — so going
+  /// somewhere else comes first.
+  ///
+  /// An assistant turn that called tools and has nothing under it but the
+  /// entry being removed goes with it: with its results gone it is a call no
+  /// provider will accept an answer to, and it is no place to stop either.
+  pub fn delete_branch(&mut self, id: &str) -> Result<usize> {
+    let mut root = self.node(id).with_context(|| format!("no entry {id}"))?;
+    while let Some(parent) = root.parent.as_deref().and_then(|p| self.node(p)) {
+      let calls = matches!(&parent.kind, NodeKind::Message(Message::Assistant { content, .. })
+        if content.iter().any(|c| matches!(c, AssistantContent::ToolCall(_))));
+      let alone = self
+        .nodes
+        .iter()
+        .filter(|n| n.parent.as_deref() == Some(&parent.id))
+        .count()
+        == 1;
+      if !calls || !alone {
+        break;
+      }
+      root = parent;
+    }
+    let root = root.id.clone();
+    if self.lineage(self.leaf(), true).contains(&root.as_str()) {
+      bail!("entry {root} is on the conversation the session is on");
+    }
+    // Everything under the root, found by sweeping the entries until a sweep
+    // adds nothing: a child is written after its parent, so it is usually one.
+    let mut gone: HashSet<String> = HashSet::from([root]);
+    loop {
+      let before = gone.len();
+      for node in &self.nodes {
+        if node.parent.as_ref().is_some_and(|p| gone.contains(p)) {
+          gone.insert(node.id.clone());
+        }
+      }
+      if gone.len() == before {
+        break;
+      }
+    }
+    if let Some((path, _)) = &self.file {
+      rewrite_without(path, &gone)?;
+      let file = OpenOptions::new().append(true).open(path)?;
+      self.file = Some((path.clone(), file));
+    }
+    for node in self.nodes.iter().filter(|node| gone.contains(&node.id)) {
+      if let NodeKind::Message(message) = &node.kind {
+        for call in call_ids(message) {
+          self.outcomes.remove(&call);
+        }
+      }
+    }
+    self.nodes.retain(|node| !gone.contains(&node.id));
+    Ok(gone.len())
+  }
+
   /// A new session carrying the conversation that ends at `leaf`.
   ///
   /// Where `go_to` branches inside this file, this starts another one: this
@@ -914,6 +1006,58 @@ mod tests {
     assert!(session.history.is_empty());
     assert_eq!(Session::load(&path).unwrap().nodes().len(), 3);
     std::fs::remove_dir_all(&store.dir).unwrap();
+  }
+
+  #[test]
+  fn deleting_a_branch_takes_it_out_of_the_file_and_leaves_the_rest() {
+    let store = temp_store("delete-branch");
+    let mut session = Session::new(Some(&store), Path::new("/work"), "mock");
+    session.append(vec![Message::user("first")]).unwrap();
+    let prompt = session.leaf().unwrap().to_string();
+    session.append(vec![Message::assistant("one")]).unwrap();
+    let left = session.leaf().unwrap().to_string();
+    session.go_to(Some(prompt.clone())).unwrap();
+    session.append(vec![Message::assistant("two")]).unwrap();
+    let path = session.path().unwrap().to_path_buf();
+
+    // The path the session is on is not something to remove.
+    assert!(session.delete_branch(&prompt).is_err());
+    assert_eq!(session.nodes().len(), 3);
+
+    // The one it left is, and the file no longer holds it — the move to it
+    // included.
+    assert_eq!(session.delete_branch(&left).unwrap(), 1);
+    assert_eq!(session.nodes().len(), 2);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("\"one\""), "{text}");
+    let loaded = Session::load(&path).unwrap();
+    assert_eq!(loaded.nodes().len(), 2);
+    assert_eq!(loaded.leaf(), session.leaf());
+    assert_eq!(loaded.history, [Message::user("first"), Message::assistant("two")]);
+
+    // And the file is still the one being appended to.
+    session.append(vec![Message::user("again")]).unwrap();
+    assert_eq!(Session::load(&path).unwrap().nodes().len(), 3);
+    std::fs::remove_dir_all(&store.dir).unwrap();
+  }
+
+  #[test]
+  fn deleting_a_tool_result_takes_the_call_it_answers_along() {
+    let mut session = Session::new(None, Path::new("/work"), "mock");
+    session.append(vec![Message::user("look")]).unwrap();
+    let prompt = session.leaf().unwrap().to_string();
+    let call = Message::Assistant {
+      id: None,
+      content: vec![AssistantContent::tool_call("1", "read", serde_json::json!({}))],
+    };
+    session.append(vec![call, tool_result("1", "fn main() {}")]).unwrap();
+    let result = session.leaf().unwrap().to_string();
+    session.go_to(Some(prompt)).unwrap();
+    session.append(vec![Message::assistant("no need")]).unwrap();
+
+    // With its result gone the call would answer nothing, so it goes too.
+    assert_eq!(session.delete_branch(&result).unwrap(), 2);
+    assert_eq!(session.nodes().len(), 2);
   }
 
   #[test]

@@ -1946,6 +1946,80 @@ fn typing_at_the_tree_narrows_it_to_what_was_typed() {
   assert_eq!(term.typed(), "pear", "the filtered-to prompt comes back");
 }
 
+/// A branch left behind can be deleted from the tree the way a session is
+/// from the picker: `Ctrl+D` asks, a second one removes it from the file. The
+/// conversation on screen is not one it will take out from under itself.
+#[test]
+fn the_tree_deletes_a_branch_once_it_has_asked_about_it() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![Turn::Echo]);
+  let term = asked_twice("tree-delete", &provider, &[]);
+  // Back under the second prompt and a different one asked, which leaves
+  // `pear` and its answer a branch of their own.
+  term.submit("/tree");
+  term.wait_for("Esc cancel");
+  term.choose("❯ pear");
+  term.wait_for("Moved to 2 messages.");
+  for _ in 0..4 {
+    term.type_in("BSpace");
+  }
+  term.submit("plum");
+  term.wait_for("Answer to plum.");
+
+  // Where the session is stays put, asked or not.
+  term.submit("/tree");
+  term.wait_for("Esc cancel");
+  term.point_at("Answer to plum.");
+  term.type_in("C-d");
+  term.wait_for("delete? Ctrl+D to confirm");
+  term.type_in("C-d");
+  term.settle();
+  let (rows, _) = term.overlay();
+  assert!(
+    rows.iter().any(|row| row.contains("Answer to plum.")),
+    "the conversation on screen stays: {rows:?}"
+  );
+
+  // Anything else answers no.
+  term.point_at("❯ pear");
+  term.type_in("C-d");
+  term.wait_for("delete? Ctrl+D to confirm");
+  term.type_in("Escape");
+  term.settle();
+  let (rows, _) = term.overlay();
+  assert!(
+    rows.iter().any(|row| row.contains("pear")),
+    "nothing is deleted: {rows:?}"
+  );
+
+  // The branch is the prompt and everything after it.
+  term.type_in("C-d");
+  term.wait_for("delete? Ctrl+D to confirm");
+  term.type_in("C-d");
+  term.settle();
+  let (rows, _) = term.overlay();
+  assert!(
+    !rows.iter().any(|row| row.contains("pear")),
+    "the prompt and its answer go together: {rows:?}"
+  );
+  assert!(
+    rows.iter().any(|row| row.contains("Answer to plum.")),
+    "and the rest stays: {rows:?}"
+  );
+  let session = term.session_file();
+  assert!(!session.contains("pear"), "the file forgets it too:\n{session}");
+  assert!(session.contains("plum"));
+
+  term.type_in("Escape");
+  let screen = term.wait_for("Deleted ❯ pear, 2 messages in all.");
+  assert!(
+    screen.contains("go somewhere else before deleting it"),
+    "why the conversation on screen was kept:\n{screen}"
+  );
+}
+
 #[test]
 fn forking_starts_a_session_of_its_own_and_leaves_the_first_alone() {
   if !have_tmux() {

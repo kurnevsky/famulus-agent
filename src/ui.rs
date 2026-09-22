@@ -244,6 +244,10 @@ struct Overlay {
   /// What the list is narrowed by. Every list has one; the questionnaire,
   /// which is not a list, does not.
   filter: Option<Filter>,
+  /// `Ctrl+D` has been pressed on the selected row and the deletion is
+  /// waiting to be confirmed. What either list deletes is gone for good, so
+  /// it is asked about first.
+  confirming: bool,
 }
 
 /// The query a list is being narrowed by, and what it leaves.
@@ -288,13 +292,7 @@ impl Filter {
 
 enum OverlayList {
   /// `/resume`: every saved session, most recent first.
-  Sessions {
-    sessions: Vec<SessionInfo>,
-    /// `Ctrl+D` has been pressed on the selected row and the deletion is
-    /// waiting to be confirmed. A session file is gone for good, so it is
-    /// asked about first.
-    confirming: bool,
-  },
+  Sessions(Vec<SessionInfo>),
   /// `/tree`: every point this session can go back to, oldest first.
   Tree(Vec<Point>),
   /// `/fork`: the prompts, to start a new session from one of them.
@@ -314,6 +312,8 @@ enum OverlayList {
 
 /// A point the conversation can be moved to.
 struct Point {
+  /// The entry the row stands for, which is what deleting it removes.
+  id: String,
   /// Where the conversation would end after going there; `None` is before the
   /// first message.
   leaf: Option<String>,
@@ -334,7 +334,7 @@ impl Overlay {
   /// A list the filter has yet to touch, at the row `selected`.
   fn new(list: OverlayList, selected: usize) -> Self {
     let len = match &list {
-      OverlayList::Sessions { sessions, .. } => sessions.len(),
+      OverlayList::Sessions(sessions) => sessions.len(),
       OverlayList::Tree(points) | OverlayList::Fork(points) => points.len(),
       OverlayList::Models(models) => models.len(),
       OverlayList::Question { .. } => 0,
@@ -343,6 +343,7 @@ impl Overlay {
       list,
       selected,
       filter: Some(Filter::new(len)),
+      confirming: false,
     }
   }
 
@@ -370,7 +371,7 @@ impl Overlay {
     let Some(filter) = filter else { return };
     let query = &filter.query();
     filter.shown = match list {
-      OverlayList::Sessions { sessions, .. } => filter_sessions(matcher, sessions, query),
+      OverlayList::Sessions(sessions) => filter_sessions(matcher, sessions, query),
       OverlayList::Tree(points) => filter_points(matcher, points, query),
       // The fork list draws its prompts flat, so that is what is matched:
       // what is picked out has to sit under what was typed.
@@ -384,12 +385,13 @@ impl Overlay {
     match &self.list {
       // A deletion waiting to be confirmed says so where the keys are said,
       // since the keys it is waiting for are not the usual ones.
-      OverlayList::Sessions { confirming: true, .. } => " Delete session? — Ctrl+D confirm · Esc cancel ".into(),
+      OverlayList::Sessions(_) if self.confirming => " Delete session? — Ctrl+D confirm · Esc cancel ".into(),
+      OverlayList::Tree(_) if self.confirming => " Delete branch? — Ctrl+D confirm · Esc cancel ".into(),
       // What narrows the list is said by the box the query is typed in,
       // which is on screen under the list saying it. What is left to say up
       // here is what the keys the box does not take do.
-      OverlayList::Sessions { .. } => " Resume — ↑↓ select · Enter resume · Ctrl+D delete · Esc cancel ".into(),
-      OverlayList::Tree(_) => " Tree — ↑↓ PgUp/PgDn select · Enter go there · Esc cancel ".into(),
+      OverlayList::Sessions(_) => " Resume — ↑↓ select · Enter resume · Ctrl+D delete · Esc cancel ".into(),
+      OverlayList::Tree(_) => " Tree — ↑↓ PgUp/PgDn select · Enter go there · Ctrl+D delete · Esc cancel ".into(),
       OverlayList::Fork(_) => " Fork — ↑↓ PgUp/PgDn select · Enter fork · Esc cancel ".into(),
       OverlayList::Models(_) => " Model — ↑↓ select · Enter use · Esc cancel ".into(),
       // The dialog says which keys do what along its own bottom, where the
@@ -1225,7 +1227,7 @@ impl App {
           return;
         };
         match overlay.list {
-          OverlayList::Sessions { sessions, .. } => {
+          OverlayList::Sessions(sessions) => {
             if let Some(info) = sessions.get(at) {
               self.load_session(&info.path.clone());
             }
@@ -1286,15 +1288,21 @@ impl App {
     let Some(overlay) = &mut self.overlay else {
       return false;
     };
-    let OverlayList::Sessions { confirming, .. } = &mut overlay.list else {
+    if !matches!(overlay.list, OverlayList::Sessions(_) | OverlayList::Tree(_)) {
       return false;
-    };
+    }
     let asked = ctrl && code == KeyCode::Char('d');
-    match (asked, *confirming) {
-      (true, false) => *confirming = true,
-      (true, true) => self.delete_selected(),
+    match (asked, overlay.confirming) {
+      (true, false) => overlay.confirming = overlay.at().is_some(),
+      (true, true) => {
+        overlay.confirming = false;
+        match overlay.list {
+          OverlayList::Tree(_) => self.delete_point(),
+          _ => self.delete_session(),
+        }
+      }
       (false, true) => {
-        *confirming = false;
+        overlay.confirming = false;
         return code == KeyCode::Esc;
       }
       _ => return false,
@@ -1303,15 +1311,14 @@ impl App {
   }
 
   /// Delete the session the picker is on, and take its row out of the list.
-  fn delete_selected(&mut self) {
+  fn delete_session(&mut self) {
     let Some(overlay) = &mut self.overlay else {
       return;
     };
     let at = overlay.at();
-    let OverlayList::Sessions { sessions, confirming } = &mut overlay.list else {
+    let OverlayList::Sessions(sessions) = &mut overlay.list else {
       return;
     };
-    *confirming = false;
     let Some(at) = at else {
       return;
     };
@@ -1343,6 +1350,52 @@ impl App {
     overlay.selected = overlay.selected.min(overlay.len().saturating_sub(1));
     self.entries.push(Entry::Info(format!("Deleted session {title}.")));
     // Nothing left to pick from is nothing to keep a picker open for.
+    if emptied {
+      self.overlay = None;
+    }
+  }
+
+  /// Delete the branch the tree is on — the entry under the cursor and
+  /// everything said after it — and draw the tree again without it.
+  fn delete_point(&mut self) {
+    let Some(overlay) = &mut self.overlay else {
+      return;
+    };
+    let at = overlay.at();
+    let OverlayList::Tree(rows) = &overlay.list else {
+      return;
+    };
+    let Some(point) = at.and_then(|at| rows.get(at)) else {
+      return;
+    };
+    let (id, label) = (point.id.clone(), point.label.clone());
+    // The next turn is written under the end of the conversation on screen,
+    // so that is not something to take out from under it.
+    if self.session.lineage(self.session.leaf(), true).contains(&id.as_str()) {
+      self.entries.push(Entry::Info(
+        "That is on the conversation you are in — go somewhere else before deleting it.".into(),
+      ));
+      return;
+    }
+    let gone = match self.session.delete_branch(&id) {
+      Ok(gone) => gone,
+      Err(err) => {
+        self
+          .entries
+          .push(Entry::Error(format!("Could not delete branch: {err:#}")));
+        return;
+      }
+    };
+    // The rows past it have moved and the indents where it branched off
+    // have changed, so the tree is worked out again rather than patched up.
+    let rows = points(&self.session);
+    let emptied = rows.is_empty();
+    overlay.list = OverlayList::Tree(rows);
+    overlay.refilter(&mut self.matcher);
+    overlay.selected = overlay.selected.min(overlay.len().saturating_sub(1));
+    self
+      .entries
+      .push(Entry::Info(format!("Deleted {label}, {} in all.", messages(gone))));
     if emptied {
       self.overlay = None;
     }
@@ -1855,13 +1908,7 @@ impl App {
       self.entries.push(Entry::Info("No saved sessions.".into()));
       return;
     }
-    self.overlay = Some(Overlay::new(
-      OverlayList::Sessions {
-        sessions,
-        confirming: false,
-      },
-      0,
-    ));
+    self.overlay = Some(Overlay::new(OverlayList::Sessions(sessions), 0));
   }
 
   /// List where the conversation can go, with where it is now selected.
@@ -2212,6 +2259,7 @@ impl App {
           // A questionnaire is answered rather than looked through, and it
           // takes the keyboard whole — there is nothing here to narrow.
           filter: None,
+          confirming: false,
         });
       }
       AgentEvent::Error(err) => {
@@ -2559,7 +2607,7 @@ impl App {
     // directory with nothing saved in it.
     let emptied = shown.is_empty().then_some(match &overlay.list {
       OverlayList::Models(_) => "  No model matches.",
-      OverlayList::Sessions { .. } => "  No session matches.",
+      OverlayList::Sessions(_) => "  No session matches.",
       _ => "  No point matches.",
     });
     if let Some(text) = emptied {
@@ -2573,14 +2621,14 @@ impl App {
     // Each row is a title and a dim note about it, the title clipped so the
     // note always fits.
     let rows: Vec<(String, String)> = match &overlay.list {
-      OverlayList::Sessions { sessions, confirming } => shown
+      OverlayList::Sessions(sessions) => shown
         .iter()
         .filter_map(|(at, _)| sessions.get(*at))
         .enumerate()
         .map(|(i, s)| {
           // The row being asked about says what it is being asked, where it
           // otherwise says what it is.
-          let note = match *confirming && i == overlay.selected {
+          let note = match overlay.confirming && i == overlay.selected {
             true => "delete? Ctrl+D to confirm".to_string(),
             false => format!(
               "{}  {} msgs  {}",
@@ -2598,10 +2646,12 @@ impl App {
       OverlayList::Tree(points) => shown
         .iter()
         .filter_map(|(at, _)| points.get(*at))
-        .map(|p| {
-          let note = match p.here {
-            true => "here".to_string(),
-            false => messages(p.len),
+        .enumerate()
+        .map(|(i, p)| {
+          let note = match (overlay.confirming && i == overlay.selected, p.here) {
+            (true, _) => "delete? Ctrl+D to confirm".to_string(),
+            (false, true) => "here".to_string(),
+            (false, false) => messages(p.len),
           };
           (point_label(p), note)
         })
@@ -4244,6 +4294,7 @@ fn point(session: &Session, node: &Node, depth: usize) -> Option<Point> {
     Kind::ToolCalls => return None,
   };
   Some(Point {
+    id: node.id.clone(),
     // Where the session already stands, and selecting it would do nothing.
     // The prompt that was answered here ends the conversation in the same
     // place, but hands itself back to be asked again, which is not nothing.
@@ -4725,6 +4776,7 @@ mod tests {
   fn the_point_filter_matches_the_rows_the_tree_is_drawn_as() {
     let mut matcher = Matcher::new(Config::DEFAULT);
     let point = |label: &str, depth: usize| Point {
+      id: "n".into(),
       leaf: Some("n".into()),
       text: None,
       label: label.into(),
