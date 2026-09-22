@@ -380,54 +380,73 @@ impl Summarizer {
   }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Which API to speak. The names are the `--provider` values, and what the
+/// provider is called on screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Provider {
-  /// OpenAI Chat Completions and compatible servers.
+  /// OpenAI Chat Completions and compatible servers
+  #[value(name = "openai")]
   OpenAi,
-  /// OpenRouter (chat completions, with its own key and model names).
+  /// OpenRouter
+  #[value(name = "openrouter")]
   OpenRouter,
-  /// Ollama's own API, on `http://localhost:11434` unless told otherwise.
+  /// Ollama, on http://localhost:11434 by default
   Ollama,
-  /// Google Gemini (generateContent API).
+  /// Google Gemini
   Gemini,
-  /// Anthropic's Messages API.
+  /// Anthropic
   Anthropic,
+  /// Cohere
   Cohere,
+  /// DeepSeek
+  #[value(name = "deepseek")]
   DeepSeek,
+  /// Doubleword
   Doubleword,
+  /// Groq
   Groq,
+  /// Hyperbolic
   Hyperbolic,
-  /// A llamafile server, on `http://localhost:8080` unless told otherwise.
+  /// A llamafile server, on http://localhost:8080 by default
   Llamafile,
+  /// Mira
   Mira,
+  /// Mistral
   Mistral,
+  /// Perplexity
   Perplexity,
+  /// Together AI
   Together,
+  /// Venice
   Venice,
+  /// xAI
+  #[value(name = "xai")]
   XAi,
 }
 
 impl Provider {
-  /// What this provider is called on screen, and in the session file.
-  pub fn label(self) -> &'static str {
+  /// What this provider is called on screen: its `--provider` value.
+  pub fn label(self) -> String {
+    clap::ValueEnum::to_possible_value(&self)
+      .expect("no provider is skipped")
+      .get_name()
+      .to_string()
+  }
+
+  /// The environment variable the key is read from when `--api-key` is not
+  /// given.
+  pub fn key_env(self) -> String {
+    format!("{}_API_KEY", self.label().to_uppercase())
+  }
+
+  /// The key to use when none is given. Ollama and llamafile want no key at
+  /// all — rig leaves the header off for an empty one, which is what a local
+  /// server expects — while a hosted endpoint that ignores auth is happy with
+  /// anything.
+  pub fn no_key(self) -> &'static str {
     match self {
-      Self::OpenAi => "openai",
-      Self::OpenRouter => "openrouter",
-      Self::Ollama => "ollama",
-      Self::Gemini => "gemini",
-      Self::Anthropic => "anthropic",
-      Self::Cohere => "cohere",
-      Self::DeepSeek => "deepseek",
-      Self::Doubleword => "doubleword",
-      Self::Groq => "groq",
-      Self::Hyperbolic => "hyperbolic",
-      Self::Llamafile => "llamafile",
-      Self::Mira => "mira",
-      Self::Mistral => "mistral",
-      Self::Perplexity => "perplexity",
-      Self::Together => "together",
-      Self::Venice => "venice",
-      Self::XAi => "xai",
+      Self::Ollama | Self::Llamafile => "",
+      _ => "none",
     }
   }
 }

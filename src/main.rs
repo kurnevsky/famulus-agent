@@ -16,7 +16,7 @@ use std::io::stdout;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use ratatui::crossterm::event::{
   DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, KeyboardEnhancementFlags,
   PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -31,8 +31,8 @@ use tokio::sync::mpsc;
 #[command(name = "fa", version)]
 struct Cli {
   /// API flavour to speak
-  #[arg(long, env = "FA_PROVIDER", value_enum, default_value_t = ProviderArg::Openai)]
-  provider: ProviderArg,
+  #[arg(long, env = "FA_PROVIDER", value_enum, default_value_t = agent::Provider::OpenAi)]
+  provider: agent::Provider,
 
   /// Endpoint root, e.g. http://localhost:8080/v1 for an OpenAI-compatible
   /// server. Defaults to the provider's public API.
@@ -134,107 +134,15 @@ struct Cli {
   no_tools: Vec<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum ProviderArg {
-  /// OpenAI Chat Completions and compatible servers
-  Openai,
-  /// OpenRouter
-  Openrouter,
-  /// Ollama, on http://localhost:11434 by default
-  Ollama,
-  /// Google Gemini
-  Gemini,
-  /// Anthropic
-  Anthropic,
-  /// Cohere
-  Cohere,
-  /// DeepSeek
-  Deepseek,
-  /// Doubleword
-  Doubleword,
-  /// Groq
-  Groq,
-  /// Hyperbolic
-  Hyperbolic,
-  /// A llamafile server, on http://localhost:8080 by default
-  Llamafile,
-  /// Mira
-  Mira,
-  /// Mistral
-  Mistral,
-  /// Perplexity
-  Perplexity,
-  /// Together AI
-  Together,
-  /// Venice
-  Venice,
-  /// xAI
-  Xai,
-}
-
-/// Which provider an argument names, which variable its key is read from,
-/// and what key to use when neither the flag nor that variable says.
-struct Wire {
-  provider: agent::Provider,
-  /// `None` for llamafile, whose client takes no key at all, so there is no
-  /// variable worth reading.
-  key_env: Option<&'static str>,
-  /// Ollama and llamafile want no key at all — rig leaves the header off for
-  /// an empty one, which is what a local server expects — while a hosted
-  /// endpoint that ignores auth is happy with anything.
-  no_key: &'static str,
-}
-
-impl ProviderArg {
-  fn wire(self) -> Wire {
-    use agent::Provider as P;
-    let hosted = |provider, key_env| Wire {
-      provider,
-      key_env: Some(key_env),
-      no_key: "none",
-    };
-    let local = |provider, key_env| Wire {
-      provider,
-      key_env,
-      no_key: "",
-    };
-    match self {
-      Self::Openai => hosted(P::OpenAi, "OPENAI_API_KEY"),
-      Self::Openrouter => hosted(P::OpenRouter, "OPENROUTER_API_KEY"),
-      Self::Ollama => local(P::Ollama, Some("OLLAMA_API_KEY")),
-      Self::Gemini => hosted(P::Gemini, "GEMINI_API_KEY"),
-      Self::Anthropic => hosted(P::Anthropic, "ANTHROPIC_API_KEY"),
-      Self::Cohere => hosted(P::Cohere, "COHERE_API_KEY"),
-      Self::Deepseek => hosted(P::DeepSeek, "DEEPSEEK_API_KEY"),
-      Self::Doubleword => hosted(P::Doubleword, "DOUBLEWORD_API_KEY"),
-      Self::Groq => hosted(P::Groq, "GROQ_API_KEY"),
-      Self::Hyperbolic => hosted(P::Hyperbolic, "HYPERBOLIC_API_KEY"),
-      Self::Llamafile => local(P::Llamafile, None),
-      Self::Mira => hosted(P::Mira, "MIRA_API_KEY"),
-      Self::Mistral => hosted(P::Mistral, "MISTRAL_API_KEY"),
-      Self::Perplexity => hosted(P::Perplexity, "PERPLEXITY_API_KEY"),
-      Self::Together => hosted(P::Together, "TOGETHER_API_KEY"),
-      Self::Venice => hosted(P::Venice, "VENICE_API_KEY"),
-      Self::Xai => hosted(P::XAi, "XAI_API_KEY"),
-    }
-  }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
   let cli = Cli::parse();
-  let wire = cli.provider.wire();
   let api_key = cli
     .api_key
-    .or_else(|| {
-      wire
-        .key_env
-        .and_then(|env| std::env::var(env).ok())
-        .filter(|k| !k.is_empty())
-    })
-    .unwrap_or_else(|| wire.no_key.to_string());
+    .or_else(|| std::env::var(cli.provider.key_env()).ok().filter(|k| !k.is_empty()))
+    .unwrap_or_else(|| cli.provider.no_key().to_string());
   let mut cfg = agent::Config {
-    provider: wire.provider,
+    provider: cli.provider,
     base_url: cli.base_url,
     api_key,
     model: cli.model,
