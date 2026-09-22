@@ -241,9 +241,8 @@ struct Completion {
 struct Overlay {
   list: OverlayList,
   selected: usize,
-  /// What the list is narrowed by. Every list has one; the questionnaire,
-  /// which is not a list, does not.
-  filter: Option<Filter>,
+  /// What the list is narrowed by.
+  filter: Filter,
   /// `Ctrl+D` has been pressed on the selected row and the deletion is
   /// waiting to be confirmed. What either list deletes is gone for good, so
   /// it is asked about first.
@@ -299,15 +298,15 @@ enum OverlayList {
   Fork(Vec<Point>),
   /// `/model`: what the provider last said it offers.
   Models(Vec<ModelInfo>),
-  /// What the `ask` tool put to the user, and the channel the answer goes
-  /// back down. The dialog keeps its own cursor, so `Overlay::selected` says
-  /// nothing about this one.
-  Question {
-    dialog: Box<Dialog>,
-    /// Taken when the questionnaire is answered. Dropping it unanswered is
-    /// what tells the tool the user walked away.
-    reply: Option<oneshot::Sender<ask::Outcome>>,
-  },
+}
+
+/// What the `ask` tool put to the user, and the channel the answer goes back
+/// down. Drawn over whatever else is on screen, a list included: it takes the
+/// keyboard whole until it is answered.
+struct Question {
+  dialog: Dialog,
+  /// Dropping it unanswered is what tells the tool the user walked away.
+  reply: oneshot::Sender<ask::Outcome>,
 }
 
 /// A point the conversation can be moved to.
@@ -337,38 +336,35 @@ impl Overlay {
       OverlayList::Sessions(sessions) => sessions.len(),
       OverlayList::Tree(points) | OverlayList::Fork(points) => points.len(),
       OverlayList::Models(models) => models.len(),
-      OverlayList::Question { .. } => 0,
     };
     Self {
       list,
       selected,
-      filter: Some(Filter::new(len)),
+      filter: Filter::new(len),
       confirming: false,
     }
   }
 
   /// Rows the list is showing, which is what the filter left of it.
   fn len(&self) -> usize {
-    self.filter.as_ref().map_or(0, |filter| filter.shown.len())
+    self.filter.shown.len()
   }
 
   /// Which row of the list the cursor is on: an index into the whole of it,
   /// rather than the place in the narrowed list the cursor stands at.
   fn at(&self) -> Option<usize> {
-    let filter = self.filter.as_ref()?;
-    filter.shown.get(self.selected).map(|(at, _)| *at)
+    self.filter.shown.get(self.selected).map(|(at, _)| *at)
   }
 
   /// The letters of each shown row the query matched, for picking out.
   fn matched(&self) -> &[(usize, Vec<u32>)] {
-    self.filter.as_ref().map_or(&[], |filter| filter.shown.as_slice())
+    &self.filter.shown
   }
 
   /// Work out again which rows the query leaves. Called when the query
   /// changes, and when a row has gone from under it.
   fn refilter(&mut self, matcher: &mut Matcher) {
     let Overlay { list, filter, .. } = self;
-    let Some(filter) = filter else { return };
     let query = &filter.query();
     filter.shown = match list {
       OverlayList::Sessions(sessions) => filter_sessions(matcher, sessions, query),
@@ -377,7 +373,6 @@ impl Overlay {
       // what is picked out has to sit under what was typed.
       OverlayList::Fork(points) => filter_rows(matcher, points.iter().map(|p| p.label.as_str()), query),
       OverlayList::Models(models) => filter_models(matcher, models, query),
-      OverlayList::Question { .. } => Vec::new(),
     };
   }
 
@@ -394,17 +389,6 @@ impl Overlay {
       OverlayList::Tree(_) => " Tree — ↑↓ PgUp/PgDn select · Enter go there · Ctrl+D delete · Esc cancel ".into(),
       OverlayList::Fork(_) => " Fork — ↑↓ PgUp/PgDn select · Enter fork · Esc cancel ".into(),
       OverlayList::Models(_) => " Model — ↑↓ select · Enter use · Esc cancel ".into(),
-      // The dialog says which keys do what along its own bottom, where the
-      // answer to that changes with the question.
-      OverlayList::Question { .. } => " The model is asking ".into(),
-    }
-  }
-
-  /// The questionnaire this overlay is, if it is one.
-  fn dialog(&mut self) -> Option<(&mut Dialog, &mut Option<oneshot::Sender<ask::Outcome>>)> {
-    match &mut self.list {
-      OverlayList::Question { dialog, reply } => Some((dialog, reply)),
-      _ => None,
     }
   }
 }
@@ -588,6 +572,7 @@ pub struct App {
   /// The conversation: history plus its on-disk file.
   session: Session,
   overlay: Option<Overlay>,
+  question: Option<Question>,
   matcher: Matcher,
   completion: Option<Completion>,
   /// Esc closed the popup; stay closed until the input changes.
@@ -694,6 +679,7 @@ impl App {
       store,
       session,
       overlay: None,
+      question: None,
       matcher: Matcher::new(Config::DEFAULT),
       completion: None,
       completion_dismissed: false,
@@ -815,7 +801,7 @@ impl App {
       return;
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    if self.overlay.as_mut().is_some_and(|o| o.dialog().is_some()) {
+    if self.question.is_some() {
       self.handle_question_key(key, ctrl);
       return;
     }
@@ -911,8 +897,8 @@ impl App {
     if text.is_empty() {
       return;
     }
-    if let Some((dialog, _)) = self.overlay.as_mut().and_then(|o| o.dialog()) {
-      dialog.paste(&text);
+    if let Some(question) = &mut self.question {
+      question.dialog.paste(&text);
       return;
     }
     // The other overlays are lists, and text pasted at one narrows it: the
@@ -920,10 +906,7 @@ impl App {
     // title copied from somewhere else is a reasonable thing to look for.
     // Its newlines are not, so it arrives as the one line the query is.
     if let Some(overlay) = &mut self.overlay {
-      let Some(filter) = &mut overlay.filter else {
-        return;
-      };
-      filter.field.insert_str(text.replace('\n', " "));
+      overlay.filter.field.insert_str(text.replace('\n', " "));
       overlay.refilter(&mut self.matcher);
       overlay.selected = 0;
       return;
@@ -1173,16 +1156,15 @@ impl App {
       self.abort();
       return;
     }
-    let Some((dialog, reply)) = self.overlay.as_mut().and_then(Overlay::dialog) else {
+    let Some(question) = &mut self.question else {
       return;
     };
-    let Some(outcome) = dialog.key(key) else {
+    let Some(outcome) = question.dialog.key(key) else {
       return;
     };
-    if let Some(reply) = reply.take() {
-      let _ = reply.send(outcome);
+    if let Some(question) = self.question.take() {
+      let _ = question.reply.send(outcome);
     }
-    self.overlay = None;
   }
 
   fn handle_overlay_key(&mut self, key: KeyEvent, ctrl: bool) {
@@ -1260,9 +1242,7 @@ impl App {
     let Some(overlay) = &mut self.overlay else {
       return;
     };
-    let Some(filter) = &mut overlay.filter else {
-      return;
-    };
+    let filter = &mut overlay.filter;
     let before = filter.query();
     filter.field.input(key);
     if filter.query() == before {
@@ -1424,7 +1404,7 @@ impl App {
     self.grab_thumb(column, row);
     // An overlay is a window over the transcript, not a view of it: what is
     // under it is not what is on screen at that cell.
-    if self.dragging.is_some() || self.overlay.is_some() {
+    if self.dragging.is_some() || self.overlay.is_some() || self.question.is_some() {
       return;
     }
     if !self.content.contains(Position::new(column, row)) {
@@ -2132,9 +2112,7 @@ impl App {
   /// Take down the model's questionnaire, if one is up. What it had been
   /// asked is left unanswered, which the tool reads as a decline.
   fn close_question(&mut self) {
-    if self.overlay.as_mut().is_some_and(|o| o.dialog().is_some()) {
-      self.overlay = None;
-    }
+    self.question = None;
   }
 
   /// Freeze every live tool output when the run was killed.
@@ -2250,16 +2228,9 @@ impl App {
         if self.bell {
           bell();
         }
-        self.overlay = Some(Overlay {
-          list: OverlayList::Question {
-            dialog: Box::new(Dialog::new(questions)),
-            reply: Some(reply),
-          },
-          selected: 0,
-          // A questionnaire is answered rather than looked through, and it
-          // takes the keyboard whole — there is nothing here to narrow.
-          filter: None,
-          confirming: false,
+        self.question = Some(Question {
+          dialog: Dialog::new(questions),
+          reply,
         });
       }
       AgentEvent::Error(err) => {
@@ -2365,7 +2336,9 @@ impl App {
   fn draw(&mut self, f: &mut Frame) {
     // A query is one line, whatever the prompt the box is holding for the
     // moment came to.
-    let filtering = self.overlay.as_ref().is_some_and(|o| o.filter.is_some());
+    // A questionnaire takes the keyboard whole, so a list under it is not
+    // being narrowed while it is up.
+    let filtering = self.overlay.is_some() && self.question.is_none();
     let lines = match filtering {
       true => 1,
       false => self.input.lines().len(),
@@ -2387,7 +2360,9 @@ impl App {
     }
 
     self.thumb = None;
-    if self.overlay.is_some() {
+    if self.question.is_some() {
+      self.draw_question(f, transcript_area);
+    } else if self.overlay.is_some() {
       self.draw_overlay(f, transcript_area);
     } else {
       self.draw_transcript(f, transcript_area);
@@ -2407,7 +2382,7 @@ impl App {
       .borders(Borders::ALL)
       .border_type(BorderType::Rounded)
       .border_style(Style::default().fg(border_color));
-    if let Some(filter) = self.overlay.as_mut().and_then(|o| o.filter.as_mut()) {
+    if let Some(filter) = self.overlay.as_mut().filter(|_| filtering).map(|o| &mut o.filter) {
       filter.field.set_block(block.title(" filter "));
       f.render_widget(&filter.field, input_area);
     } else {
@@ -2577,6 +2552,28 @@ impl App {
     f.render_widget(Paragraph::new(lines), area);
   }
 
+  fn draw_question(&self, f: &mut Frame, area: Rect) {
+    let Some(question) = &self.question else { return };
+    // The dialog says which keys do what along its own bottom, where the
+    // answer to that changes with the question.
+    let block = Block::default()
+      .borders(Borders::ALL)
+      .border_type(BorderType::Rounded)
+      .border_style(Style::default().fg(Color::Gray))
+      .title(" The model is asking ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let height = inner.height as usize;
+    let (lines, focus) = question.dialog.lines(inner.width);
+    // More dialog than screen: scroll it just far enough to keep the row the
+    // cursor is on in view, which is the row being answered.
+    let first = focus.saturating_sub(height.saturating_sub(1)).min(focus);
+    f.render_widget(
+      Paragraph::new(lines.into_iter().skip(first).take(height).collect::<Vec<_>>()),
+      inner,
+    );
+  }
+
   fn draw_overlay(&self, f: &mut Frame, area: Rect) {
     let Some(overlay) = &self.overlay else { return };
     let block = Block::default()
@@ -2588,17 +2585,6 @@ impl App {
     f.render_widget(block, area);
     let height = inner.height as usize;
     let width = inner.width as usize;
-    if let OverlayList::Question { dialog, .. } = &overlay.list {
-      let (lines, focus) = dialog.lines(inner.width);
-      // More dialog than screen: scroll it just far enough to keep the row
-      // the cursor is on in view, which is the row being answered.
-      let first = focus.saturating_sub(height.saturating_sub(1)).min(focus);
-      f.render_widget(
-        Paragraph::new(lines.into_iter().skip(first).take(height).collect::<Vec<_>>()),
-        inner,
-      );
-      return;
-    }
     // Only the rows the filter left, which is all of them until something is
     // typed.
     let shown = overlay.matched();
@@ -2679,8 +2665,6 @@ impl App {
           (format!("{}{}", model.id, if here { "  (in use)" } else { "" }), note)
         })
         .collect(),
-      // Drawn above, where it draws itself.
-      OverlayList::Question { .. } => Vec::new(),
     };
     let dim = Style::default().add_modifier(Modifier::DIM);
     let mut lines = Vec::new();
