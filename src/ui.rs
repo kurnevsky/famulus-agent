@@ -4227,38 +4227,32 @@ fn points(session: &Session) -> Vec<Point> {
   // The whole path, checkpoints included: a compaction does not stop the
   // entries above it being the way the conversation came.
   let here: HashSet<&str> = session.lineage(session.leaf(), true).into_iter().collect();
-  let mut out = Vec::new();
-  walk(session, &children, &here, None, 0, &mut out);
-  out
-}
-
-fn walk<'a>(
-  session: &'a Session,
-  children: &HashMap<Option<&'a str>, Vec<&'a Node>>,
-  here: &HashSet<&'a str>,
-  parent: Option<&'a str>,
-  depth: usize,
-  out: &mut Vec<Point>,
-) {
-  let Some(kids) = children.get(&parent) else {
-    return;
+  // The rows under `parent`, each with the indent it is drawn at. One child is
+  // the conversation carrying on, and reads at the same level. More than one
+  // is somewhere it went two ways, which is what the indent is for — and where
+  // the path still in use is listed first.
+  let kids = |parent: Option<&str>, depth: usize| {
+    let mut kids = children.get(&parent).cloned().unwrap_or_default();
+    let branching = kids.len() > 1;
+    if branching {
+      kids.sort_by_key(|node| !here.contains(node.id.as_str()));
+    }
+    let depth = depth + usize::from(branching);
+    kids.into_iter().map(move |node| (node, depth))
   };
-  // One child is the conversation carrying on, and reads at the same level.
-  // More than one is somewhere it went two ways, which is what the indent is
-  // for — and where the path still in use is listed first.
-  let branching = kids.len() > 1;
-  let mut kids = kids.clone();
-  if branching {
-    kids.sort_by_key(|node| !here.contains(node.id.as_str()));
-  }
-  let depth = depth + usize::from(branching);
-  for node in kids {
+  // Depth first, each entry before what grew from it. Walked with a stack of
+  // its own rather than by recursion: a session is one entry per message, and
+  // a long one is deeper than the thread's stack.
+  let mut stack: Vec<(&Node, usize)> = kids(None, 0).rev().collect();
+  let mut out = Vec::new();
+  while let Some((node, depth)) = stack.pop() {
     if let Some(point) = point(session, node, depth) {
       out.push(point);
     }
     // A step that is no place to stop still has children that are.
-    walk(session, children, here, Some(&node.id), depth, out);
+    stack.extend(kids(Some(&node.id), depth).rev());
   }
+  out
 }
 
 fn point(session: &Session, node: &Node, depth: usize) -> Option<Point> {

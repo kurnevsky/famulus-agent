@@ -196,67 +196,28 @@ impl Store {
 }
 
 fn read_info(path: &Path) -> Result<SessionInfo> {
-  let file = File::open(path)?;
-  let modified: DateTime<Local> = file.metadata()?.modified()?.into();
-  let mut lines = BufReader::new(file).lines();
-  let header = lines.next().context("empty session file")??;
-  let Record::Header { id, cwd, .. } = serde_json::from_str(&header)? else {
-    bail!("missing session header");
-  };
-  let mut info = SessionInfo {
+  let modified: DateTime<Local> = std::fs::metadata(path)?.modified()?.into();
+  let session = Session::parse(path)?;
+  let first_message = session
+    .nodes
+    .iter()
+    .find_map(|node| match &node.kind {
+      NodeKind::Message(message) => user_text(message),
+      NodeKind::Checkpoint { .. } => None,
+    })
+    .map(|text| first_line(&text))
+    .unwrap_or_default();
+  Ok(SessionInfo {
     path: path.to_path_buf(),
-    id,
-    name: None,
-    cwd,
+    // A file that has been gone back through holds more entries than the
+    // conversation does, and it is the conversation the picker is describing.
+    message_count: session.branch_len(session.leaf()),
+    first_message,
+    id: session.id,
+    name: session.name,
+    cwd: session.cwd,
     modified,
-    message_count: 0,
-    first_message: String::new(),
-  };
-  // Enough of the tree to count the branch the session is on. A file that
-  // has been gone back through holds more entries than the conversation does,
-  // and it is the conversation the picker is describing.
-  let mut parents: HashMap<String, Option<String>> = HashMap::new();
-  let mut checkpoints: HashSet<String> = HashSet::new();
-  let mut leaf: Option<String> = None;
-  for line in lines {
-    let Ok(record) = serde_json::from_str::<Record>(&line?) else {
-      continue;
-    };
-    match record {
-      Record::Message {
-        id, parent, message, ..
-      } => {
-        if info.first_message.is_empty()
-          && let Some(text) = user_text(&message)
-        {
-          info.first_message = first_line(&text);
-        }
-        parents.insert(id.clone(), parent);
-        leaf = Some(id);
-      }
-      Record::Compaction { id, parent, .. } => {
-        parents.insert(id.clone(), parent);
-        checkpoints.insert(id.clone());
-        leaf = Some(id);
-      }
-      Record::Leaf { id } => leaf = id,
-      Record::Name { name } => info.name = Some(name),
-      // Neither says anything the picker shows.
-      Record::Header { .. } | Record::Model { .. } => {}
-    }
-  }
-  let mut at = leaf;
-  // A checkpoint ends the walk, standing for everything above it. The bound
-  // is against a parent link that loops: the file is only as good as what
-  // last wrote it.
-  while let Some(id) = at.filter(|_| info.message_count <= parents.len()) {
-    info.message_count += 1;
-    if checkpoints.contains(&id) {
-      break;
-    }
-    at = parents.get(&id).cloned().flatten();
-  }
-  Ok(info)
+  })
 }
 
 /// Text of a plain user message (not a tool result or compaction summary).
@@ -420,6 +381,9 @@ pub struct Session {
   pub history: Vec<Message>,
   /// Every entry ever written, in the order it was written.
   nodes: Vec<Node>,
+  /// Where each entry sits in `nodes`, by id. Every walk up the tree is one
+  /// lookup per step through here.
+  index: HashMap<String, usize>,
   /// Where the conversation currently ends; `None` is before the first entry.
   leaf: Option<String>,
   /// Counter behind `mint`, past every id already in the file.
@@ -444,6 +408,7 @@ impl Session {
       created: Local::now(),
       history: Vec::new(),
       nodes: Vec::new(),
+      index: HashMap::new(),
       leaf: None,
       ids: 0,
       outcomes: HashMap::new(),
@@ -455,6 +420,16 @@ impl Session {
 
   /// Replay a session file. Appending continues in the same file.
   pub fn load(path: &Path) -> Result<Self> {
+    let mut session = Self::parse(path)?;
+    session.history = session.branch(session.leaf.as_deref());
+    let file = OpenOptions::new().append(true).open(path)?;
+    session.file = Some((path.to_path_buf(), file));
+    Ok(session)
+  }
+
+  /// Read a session file's tree, without the conversation built from it or a
+  /// handle to append with.
+  fn parse(path: &Path) -> Result<Self> {
     let file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
     let mut lines = BufReader::new(file).lines();
     let header = lines.next().with_context(|| format!("{} is empty", path.display()))??;
@@ -476,6 +451,7 @@ impl Session {
       created,
       history: Vec::new(),
       nodes: Vec::new(),
+      index: HashMap::new(),
       leaf: None,
       ids: 0,
       outcomes: HashMap::new(),
@@ -519,11 +495,8 @@ impl Session {
       };
       session.remember(&id);
       session.leaf = Some(id.clone());
-      session.nodes.push(Node { id, parent, kind });
+      session.push(Node { id, parent, kind });
     }
-    session.history = session.branch(session.leaf.as_deref());
-    let file = OpenOptions::new().append(true).open(path)?;
-    session.file = Some((path.to_path_buf(), file));
     Ok(session)
   }
 
@@ -536,8 +509,15 @@ impl Session {
     &self.nodes
   }
 
+  /// Add an entry to the tree. An id the file repeats keeps pointing at its
+  /// first entry.
+  fn push(&mut self, node: Node) {
+    self.index.entry(node.id.clone()).or_insert(self.nodes.len());
+    self.nodes.push(node);
+  }
+
   fn node(&self, id: &str) -> Option<&Node> {
-    self.nodes.iter().find(|node| node.id == id)
+    self.index.get(id).map(|&at| &self.nodes[at])
   }
 
   /// The entry a cut at `id` would leave the conversation ending at.
@@ -654,9 +634,10 @@ impl Session {
         message: message.clone(),
       });
       self.history.push(message.clone());
-      self.nodes.push(Node {
+      let parent = self.leaf.take();
+      self.push(Node {
         id: id.clone(),
-        parent: self.leaf.take(),
+        parent,
         kind: NodeKind::Message(message),
       });
       self.leaf = Some(id);
@@ -681,9 +662,10 @@ impl Session {
       parent: self.leaf.clone(),
       summary: summary.to_string(),
     };
-    self.nodes.push(Node {
+    let parent = self.leaf.take();
+    self.push(Node {
       id: id.clone(),
-      parent: self.leaf.take(),
+      parent,
       kind: NodeKind::Checkpoint {
         summary: summary.to_string(),
       },
@@ -770,6 +752,10 @@ impl Session {
       }
     }
     self.nodes.retain(|node| !gone.contains(&node.id));
+    self.index.clear();
+    for (at, node) in self.nodes.iter().enumerate() {
+      self.index.entry(node.id.clone()).or_insert(at);
+    }
     Ok(gone.len())
   }
 
@@ -792,6 +778,7 @@ impl Session {
       created: Local::now(),
       history: Vec::new(),
       nodes: Vec::new(),
+      index: HashMap::new(),
       leaf: None,
       ids: 0,
       // The fork draws the conversation it copied the same way this one did.
