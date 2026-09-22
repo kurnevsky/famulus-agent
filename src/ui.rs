@@ -915,15 +915,10 @@ impl App {
     // Dropping an image on the terminal pastes its path, which is the
     // gesture people reach for first. Written down as a token, it attaches
     // rather than sitting there as a path nothing reads.
-    let text = self.as_token(&text).unwrap_or(text);
+    let text = as_token(&text, &self.cwd).unwrap_or(text);
     self.input.insert_str(&text);
     self.completion_dismissed = false;
     self.input_changed();
-  }
-
-  /// A pasted path to an image, as the token that attaches it.
-  fn as_token(&self, text: &str) -> Option<String> {
-    as_token(text, &self.cwd)
   }
 
   /// Keys consumed by the `/` popup. Returns false to let the key fall
@@ -981,8 +976,7 @@ impl App {
     let row = before.matches('\n').count();
     let col = before.rsplit('\n').next().unwrap_or("").chars().count();
     self.input.move_cursor(CursorMove::Jump(row as u16, col as u16));
-    self.refresh_attachments();
-    self.refresh_completion();
+    self.input_changed();
   }
 
   fn move_completion(&mut self, delta: isize) {
@@ -2115,11 +2109,6 @@ impl App {
     self.question = None;
   }
 
-  /// Freeze every live tool output when the run was killed.
-  fn finish_running_tool(&mut self) {
-    finish_running(&mut self.entries);
-  }
-
   /// Record what a run added to the conversation.
   ///
   /// However it ended — with its answer, stopped for room, or cancelled —
@@ -2278,7 +2267,7 @@ impl App {
         // Esc asked for this. The run has stopped where it stood and said
         // what it got through, so the rest of what Esc means happens here.
         if std::mem::take(&mut self.aborting) {
-          self.finish_running_tool();
+          finish_running(&mut self.entries);
           self.entries.push(Entry::Info("Aborted.".into()));
           self.strand_queued();
           return;
@@ -2389,7 +2378,7 @@ impl App {
       // What the `@tokens` in the box found, said along the bottom border
       // rather than on a line of its own: it costs the transcript nothing,
       // and it is gone again the moment the tokens are.
-      if let Some(strip) = self.attachment_strip(input_area.width) {
+      if let Some(strip) = attachment_strip(&self.attachments, self.cfg.vision, input_area.width) {
         block = block.title_bottom(strip);
       }
       self.input.set_block(block);
@@ -2440,8 +2429,8 @@ impl App {
     // A scrollbar with nothing to scroll draws neither track nor thumb, and
     // an `auto` one that has faded draws nothing at all, so in either case
     // there is nothing for the mouse to take hold of — the column it was on
-    // is transcript again, to be read and selected like the rest of it.
-    self.thumb = None;
+    // is transcript again, to be read and selected like the rest of it: the
+    // thumb `draw` cleared stays cleared.
     if show_scrollbar {
       if max_scroll > 0 && transcript_area.width > 0 {
         let track = Rect {
@@ -2467,11 +2456,6 @@ impl App {
         &mut state,
       );
     }
-  }
-
-  /// What the input box's `@tokens` resolved to, for the bottom border.
-  fn attachment_strip(&self, width: u16) -> Option<Line<'static>> {
-    attachment_strip(&self.attachments, self.cfg.vision, width)
   }
 
   fn draw_completion(&self, f: &mut Frame, area: Rect) {
@@ -2792,7 +2776,7 @@ impl App {
           // has, folded, and cached by its bytes and that width.
           for image in images {
             let cols = width.saturating_sub(3);
-            let key = (hash_bytes(IMAGE_KIND, image), cols, false);
+            let key = (hash(IMAGE_KIND, image), cols, false);
             let drawn = match cached.remove(&key) {
               Some(drawn) => drawn,
               None => crate::images::blocks(image, cols, IMAGE_MAX_LINES)
@@ -2925,7 +2909,7 @@ impl App {
             // Two columns of indent and the gutter, as every other block of
             // a tool's output is drawn.
             let cols = width.saturating_sub(3);
-            let key = (hash_bytes(IMAGE_KIND, image), cols, false);
+            let key = (hash(IMAGE_KIND, image), cols, false);
             let drawn = match cached.remove(&key) {
               Some(drawn) => drawn,
               None => crate::images::blocks(image, cols, IMAGE_MAX_LINES)
@@ -3055,20 +3039,13 @@ impl App {
   }
 }
 
-/// Identifies a message by content, for the rendered-text cache. `kind` keeps
-/// an assistant message and a reasoning block apart when they read the same.
-fn hash(kind: u8, text: &str) -> u64 {
+/// Identifies a message or an image by content, for the rendered-text cache.
+/// `kind` keeps an assistant message and a reasoning block apart when they
+/// read the same.
+fn hash<T: Hash + ?Sized>(kind: u8, content: &T) -> u64 {
   let mut hasher = DefaultHasher::new();
   kind.hash(&mut hasher);
-  text.hash(&mut hasher);
-  hasher.finish()
-}
-
-/// The same, for an image, which is bytes rather than text.
-fn hash_bytes(kind: u8, bytes: &[u8]) -> u64 {
-  let mut hasher = DefaultHasher::new();
-  kind.hash(&mut hasher);
-  bytes.hash(&mut hasher);
+  content.hash(&mut hasher);
   hasher.finish()
 }
 

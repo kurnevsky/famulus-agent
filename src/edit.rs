@@ -2,10 +2,21 @@
 //! handling, exact-then-fuzzy matching, overlap checks, and the numbered
 //! diff rendering for the UI.
 
+use schemars::JsonSchema;
+use serde::Deserialize;
 use unicode_normalization::UnicodeNormalization;
 
+// One replacement, as the `edit` tool is given it. No doc comment: it would
+// become part of the schema the model reads.
+#[derive(Deserialize, JsonSchema)]
+#[schemars(rename = "Replacement")]
 pub struct Edit {
+  /// Exact text for one targeted replacement. It must be unique in the original file and
+  /// must not overlap with any other edits[].oldText in the same call.
+  #[serde(rename = "oldText")]
   pub old_text: String,
+  /// Replacement text for this targeted edit.
+  #[serde(rename = "newText")]
   pub new_text: String,
 }
 

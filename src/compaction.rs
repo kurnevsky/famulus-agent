@@ -241,8 +241,8 @@ fn previous_summary(message: &Message) -> Option<&str> {
 /// place the model can carry on from. Returns `None` when there is nothing
 /// worth summarizing.
 pub fn cut_point(history: &[Message], keep_recent_tokens: u64) -> Option<usize> {
-  let first = usize::from(history.first().is_some_and(previous_summary_present));
-  let cuts: Vec<usize> = (first..history.len()).filter(|&i| can_follow(&history[i])).collect();
+  let first = usize::from(history.first().is_some_and(|m| previous_summary(m).is_some()));
+  let cut_at = |i: &usize| can_follow(&history[*i]);
 
   let mut accumulated = 0u64;
   let mut exceeded_at = None;
@@ -259,10 +259,8 @@ pub fn cut_point(history: &[Message], keep_recent_tokens: u64) -> Option<usize> 
     None => (first..history.len()).rfind(|&i| starts_turn(&history[i])),
     // Keep from the nearest cut at or after the overflow, which is as much
     // of the budget as can be kept without parting a call from its answer.
-    Some(i) => cuts
-      .iter()
-      .copied()
-      .find(|&c| c >= i)
+    Some(i) => (i..history.len())
+      .find(cut_at)
       .filter(|&c| c > first)
       // Nothing after the overflow to keep from — the tail is one tool
       // result worth more than the whole budget, or the overflow is the
@@ -270,13 +268,9 @@ pub fn cut_point(history: &[Message], keep_recent_tokens: u64) -> Option<usize> 
       // the model made and what came back. Keeping nothing at all would
       // leave it a summary and no work to carry on with, which is the one
       // thing a compaction must not do.
-      .or_else(|| cuts.last().copied()),
+      .or_else(|| (first..history.len()).rfind(cut_at)),
   };
   cut.filter(|&c| c > first)
-}
-
-fn previous_summary_present(message: &Message) -> bool {
-  previous_summary(message).is_some()
 }
 
 /// Render messages in the summarization transcript format.
@@ -354,10 +348,7 @@ fn truncate_for_summary(text: &str) -> String {
   if text.len() <= TOOL_RESULT_MAX_CHARS {
     return text.to_string();
   }
-  let mut end = TOOL_RESULT_MAX_CHARS;
-  while !text.is_char_boundary(end) {
-    end -= 1;
-  }
+  let end = text.floor_char_boundary(TOOL_RESULT_MAX_CHARS);
   format!("{}\n[... truncated {} chars]", &text[..end], text.len() - end)
 }
 

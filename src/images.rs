@@ -32,6 +32,14 @@ pub struct ProcessedImage {
 }
 
 impl ProcessedImage {
+  /// `header`, then what converting or resizing the image did, a line each.
+  pub fn note(&self, header: String) -> String {
+    std::iter::once(header)
+      .chain(self.hints.iter().cloned())
+      .collect::<Vec<_>>()
+      .join("\n")
+  }
+
   /// The image as a provider takes it inline.
   pub fn base64(&self) -> String {
     STANDARD.encode(&self.bytes)

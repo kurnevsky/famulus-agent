@@ -203,12 +203,18 @@ pub fn load(paths: &[PathBuf], strict: bool) -> (Config, Vec<String>) {
 #[derive(Default)]
 pub struct Servers {
   #[cfg(feature = "mcp")]
-  running: Vec<rmcp::service::RunningService<rmcp::service::RoleClient, ()>>,
-  /// The tools each connection offers, with the connection to call them on
-  /// and how long one of its calls may take.
-  #[cfg(feature = "mcp")]
-  tools: Vec<(Vec<rmcp::model::Tool>, rmcp::service::ServerSink, Option<u64>)>,
+  running: Vec<Running>,
   notes: Vec<String>,
+}
+
+/// One server that came up.
+#[cfg(feature = "mcp")]
+struct Running {
+  service: rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+  /// What it offers, narrowed to what was asked of it.
+  tools: Vec<rmcp::model::Tool>,
+  /// How long one of its calls may take.
+  timeout: Option<u64>,
 }
 
 impl Servers {
@@ -221,7 +227,10 @@ impl Servers {
   /// How many servers came up, and how many tools they brought between them.
   pub fn count(&self) -> (usize, usize) {
     #[cfg(feature = "mcp")]
-    return (self.tools.len(), self.tools.iter().map(|(tools, ..)| tools.len()).sum());
+    return (
+      self.running.len(),
+      self.running.iter().map(|server| server.tools.len()).sum(),
+    );
     #[cfg(not(feature = "mcp"))]
     (0, 0)
   }
@@ -231,17 +240,12 @@ impl Servers {
   pub fn tool_names(&self) -> Vec<String> {
     #[cfg(feature = "mcp")]
     return self
-      .tools
+      .running
       .iter()
-      .flat_map(|(tools, ..)| tools.iter().map(|tool| tool.name.to_string()))
+      .flat_map(|server| server.tools.iter().map(|tool| tool.name.to_string()))
       .collect();
     #[cfg(not(feature = "mcp"))]
     Vec::new()
-  }
-
-  #[cfg(feature = "mcp")]
-  fn note(&mut self, note: String) {
-    self.notes.push(note);
   }
 }
 
@@ -254,18 +258,20 @@ pub async fn connect(config: Config) -> Servers {
     let running = match started.await {
       Ok(Ok(running)) => running,
       Ok(Err(err)) => {
-        servers.note(format!("MCP {name}: {err:#}"));
+        servers.notes.push(format!("MCP {name}: {err:#}"));
         continue;
       }
       Err(_) => {
-        servers.note(format!("MCP {name}: no answer in {}s", START_TIMEOUT.as_secs()));
+        servers
+          .notes
+          .push(format!("MCP {name}: no answer in {}s", START_TIMEOUT.as_secs()));
         continue;
       }
     };
     let tools = match running.list_all_tools().await {
       Ok(tools) => tools,
       Err(err) => {
-        servers.note(format!("MCP {name}: could not list tools: {err}"));
+        servers.notes.push(format!("MCP {name}: could not list tools: {err}"));
         continue;
       }
     };
@@ -275,12 +281,14 @@ pub async fn connect(config: Config) -> Servers {
     let offered: Vec<String> = tools.iter().map(|tool| tool.name.to_string()).collect();
     let (wanted, unknown) = crate::tools::choose(&offered, &server.tools, &server.except);
     if !unknown.is_empty() {
-      servers.note(format!("MCP {name}: offers no {}", unknown.join(", ")));
+      servers
+        .notes
+        .push(format!("MCP {name}: offers no {}", unknown.join(", ")));
     }
     let tools: Vec<_> = match &wanted {
       Some(wanted) => tools
         .into_iter()
-        .filter(|tool| wanted.contains(&tool.name.to_string()))
+        .filter(|tool| wanted.iter().any(|name| *name == tool.name))
         .collect(),
       None => tools,
     };
@@ -289,24 +297,27 @@ pub async fn connect(config: Config) -> Servers {
     // ones it was told about.
     let (tools, clashed): (Vec<_>, Vec<_>) = tools
       .into_iter()
-      .partition(|tool| !taken.contains(&tool.name.to_string()));
+      .partition(|tool| !taken.iter().any(|name| *name == tool.name));
     taken.extend(tools.iter().map(|tool| tool.name.to_string()));
     if !clashed.is_empty() {
       let names: Vec<String> = clashed.iter().map(|tool| tool.name.to_string()).collect();
-      servers.note(format!(
+      servers.notes.push(format!(
         "MCP {name}: not taking {} (name already used)",
         names.join(", ")
       ));
     }
-    servers.note(format!(
+    servers.notes.push(format!(
       "MCP {name}: {}",
       match tools.len() {
         1 => "1 tool".to_string(),
         n => format!("{n} tools"),
       }
     ));
-    servers.tools.push((tools, running.peer().clone(), server.timeout));
-    servers.running.push(running);
+    servers.running.push(Running {
+      service: running,
+      tools,
+      timeout: server.timeout,
+    });
   }
   servers
 }
@@ -429,15 +440,15 @@ fn headers(
 /// Hand every tool that came up to the agent being built.
 #[cfg(feature = "mcp")]
 pub fn attach(server: rig_agent::tool::server::ToolServer, servers: &Servers) -> rig_agent::tool::server::ToolServer {
-  servers.tools.iter().fold(server, |server, (tools, sink, timeout)| {
+  servers.running.iter().fold(server, |server, running| {
     // Rig bounds a call at five minutes unless told otherwise. A server can
     // say its own number, and zero lets a call take as long as it takes.
-    let timeout = match timeout {
+    let timeout = match running.timeout {
       Some(0) => None,
-      Some(seconds) => Some(std::time::Duration::from_secs(*seconds)),
+      Some(seconds) => Some(std::time::Duration::from_secs(seconds)),
       None => Some(rig_agent::tool::rmcp::DEFAULT_MCP_TOOL_TIMEOUT),
     };
-    server.rmcp_tools_with_timeout(tools.clone(), sink.clone(), timeout)
+    server.rmcp_tools_with_timeout(running.tools.clone(), running.service.peer().clone(), timeout)
   })
 }
 

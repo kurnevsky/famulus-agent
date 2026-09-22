@@ -498,11 +498,7 @@ fn read_image(bytes: &[u8], format: image::ImageFormat, vision: bool) -> Vec<Too
   let mime = images::mime_type(format);
   match images::process(bytes, format) {
     Ok(image) => {
-      let mut note = format!("Read image file [{}]", image.media_type.to_mime_type());
-      for hint in &image.hints {
-        note.push('\n');
-        note.push_str(hint);
-      }
+      let mut note = image.note(format!("Read image file [{}]", image.media_type.to_mime_type()));
       if !vision {
         note.push('\n');
         note.push_str(NON_VISION_NOTE);
@@ -721,24 +717,13 @@ pub struct EditTool {
 }
 
 #[derive(Deserialize, JsonSchema)]
-pub struct Replacement {
-  /// Exact text for one targeted replacement. It must be unique in the original file and
-  /// must not overlap with any other edits[].oldText in the same call.
-  #[serde(rename = "oldText")]
-  old_text: String,
-  /// Replacement text for this targeted edit.
-  #[serde(rename = "newText")]
-  new_text: String,
-}
-
-#[derive(Deserialize, JsonSchema)]
 pub struct EditArgs {
   /// Path to the file to edit (relative or absolute)
   path: String,
   /// One or more targeted replacements. Each edit is matched against the original file, not
   /// incrementally. Do not include overlapping or nested edits. If two changes touch the same
   /// block or nearby lines, merge them into one edit instead.
-  edits: Vec<Replacement>,
+  edits: Vec<edit::Edit>,
 }
 
 impl Tool for EditTool {
@@ -783,15 +768,7 @@ impl Tool for EditTool {
     let (bom, content) = edit::split_bom(&raw);
     let ending = edit::detect_line_ending(content);
     let normalized = edit::normalize_to_lf(content);
-    let edits: Vec<edit::Edit> = args
-      .edits
-      .iter()
-      .map(|e| edit::Edit {
-        old_text: e.old_text.clone(),
-        new_text: e.new_text.clone(),
-      })
-      .collect();
-    let applied = edit::apply_edits(&normalized, &edits, &args.path).map_err(ToolError)?;
+    let applied = edit::apply_edits(&normalized, &args.edits, &args.path).map_err(ToolError)?;
 
     let final_content = format!("{bom}{}", edit::restore_line_endings(&applied.new, ending));
     tokio::fs::write(&path, final_content).await?;
@@ -799,7 +776,7 @@ impl Tool for EditTool {
     attach_diff(ctx, &applied.base, &applied.new);
     Ok(format!(
       "Successfully replaced {} block(s) in {}.",
-      edits.len(),
+      args.edits.len(),
       args.path
     ))
   }
@@ -914,7 +891,7 @@ mod edit_tests {
           path: "f.txt".into(),
           edits: edits
             .into_iter()
-            .map(|(o, n)| Replacement {
+            .map(|(o, n)| edit::Edit {
               old_text: o.into(),
               new_text: n.into(),
             })

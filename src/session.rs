@@ -445,19 +445,10 @@ impl Session {
     };
     let mut session = Self {
       id,
-      name: None,
-      cwd,
-      model,
       created,
-      history: Vec::new(),
-      nodes: Vec::new(),
-      index: HashMap::new(),
-      leaf: None,
-      ids: 0,
-      outcomes: HashMap::new(),
       parent,
       dir: path.parent().map(Path::to_path_buf),
-      file: None,
+      ..Self::new(None, Path::new(&cwd), &model)
     };
     for (n, line) in lines.enumerate() {
       let line = line?;
@@ -771,21 +762,11 @@ impl Session {
   /// the fork starts as a straight line with nowhere of its own to go back to.
   pub fn fork(&self, leaf: Option<&str>) -> Result<Self> {
     let mut forked = Self {
-      id: uuid::Uuid::new_v4().to_string(),
-      name: None,
-      cwd: self.cwd.clone(),
-      model: self.model.clone(),
-      created: Local::now(),
-      history: Vec::new(),
-      nodes: Vec::new(),
-      index: HashMap::new(),
-      leaf: None,
-      ids: 0,
       // The fork draws the conversation it copied the same way this one did.
       outcomes: self.outcomes.clone(),
       parent: self.path().map(|path| path.display().to_string()),
       dir: self.dir.clone(),
-      file: None,
+      ..Self::new(None, Path::new(&self.cwd), &self.model)
     };
     // Forking from the very start leaves an empty session, which — like any
     // other empty session — gets its file once it has something to say.

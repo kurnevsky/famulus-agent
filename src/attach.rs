@@ -9,13 +9,11 @@
 
 use std::path::{Path, PathBuf};
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
 use image::ImageFormat;
 use rig_core::completion::Message;
-use rig_core::message::{ImageMediaType, MimeType, UserContent};
+use rig_core::message::{MimeType, UserContent};
 
-use crate::images;
+use crate::images::{self, ProcessedImage};
 use crate::tools::resolve;
 
 /// Trailing characters a sentence leaves stuck to a path: `@shot.png,` is a
@@ -91,7 +89,7 @@ pub fn tokens(text: &str, cwd: &Path) -> Vec<Token> {
     if raw.is_empty() {
       continue;
     }
-    at = start + '@'.len_utf8() + len;
+    at += len;
     out.push(probe(text, start, at, raw, quoted, cwd));
   }
   out
@@ -173,11 +171,7 @@ pub fn dimensions(path: &Path) -> Option<(u32, u32)> {
 /// alone — for listing a directory, where opening every file would be a
 /// syscall a keystroke.
 pub fn looks_like_image(path: &Path) -> bool {
-  path
-    .extension()
-    .and_then(|e| e.to_str())
-    .and_then(|e| ImageFormat::from_extension(e.to_ascii_lowercase()))
-    .is_some_and(images::supported)
+  ImageFormat::from_path(path).is_ok_and(images::supported)
 }
 
 /// An image read and prepared for sending: the bytes as the model will be
@@ -185,10 +179,7 @@ pub fn looks_like_image(path: &Path) -> bool {
 pub struct Attached {
   /// The token that named it, for the note that labels it.
   pub token: String,
-  pub bytes: Vec<u8>,
-  pub media_type: ImageMediaType,
-  /// What `images::process` had to say about converting or resizing it.
-  pub hints: Vec<String>,
+  pub image: ProcessedImage,
 }
 
 /// Read and prepare the image behind a token. `Err` is the reason, in the
@@ -199,9 +190,7 @@ pub fn load(token: &Token) -> Result<Attached, String> {
   let image = images::process(&bytes, format).map_err(|reason| format!("{}: {reason}", token.text))?;
   Ok(Attached {
     token: token.text.clone(),
-    bytes: image.bytes,
-    media_type: image.media_type,
-    hints: image.hints,
+    image,
   })
 }
 
@@ -228,15 +217,11 @@ impl Prompt {
   pub fn message(&self) -> Message {
     let mut content = Vec::with_capacity(1 + self.images.len() * 2);
     content.push(UserContent::text(self.text.clone()));
-    for image in &self.images {
-      let mut note = format!("[Attached {} — {}]", image.token, image.media_type.to_mime_type());
-      for hint in &image.hints {
-        note.push('\n');
-        note.push_str(hint);
-      }
-      content.push(UserContent::text(note));
+    for Attached { token, image } in &self.images {
+      let header = format!("[Attached {token} — {}]", image.media_type.to_mime_type());
+      content.push(UserContent::text(image.note(header)));
       content.push(UserContent::image_base64(
-        STANDARD.encode(&image.bytes),
+        image.base64(),
         Some(image.media_type.clone()),
         None,
       ));
@@ -246,7 +231,11 @@ impl Prompt {
 
   /// The bytes the transcript draws under the prompt.
   pub fn preview(&self) -> Vec<Vec<u8>> {
-    self.images.iter().map(|image| image.bytes.clone()).collect()
+    self
+      .images
+      .iter()
+      .map(|attached| attached.image.bytes.clone())
+      .collect()
   }
 }
 
