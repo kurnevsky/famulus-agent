@@ -693,6 +693,11 @@ impl App {
       }
     });
     let mut ticker = tokio::time::interval(Duration::from_millis(120));
+    // The tick branch is disabled while nothing is animating, so the interval
+    // goes unpolled for as long as the session sits idle. Without this the
+    // backlog of missed ticks is replayed the instant a turn starts and the
+    // spinner races through it before settling into its real cadence.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
       terminal.draw(|f| self.draw(f))?;
