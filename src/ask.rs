@@ -18,10 +18,11 @@ use std::collections::{HashMap, HashSet};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui_textarea::{CursorMove, DataCursor, TextArea};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::markdown::wrap_text;
+use crate::markdown::{wrap_line, wrap_text};
 
 /// Questions one call may ask. Four is an interruption; more is an interview.
 pub const MAX_QUESTIONS: usize = 4;
@@ -55,8 +56,9 @@ const POINTER: &str = "› ";
 const NO_POINTER: &str = "  ";
 const CHECKED: &str = "[✔]";
 const UNCHECKED: &str = "[ ]";
-/// Where the next typed character will land, in the free-text row.
-const CARET: &str = "▌";
+/// The cursor of the free-text row when there is no character under it to
+/// reverse — at the end of a line, or on a space.
+const CURSOR: &str = "█";
 
 // ---------------------------------------------------------------- questions
 
@@ -260,105 +262,48 @@ impl Outcome {
 
 /// What the user is typing on a question's free-text row.
 ///
-/// Its own little editor rather than the input box's, because the row is in
-/// the middle of a list the arrow keys are already walking: `Up` at the top of
-/// the draft is not a cursor move, it is the option above.
-#[derive(Clone, Debug, Default)]
-struct Draft {
-  text: String,
-  /// Where the next character lands, as a byte offset into `text`.
-  cursor: usize,
+/// The row is in the middle of a list the arrow keys are already walking, so
+/// the keys are routed by hand rather than through the text area's own
+/// bindings: `Up` at the top of the draft is not a cursor move, it is the
+/// option above.
+type Draft = TextArea<'static>;
+
+fn draft_text(draft: &Draft) -> String {
+  draft.lines().join("\n")
 }
 
-impl Draft {
-  fn insert(&mut self, c: char) {
-    self.text.insert(self.cursor, c);
-    self.cursor += c.len_utf8();
-  }
-
-  fn insert_str(&mut self, s: &str) {
-    self.text.insert_str(self.cursor, s);
-    self.cursor += s.len();
-  }
-
-  fn backspace(&mut self) {
-    if let Some((at, _)) = self.text[..self.cursor].char_indices().next_back() {
-      self.text.remove(at);
-      self.cursor = at;
+/// The draft's lines with the cursor drawn over the character it is on, so
+/// moving it shifts nothing, before they are wrapped to `width`.
+fn draft_shown(draft: &Draft, width: u16, style: Style) -> Vec<Line<'static>> {
+  let DataCursor(row, column) = draft.cursor();
+  let lines = draft.lines().iter().enumerate().map(|(index, line)| {
+    if index != row {
+      return Line::styled(line.clone(), style);
     }
-  }
-
-  fn left(&mut self) {
-    if let Some((at, _)) = self.text[..self.cursor].char_indices().next_back() {
-      self.cursor = at;
-    }
-  }
-
-  fn right(&mut self) {
-    if let Some(c) = self.text[self.cursor..].chars().next() {
-      self.cursor += c.len_utf8();
-    }
-  }
-
-  fn line_start(&self) -> usize {
-    self.text[..self.cursor].rfind('\n').map_or(0, |at| at + 1)
-  }
-
-  fn line_end(&self) -> usize {
-    self.text[self.cursor..]
-      .find('\n')
-      .map_or(self.text.len(), |at| self.cursor + at)
-  }
-
-  /// Which character of its line the cursor is on, so moving between lines
-  /// keeps the column the way an editor does.
-  fn column(&self) -> usize {
-    self.text[self.line_start()..self.cursor].chars().count()
-  }
-
-  fn seek(&mut self, start: usize, end: usize, column: usize) {
-    let line = &self.text[start..end];
-    self.cursor = start + line.char_indices().nth(column).map_or(line.len(), |(at, _)| at);
-  }
-
-  /// Move a line up, keeping the column. False when there is no line above,
-  /// which is when the key belonged to the list rather than to the draft.
-  fn up(&mut self) -> bool {
-    let start = self.line_start();
-    if start == 0 {
-      return false;
-    }
-    let column = self.column();
-    let above = self.text[..start - 1].rfind('\n').map_or(0, |at| at + 1);
-    self.seek(above, start - 1, column);
-    true
-  }
-
-  /// The same downwards.
-  fn down(&mut self) -> bool {
-    let end = self.line_end();
-    if end == self.text.len() {
-      return false;
-    }
-    let column = self.column();
-    let below = end + 1;
-    let next_end = self.text[below..].find('\n').map_or(self.text.len(), |at| below + at);
-    self.seek(below, next_end, column);
-    true
-  }
-
-  fn clear(&mut self) {
-    self.text.clear();
-    self.cursor = 0;
-  }
-
-  /// The draft with the caret drawn where the next character will land.
-  fn shown(&self) -> String {
-    format!("{}{CARET}{}", &self.text[..self.cursor], &self.text[self.cursor..])
-  }
+    let at = line.char_indices().nth(column).map_or(line.len(), |(at, _)| at);
+    let (before, rest) = line.split_at(at);
+    let mut after = rest.chars();
+    let cursor = match after.next() {
+      Some(c) if !c.is_whitespace() => Span::styled(c.to_string(), style.add_modifier(Modifier::REVERSED)),
+      _ => Span::styled(CURSOR, style),
+    };
+    Line::from(vec![
+      Span::styled(before.to_string(), style),
+      cursor,
+      Span::styled(after.as_str().to_string(), style),
+    ])
+  });
+  lines.flat_map(|line| wrap_line(line, width.max(1))).collect()
 }
 
 // ---------------------------------------------------------------- the dialog
+
+/// What a row of the list says.
+enum Label<'a> {
+  Text(String),
+  /// The free-text row while it has the keyboard, drawn with its cursor.
+  Draft(&'a Draft),
+}
 
 /// A row of the list under a question.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -550,7 +495,7 @@ impl Dialog {
   /// mean, and the Enter inside it never picks one.
   pub fn paste(&mut self, text: &str) {
     if self.typing {
-      self.draft().insert_str(text);
+      _ = self.draft().insert_str(text);
     }
   }
 
@@ -645,31 +590,27 @@ impl Dialog {
   /// Keys while the free-text row has them.
   fn typing_key(&mut self, key: KeyEvent, ctrl: bool) -> Option<Outcome> {
     match key.code {
-      KeyCode::Enter if crate::ui::is_newline(&key) => self.draft().insert('\n'),
-      KeyCode::Char('j') if ctrl => self.draft().insert('\n'),
+      KeyCode::Enter if crate::ui::is_newline(&key) => self.draft().insert_newline(),
+      KeyCode::Char('j') if ctrl => self.draft().insert_newline(),
       KeyCode::Enter => {
-        let text = self.draft().text.clone();
+        let text = draft_text(self.draft());
         return self.confirm(Answer::Typed(text));
       }
       // Pi's line-kill, taken as the whole draft rather than the line: the row
       // is one answer, and clearing it is what the key is reached for.
-      KeyCode::Char('u') if ctrl => self.draft().clear(),
-      KeyCode::Backspace => self.draft().backspace(),
-      KeyCode::Left => self.draft().left(),
-      KeyCode::Right => self.draft().right(),
-      KeyCode::Home => {
-        let at = self.draft().line_start();
-        self.draft().cursor = at;
-      }
-      KeyCode::End => {
-        let at = self.draft().line_end();
-        self.draft().cursor = at;
-      }
+      KeyCode::Char('u') if ctrl => *self.draft() = Draft::default(),
+      KeyCode::Backspace => _ = self.draft().delete_char(),
+      KeyCode::Left => self.draft().move_cursor(CursorMove::Back),
+      KeyCode::Right => self.draft().move_cursor(CursorMove::Forward),
+      KeyCode::Home => self.draft().move_cursor(CursorMove::Head),
+      KeyCode::End => self.draft().move_cursor(CursorMove::End),
       // Inside a draft of more than one line the arrows are the draft's; at
       // its ends they belong to the list again.
-      KeyCode::Up if !self.draft().up() => self.move_by(-1),
-      KeyCode::Down if !self.draft().down() => self.move_by(1),
-      KeyCode::Char(c) if !ctrl => self.draft().insert(c),
+      KeyCode::Up if self.draft().cursor().0 == 0 => self.move_by(-1),
+      KeyCode::Up => self.draft().move_cursor(CursorMove::Up),
+      KeyCode::Down if self.draft().cursor().0 + 1 == self.draft().lines().len() => self.move_by(1),
+      KeyCode::Down => self.draft().move_cursor(CursorMove::Down),
+      KeyCode::Char(c) if !ctrl => self.draft().insert_char(c),
       _ => {}
     }
     None
@@ -775,7 +716,7 @@ impl Dialog {
             true => format!("{} ✔", option.label),
             false => option.label.clone(),
           };
-          self.draw_row(&label, Some(at + 1), digits, ticked, active, width, out);
+          self.draw_row(Label::Text(label), Some(at + 1), digits, ticked, active, width, out);
           let indent = " ".repeat(prefix_width(digits, ticked.is_some()));
           for line in wrap_text(
             &option.description,
@@ -786,22 +727,23 @@ impl Dialog {
           }
         }
         Row::Other => {
-          let typed = draft.map(|d| d.text.as_str()).unwrap_or_default();
+          let typed = draft.map(draft_text).unwrap_or_default();
+          let empty = Draft::default();
           let label = match (active && self.typing, typed.is_empty()) {
-            // While the row has the keyboard it shows the caret, so an empty
+            // While the row has the keyboard it shows the cursor, so an empty
             // draft still reads as somewhere to type.
-            (true, _) => draft.map(Draft::shown).unwrap_or_else(|| CARET.to_string()),
+            (true, _) => Label::Draft(draft.unwrap_or(&empty)),
             // What was typed stays in the row while the other options are
             // looked at, rather than reverting to the invitation.
-            (false, false) => match self.confirmed_mark(None, active) {
+            (false, false) => Label::Text(match self.confirmed_mark(None, active) {
               true => format!("{typed} ✔"),
-              false => typed.to_string(),
-            },
-            (false, true) => OTHER_LABEL.to_string(),
+              false => typed,
+            }),
+            (false, true) => Label::Text(OTHER_LABEL.to_string()),
           };
           let box_ = question.multi_select.then_some(false);
           self.draw_row(
-            &label,
+            label,
             Some(question.options.len() + 1),
             digits,
             box_,
@@ -812,7 +754,15 @@ impl Dialog {
         }
         // No number and no box: it is the question's full stop, not one of
         // its answers.
-        Row::Next => self.draw_row(NEXT_LABEL, None, digits, None, active, width, out),
+        Row::Next => self.draw_row(
+          Label::Text(NEXT_LABEL.to_string()),
+          None,
+          digits,
+          None,
+          active,
+          width,
+          out,
+        ),
       }
     }
   }
@@ -836,7 +786,7 @@ impl Dialog {
   #[allow(clippy::too_many_arguments)]
   fn draw_row(
     &self,
-    label: &str,
+    label: Label,
     number: Option<usize>,
     digits: usize,
     ticked: Option<bool>,
@@ -860,7 +810,11 @@ impl Dialog {
       true => Style::default().fg(Color::Cyan).bold(),
       false => Style::default(),
     };
-    let wrapped = wrap_text(label, width.saturating_sub(prefix.chars().count() as u16), style);
+    let width = width.saturating_sub(prefix.chars().count() as u16);
+    let wrapped = match label {
+      Label::Text(text) => wrap_text(&text, width, style),
+      Label::Draft(draft) => draft_shown(draft, width, style),
+    };
     for (at, line) in wrapped.into_iter().enumerate() {
       out.push(lead(
         match at {
@@ -908,7 +862,15 @@ impl Dialog {
       if active {
         *focus = out.len();
       }
-      self.draw_row(label, Some(index + 1), 1, None, active, width, out);
+      self.draw_row(
+        Label::Text(label.to_string()),
+        Some(index + 1),
+        1,
+        None,
+        active,
+        width,
+        out,
+      );
     }
   }
 
@@ -1061,9 +1023,33 @@ mod tests {
     press(&mut dialog, KeyCode::Left);
     press(&mut dialog, KeyCode::Backspace);
     type_in(&mut dialog, "y");
-    assert_eq!(dialog.drafts[&0].text, "redys");
+    assert_eq!(draft_text(&dialog.drafts[&0]), "redys");
     dialog.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-    assert_eq!(dialog.drafts[&0].text, "");
+    assert_eq!(draft_text(&dialog.drafts[&0]), "");
+  }
+
+  #[test]
+  fn moving_the_cursor_moves_no_letters() {
+    let mut dialog = Dialog::new(vec![question("Which cache?", &["Memory", "Disk"], false)]);
+    press(&mut dialog, KeyCode::Up);
+    type_in(&mut dialog, "redis");
+    let row = |dialog: &Dialog| {
+      let (lines, focus) = dialog.lines(40);
+      lines[focus].to_string()
+    };
+    assert!(row(&dialog).ends_with("redis█"), "at the end the cursor is a block");
+    press(&mut dialog, KeyCode::Left);
+    let (lines, focus) = dialog.lines(40);
+    assert!(
+      lines[focus].to_string().ends_with("redis"),
+      "the cursor is drawn over the s"
+    );
+    assert!(
+      lines[focus]
+        .spans
+        .iter()
+        .any(|span| span.content == "s" && span.style.add_modifier.contains(Modifier::REVERSED))
+    );
   }
 
   #[test]
@@ -1073,7 +1059,7 @@ mod tests {
     type_in(&mut dialog, "one");
     dialog.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
     type_in(&mut dialog, "two");
-    assert_eq!(dialog.drafts[&0].text, "one\ntwo");
+    assert_eq!(draft_text(&dialog.drafts[&0]), "one\ntwo");
     // Up moves between the draft's own lines, and only then leaves the row.
     press(&mut dialog, KeyCode::Up);
     assert!(dialog.typing, "still in the draft");
@@ -1086,7 +1072,7 @@ mod tests {
     let mut dialog = Dialog::new(vec![question("Which cache?", &["Memory", "Disk"], false)]);
     press(&mut dialog, KeyCode::Up);
     dialog.paste("one\ntwo");
-    assert_eq!(dialog.drafts[&0].text, "one\ntwo");
+    assert_eq!(draft_text(&dialog.drafts[&0]), "one\ntwo");
     assert!(
       dialog.typing,
       "the paste answered nothing and the row still has the keys"
@@ -1094,7 +1080,7 @@ mod tests {
     // On a row of choices there is nothing a paste could mean.
     press(&mut dialog, KeyCode::Down);
     dialog.paste("three");
-    assert_eq!(dialog.drafts[&0].text, "one\ntwo");
+    assert_eq!(draft_text(&dialog.drafts[&0]), "one\ntwo");
   }
 
   #[test]

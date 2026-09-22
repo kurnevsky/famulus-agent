@@ -2817,7 +2817,7 @@ fn an_answer_of_ones_own_is_typed_into_the_row_that_offers_it() {
   // The row above the first is the last one, which is the one typed into.
   term.type_in("Up");
   term.type_in("redis");
-  let screen = term.wait_for("redis▌");
+  let screen = term.wait_for("redis█");
   assert!(
     screen.contains("Alt+Enter for newline"),
     "the hint follows the keys:\n{screen}"
