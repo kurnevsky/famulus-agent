@@ -694,8 +694,8 @@ pub struct EditDiff {
 /// tool's own words are the whole story.
 fn attach_diff(ctx: &mut ToolContext, before: &str, after: &str) {
   let diff = edit::generate_diff_string(before, after, 4);
-  if !diff.text.trim().is_empty() {
-    ctx.insert_result(EditDiff { diff: diff.text });
+  if !diff.trim().is_empty() {
+    ctx.insert_result(EditDiff { diff });
   }
 }
 

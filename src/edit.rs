@@ -16,14 +16,6 @@ pub struct Applied {
   pub new: String,
 }
 
-pub struct DiffOutput {
-  pub text: String,
-  /// 1-based line of the first change in the new content, for editor
-  /// navigation; kept for tests.
-  #[cfg_attr(not(test), allow(dead_code))]
-  pub first_changed_line: Option<usize>,
-}
-
 pub fn split_bom(content: &str) -> (&'static str, &str) {
   match content.strip_prefix('\u{FEFF}') {
     Some(rest) => ("\u{FEFF}", rest),
@@ -285,117 +277,61 @@ fn line_range(spans: &[(usize, usize)], r: &Replacement) -> Result<(usize, usize
   Ok((start_line, end_line + 1))
 }
 
-#[derive(PartialEq, Eq, Clone, Copy)]
-enum Kind {
-  Equal,
-  Removed,
-  Added,
-}
-
 /// Compact diff: `+N line` / `-N line` for changes, ` N line` for up to
 /// `context` lines around them, and `...` where context was skipped.
-pub fn generate_diff_string(old: &str, new: &str, context: usize) -> DiffOutput {
+pub fn generate_diff_string(old: &str, new: &str, context: usize) -> String {
+  use similar::ChangeTag;
   let diff = similar::TextDiff::from_lines(old, new);
   // Collapse the change stream into runs of equal/removed/added lines.
-  let mut parts: Vec<(Kind, Vec<String>)> = Vec::new();
+  let mut parts: Vec<(ChangeTag, Vec<&str>)> = Vec::new();
   for change in diff.iter_all_changes() {
-    let kind = match change.tag() {
-      similar::ChangeTag::Equal => Kind::Equal,
-      similar::ChangeTag::Delete => Kind::Removed,
-      similar::ChangeTag::Insert => Kind::Added,
-    };
-    let line = change.value().trim_end_matches('\n').to_string();
+    let line = change.value().trim_end_matches('\n');
     match parts.last_mut() {
-      Some((k, lines)) if *k == kind => lines.push(line),
-      _ => parts.push((kind, vec![line])),
+      Some((tag, lines)) if *tag == change.tag() => lines.push(line),
+      _ => parts.push((change.tag(), vec![line])),
     }
   }
 
   let width = old.split('\n').count().max(new.split('\n').count()).to_string().len();
   let num = |n: usize| format!("{n:>width$}");
-  let ellipsis = format!(" {} ...", " ".repeat(width));
   let mut out: Vec<String> = Vec::new();
   let (mut old_num, mut new_num) = (1usize, 1usize);
-  let mut last_was_change = false;
-  let mut first_changed_line = None;
 
-  for (i, (kind, lines)) in parts.iter().enumerate() {
-    match kind {
-      Kind::Added | Kind::Removed => {
-        first_changed_line.get_or_insert(new_num);
+  for (i, (tag, lines)) in parts.iter().enumerate() {
+    match tag {
+      ChangeTag::Insert => {
         for line in lines {
-          if *kind == Kind::Added {
-            out.push(format!("+{} {line}", num(new_num)));
-            new_num += 1;
-          } else {
-            out.push(format!("-{} {line}", num(old_num)));
-            old_num += 1;
-          }
+          out.push(format!("+{} {line}", num(new_num)));
+          new_num += 1;
         }
-        last_was_change = true;
       }
-      Kind::Equal => {
-        let next_is_change = parts.get(i + 1).is_some_and(|(k, _)| *k != Kind::Equal);
-        let emit = |out: &mut Vec<String>, line: &str, old_num: &mut usize, new_num: &mut usize| {
-          out.push(format!(" {} {line}", num(*old_num)));
-          *old_num += 1;
-          *new_num += 1;
-        };
-        match (last_was_change, next_is_change) {
-          (true, true) => {
-            if lines.len() <= context * 2 {
-              for line in lines {
-                emit(&mut out, line, &mut old_num, &mut new_num);
-              }
-            } else {
-              for line in &lines[..context] {
-                emit(&mut out, line, &mut old_num, &mut new_num);
-              }
-              let skipped = lines.len() - 2 * context;
-              out.push(ellipsis.clone());
-              old_num += skipped;
-              new_num += skipped;
-              for line in &lines[lines.len() - context..] {
-                emit(&mut out, line, &mut old_num, &mut new_num);
-              }
-            }
-          }
-          (true, false) => {
-            let shown = lines.len().min(context);
-            for line in &lines[..shown] {
-              emit(&mut out, line, &mut old_num, &mut new_num);
-            }
-            let skipped = lines.len() - shown;
-            if skipped > 0 {
-              out.push(ellipsis.clone());
-              old_num += skipped;
-              new_num += skipped;
-            }
-          }
-          (false, true) => {
-            let skipped = lines.len().saturating_sub(context);
-            if skipped > 0 {
-              out.push(ellipsis.clone());
-              old_num += skipped;
-              new_num += skipped;
-            }
-            for line in &lines[skipped..] {
-              emit(&mut out, line, &mut old_num, &mut new_num);
-            }
-          }
-          (false, false) => {
-            old_num += lines.len();
-            new_num += lines.len();
+      ChangeTag::Delete => {
+        for line in lines {
+          out.push(format!("-{} {line}", num(old_num)));
+          old_num += 1;
+        }
+      }
+      ChangeTag::Equal => {
+        // Context is kept on the side of a run that touches a change: the end
+        // of the change before it, the start of the change after it.
+        let after_change = i > 0;
+        let before_change = i + 1 < parts.len();
+        let head = if after_change { context } else { 0 };
+        let tail = if before_change { context } else { 0 };
+        let hidden = head..lines.len().saturating_sub(tail);
+        for (k, line) in lines.iter().enumerate() {
+          if !hidden.contains(&k) {
+            out.push(format!(" {} {line}", num(old_num + k)));
+          } else if k == hidden.start && (after_change || before_change) {
+            out.push(format!(" {} ...", " ".repeat(width)));
           }
         }
-        last_was_change = false;
+        old_num += lines.len();
+        new_num += lines.len();
       }
     }
   }
-  DiffOutput {
-    text: out.join("\n"),
-    first_changed_line,
-  }
+  out.join("\n")
 }
 
 #[cfg(test)]
@@ -465,10 +401,8 @@ mod tests {
   fn diff_string_has_pi_layout() {
     let old = (1..=12).map(|i| format!("l{i}")).collect::<Vec<_>>().join("\n") + "\n";
     let new = old.replace("l6", "L6").replace("l7", "L7");
-    let d = generate_diff_string(&old, &new, 2);
-    assert_eq!(d.first_changed_line, Some(6));
     assert_eq!(
-      d.text,
+      generate_diff_string(&old, &new, 2),
       "    ...\n  4 l4\n  5 l5\n- 6 l6\n- 7 l7\n+ 6 L6\n+ 7 L7\n  8 l8\n  9 l9\n    ..."
     );
   }
