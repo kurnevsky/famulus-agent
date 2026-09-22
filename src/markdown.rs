@@ -182,7 +182,7 @@ pub fn wrap_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
         }
         // A word too long for a line of its own gains nothing by being moved
         // to one, so it is broken where the line it is on runs out.
-        if w > width {
+        if w > width && !blank {
           let mut piece = String::new();
           for ch in word.chars() {
             if used + ch.width().unwrap_or(0) > width {
@@ -711,96 +711,10 @@ fn prefix(lead: Span<'static>, line: Line<'static>) -> Line<'static> {
   Line::from(spans)
 }
 
-/// Word-wraps a run of spans to `width`, splitting spans where needed and
-/// carrying each span's style onto its fragments.
-///
-/// Measures in terminal columns, so CJK and emoji occupy the two cells they
-/// actually take. A `\n` span (a hard break) forces a new line.
+/// Word-wraps a run of spans to `width`, carrying each span's style onto its
+/// fragments.
 fn wrap(spans: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>> {
-  let width = width.max(1);
-  let mut lines = Vec::new();
-  let mut current: Vec<Span<'static>> = Vec::new();
-  let mut used = 0;
-
-  let mut push_line = |current: &mut Vec<Span<'static>>, used: &mut usize| {
-    // The separator that fell at the break belongs to neither line.
-    while current.last().is_some_and(|s| s.content.trim().is_empty()) {
-      current.pop();
-    }
-    lines.push(Line::from(std::mem::take(current)));
-    *used = 0;
-  };
-
-  for span in spans {
-    let style = span.style;
-    // A tab would otherwise be measured as one column and drawn as none.
-    let content = expand_tabs(&span.content);
-    for (i, chunk) in content.split('\n').enumerate() {
-      if i > 0 {
-        push_line(&mut current, &mut used);
-      }
-      for word in words(chunk) {
-        let w = word.width();
-        // Leading space on a fresh line is wrapping debris, not content.
-        if word.trim().is_empty() && used == 0 {
-          continue;
-        }
-        if used + w > width && used > 0 {
-          push_line(&mut current, &mut used);
-          if word.trim().is_empty() {
-            continue;
-          }
-        }
-        // A word longer than the line has to be broken somewhere.
-        if w > width {
-          let pieces = split(word, width);
-          let last = pieces.len() - 1;
-          for (i, piece) in pieces.into_iter().enumerate() {
-            let piece_width = piece.width();
-            current.push(Span::styled(piece, style));
-            if i < last {
-              push_line(&mut current, &mut used);
-            } else {
-              used += piece_width;
-            }
-          }
-          continue;
-        }
-        current.push(Span::styled(word.to_string(), style));
-        used += w;
-      }
-    }
-  }
-  while current.last().is_some_and(|s| s.content.trim().is_empty()) {
-    current.pop();
-  }
-  if !current.is_empty() {
-    lines.push(Line::from(current));
-  }
-  if lines.is_empty() {
-    lines.push(Line::default());
-  }
-  lines
-}
-
-/// Cuts a word too long for the line into `width`-wide pieces.
-fn split(word: &str, width: usize) -> Vec<String> {
-  let mut pieces = Vec::new();
-  let mut piece = String::new();
-  let mut used = 0;
-  for ch in word.chars() {
-    let w = ch.to_string().width();
-    if used + w > width && !piece.is_empty() {
-      pieces.push(std::mem::take(&mut piece));
-      used = 0;
-    }
-    piece.push(ch);
-    used += w;
-  }
-  if !piece.is_empty() {
-    pieces.push(piece);
-  }
-  pieces
+  wrap_line(Line::from(spans), width.clamp(1, u16::MAX.into()) as u16)
 }
 
 /// Splits on whitespace, keeping the separators so spacing survives wrapping.
@@ -884,9 +798,7 @@ mod tests {
     let span = |needle: &str| lines[1].spans.iter().find(|s| s.content == needle).unwrap();
     assert_eq!(span("let").style.fg, Some(Color::Magenta));
     assert_eq!(span("1").style.fg, Some(Color::Cyan));
-    // Wrapping splits a span at each space, so the comment arrives in pieces.
-    assert_eq!(span("//").style.fg, Some(Color::DarkGray));
-    assert_eq!(span("note").style.fg, Some(Color::DarkGray));
+    assert_eq!(span("// note").style.fg, Some(Color::DarkGray));
   }
 
   #[test]
@@ -1162,6 +1074,11 @@ mod tests {
     // Each piece is still the colour of the span it came out of.
     assert_eq!(wrapped[0].spans[0].style.fg, Some(Color::Red));
     assert_eq!(wrapped[1].spans[0].style.fg, Some(Color::Blue));
+  }
+
+  #[test]
+  fn spaces_wider_than_the_line_are_a_break_not_a_row() {
+    assert_eq!(plain(&wrap_line(Line::raw("a   ccc"), 2)), ["a", "cc", "c"]);
   }
 
   #[test]
