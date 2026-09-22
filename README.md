@@ -375,6 +375,14 @@ of them is answered however many were in flight, since a call left hanging is
 a transcript no provider will take back. Because entries name their parent, one file holds every
 branch the conversation took, not only the one it is on.
 
+The picker is typed at the way the model list is: letters narrow it to the
+sessions whose titles they fuzzily match, `Backspace` widens it again, the
+arrows steer what is left, and the matched letters are picked out in each row.
+A title is the session's name where it has one and its first message where it
+does not — which is what a conversation is remembered by, and a directory
+worked in for a month has more sessions than rows. The query is drawn in the
+list's own title, and `Enter` takes the row the filter left under the cursor.
+
 A session is deleted from the picker: `Delete` on a row asks, and a second
 `Delete` removes the file. Since that is the only copy of the conversation, it
 is asked about first, and any other key answers no. The session on screen is
@@ -731,7 +739,7 @@ what it spent.
 | `/continue` | Run the model again with no new message |
 | `/model` | Pick the model from what the provider offers, asked for afresh each time — type to filter, or `/model <id>` to name one outright |
 | `/new` | Start a new session |
-| `/resume` | Pick a saved session to resume — `Delete` removes the selected one, a second `Delete` confirms |
+| `/resume` | Pick a saved session to resume — type to filter, `Delete` removes the selected one, a second `Delete` confirms |
 | `/tree` | Move to another point in this session, on any branch |
 | `/fork` | Branch a new session from an earlier prompt |
 | `/name <name>` | Name the current session |

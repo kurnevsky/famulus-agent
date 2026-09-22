@@ -1575,6 +1575,65 @@ fn up_walks_back_through_the_prompts_and_a_resumed_session_brings_its_own() {
   assert_eq!(term.typed(), "pear", "the resumed session's last prompt");
 }
 
+/// The session picker is typed at the same way the model picker is: letters
+/// narrow it to the sessions whose titles they match, and `Enter` resumes
+/// what is left standing under the cursor.
+#[test]
+fn typing_at_the_session_picker_narrows_it_to_what_was_typed() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![Turn::Echo]);
+  let term = Term::start("session-filter", &provider, &[]);
+  // The rows a list has drawn something on: the box is as tall as the
+  // screen whatever is in it, and the blank ones are not sessions.
+  let listed = |rows: &[String]| {
+    rows
+      .iter()
+      .filter(|row| !row.trim_matches(|c| c == '│' || c == ' ').is_empty())
+      .count()
+  };
+  term.submit("apple");
+  term.wait_for("Answer to apple.");
+  term.submit("/new");
+  term.wait_for("New session.");
+  term.submit("pear");
+  term.wait_for("Answer to pear.");
+
+  term.submit("/resume");
+  term.wait_for("Esc cancel");
+  let (rows, _) = term.overlay();
+  assert_eq!(listed(&rows), 2, "both to start with: {rows:?}");
+
+  // A fuzzy match, as everywhere else in fa: "apl" is a-p-p-l-e.
+  term.type_in("apl");
+  term.wait_for("Resume: apl");
+  let (rows, on) = term.overlay();
+  assert_eq!(listed(&rows), 1, "only what matches is left: {rows:?}");
+  assert!(rows[on].contains("apple"), "and it is the one meant: {rows:?}");
+
+  // Backspace widens it again, and a query nothing matches says so rather
+  // than leaving an empty box.
+  term.type_in("BSpace");
+  term.type_in("BSpace");
+  term.type_in("BSpace");
+  term.type_in("zzz");
+  term.wait_for("No session matches.");
+  term.type_in("BSpace");
+  term.type_in("BSpace");
+  term.type_in("BSpace");
+
+  // What the filter left is what `Enter` resumes, rather than whichever row
+  // stood in that place before anything was typed.
+  term.type_in("apl");
+  term.wait_for("Resume: apl");
+  term.type_in("Enter");
+  term.wait_for("Resumed session");
+  term.type_in("Up");
+  term.settle();
+  assert_eq!(term.typed(), "apple", "the filtered-to session's own prompt");
+}
+
 /// A session file is the only copy of the conversation in it, so the picker
 /// asks before it removes one — and the session on screen, which is still
 /// writing to its file, is not one it will remove at all.
@@ -1622,10 +1681,17 @@ fn the_picker_deletes_a_session_once_it_has_asked_about_it() {
   );
   assert_eq!(term.session_files().len(), 2, "and nothing is deleted");
 
-  term.point_at("apple");
+  // The row deleted is the one the filter left under the cursor, rather than
+  // whichever row stood in that place before anything was typed.
+  term.type_in("aple");
+  term.wait_for("Resume: aple");
   term.type_in("DC");
   term.wait_for("delete? Del to confirm");
   term.type_in("DC");
+  term.wait_for("No session matches.");
+  for _ in 0..4 {
+    term.type_in("BSpace");
+  }
   term.settle();
   let (rows, _) = term.overlay();
   assert!(

@@ -247,6 +247,14 @@ enum OverlayList {
   /// `/resume`: every saved session, most recent first.
   Sessions {
     sessions: Vec<SessionInfo>,
+    /// What has been typed to narrow the list down, matched against the
+    /// titles — a session is remembered by what was asked in it, and a
+    /// directory worked in for a month has more sessions than rows.
+    query: String,
+    /// Which of `sessions` the query leaves, best match first, and which
+    /// letters of each title it matched. As for `Models`: worked out when the
+    /// query changes rather than while drawing.
+    shown: Vec<(usize, Vec<u32>)>,
     /// `Delete` has been pressed on the selected row and the deletion is
     /// waiting to be confirmed. A session file is gone for good, so it is
     /// asked about first.
@@ -261,7 +269,8 @@ enum OverlayList {
   Models {
     models: Vec<ModelInfo>,
     /// The filter, which is typed at the list rather than into a field of
-    /// its own: a picker of four hundred models is one you type at.
+    /// its own: a picker of four hundred models is one you type at. The
+    /// session picker is typed at the same way.
     query: String,
     /// Which of `models` the query leaves, best match first, and which
     /// letters of each the query matched — for drawing them picked out, as
@@ -309,8 +318,7 @@ impl Overlay {
 
   fn len(&self) -> usize {
     match &self.list {
-      OverlayList::Sessions { sessions, .. } => sessions.len(),
-      OverlayList::Models { shown, .. } => shown.len(),
+      OverlayList::Sessions { shown, .. } | OverlayList::Models { shown, .. } => shown.len(),
       OverlayList::Question { .. } => 0,
       _ => self.points().len(),
     }
@@ -321,7 +329,10 @@ impl Overlay {
       // A deletion waiting to be confirmed says so where the keys are said,
       // since the keys it is waiting for are not the usual ones.
       OverlayList::Sessions { confirming: true, .. } => " Delete session? — Del confirm · Esc cancel ".into(),
-      OverlayList::Sessions { .. } => " Resume session — ↑↓ select · Enter resume · Del delete · Esc cancel ".into(),
+      OverlayList::Sessions { query, .. } => match query.is_empty() {
+        true => " Resume — type to filter · ↑↓ select · Enter resume · Del delete · Esc cancel ".into(),
+        false => format!(" Resume: {query}▏ — ↑↓ select · Enter resume · Del delete · Esc cancel "),
+      },
       OverlayList::Tree(_) => " Tree — ↑↓ PgUp/PgDn select · Enter go there · Esc cancel ".into(),
       OverlayList::Fork(_) => " Fork — ↑↓ PgUp/PgDn select · Enter fork · Esc cancel ".into(),
       // The filter is drawn where the title is, since that is where the list
@@ -1162,8 +1173,11 @@ impl App {
           return;
         };
         match list {
-          OverlayList::Sessions { sessions, .. } => {
-            if let Some(info) = sessions.get(selected) {
+          // As for the models below: the row taken is the one the filter left
+          // there, which is an index into the whole list rather than a place
+          // in it.
+          OverlayList::Sessions { sessions, shown, .. } => {
+            if let Some(info) = shown.get(selected).and_then(|(at, _)| sessions.get(*at)) {
               self.load_session(&info.path.clone());
             }
           }
@@ -1183,7 +1197,7 @@ impl App {
     }
   }
 
-  /// A key typed at the model picker's filter, answering whether it was one.
+  /// A key typed at a picker's filter, answering whether it was one.
   ///
   /// Only letters and `Backspace`: there is no cursor in the query, because
   /// the arrows belong to the list under it — which is what is being looked
@@ -1194,19 +1208,23 @@ impl App {
     let Some(Overlay { list, selected }) = &mut self.overlay else {
       return false;
     };
-    let OverlayList::Models { models, query, shown } = list else {
-      return false;
-    };
-    match code {
-      KeyCode::Char(c) => query.push(c),
-      KeyCode::Backspace if !query.is_empty() => {
-        query.pop();
+    match list {
+      OverlayList::Models { models, query, shown } => {
+        if !edit_query(query, code) {
+          return false;
+        }
+        *shown = filter_models(&mut self.matcher, models, query);
       }
-      // An empty query has nothing to delete, so `Backspace` is not a key
-      // this list answers to and the overlay's own handling gets it.
+      OverlayList::Sessions {
+        sessions, query, shown, ..
+      } => {
+        if !edit_query(query, code) {
+          return false;
+        }
+        *shown = filter_sessions(&mut self.matcher, sessions, query);
+      }
       _ => return false,
     }
-    *shown = filter_models(&mut self.matcher, models, query);
     // The best match is the one wanted, and the rows under it have been
     // reordered anyway — a cursor left where it stood would mean nothing.
     *selected = 0;
@@ -1244,11 +1262,17 @@ impl App {
     let Some(overlay) = &mut self.overlay else {
       return;
     };
-    let OverlayList::Sessions { sessions, confirming } = &mut overlay.list else {
+    let OverlayList::Sessions {
+      sessions,
+      query,
+      shown,
+      confirming,
+    } = &mut overlay.list
+    else {
       return;
     };
     *confirming = false;
-    let Some(info) = sessions.get(overlay.selected) else {
+    let Some(info) = shown.get(overlay.selected).and_then(|(at, _)| sessions.get(*at)) else {
       return;
     };
     let (path, title) = (info.path.clone(), info.title().to_string());
@@ -1267,8 +1291,13 @@ impl App {
         .push(Entry::Error(format!("Could not delete session: {err:#}")));
       return;
     }
-    sessions.remove(overlay.selected);
-    overlay.selected = overlay.selected.min(sessions.len().saturating_sub(1));
+    let at = shown[overlay.selected].0;
+    sessions.remove(at);
+    // Every index past the deleted one has moved, so the rows are worked out
+    // again rather than patched up — the query is the same, so what is left
+    // is the same list one row shorter.
+    *shown = filter_sessions(&mut self.matcher, sessions, query);
+    overlay.selected = overlay.selected.min(shown.len().saturating_sub(1));
     let emptied = sessions.is_empty();
     self.entries.push(Entry::Info(format!("Deleted session {title}.")));
     // Nothing left to pick from is nothing to keep a picker open for.
@@ -1795,7 +1824,11 @@ impl App {
     }
     self.overlay = Some(Overlay {
       list: OverlayList::Sessions {
+        // Nothing typed yet, so every session is shown, most recent first,
+        // with nothing picked out in any of them.
+        shown: (0..sessions.len()).map(|at| (at, Vec::new())).collect(),
         sessions,
+        query: String::new(),
         confirming: false,
       },
       selected: 0,
@@ -2471,14 +2504,15 @@ impl App {
       return;
     }
     // A filter that has narrowed the list to nothing says so, rather than
-    // leaving an empty box to be read as a provider with no models.
-    if let OverlayList::Models { shown, .. } = &overlay.list
-      && shown.is_empty()
-    {
-      let line = Line::from(Span::styled(
-        "  No model matches.",
-        Style::default().add_modifier(Modifier::DIM),
-      ));
+    // leaving an empty box to be read as a provider with no models, or as a
+    // directory with nothing saved in it.
+    let emptied = match &overlay.list {
+      OverlayList::Models { shown, .. } if shown.is_empty() => Some("  No model matches."),
+      OverlayList::Sessions { shown, .. } if shown.is_empty() => Some("  No session matches."),
+      _ => None,
+    };
+    if let Some(text) = emptied {
+      let line = Line::from(Span::styled(text, Style::default().add_modifier(Modifier::DIM)));
       f.render_widget(Paragraph::new(line), inner);
       return;
     }
@@ -2488,8 +2522,14 @@ impl App {
     // Each row is a title and a dim note about it, the title clipped so the
     // note always fits.
     let rows: Vec<(String, String)> = match &overlay.list {
-      OverlayList::Sessions { sessions, confirming } => sessions
+      OverlayList::Sessions {
+        sessions,
+        shown,
+        confirming,
+        ..
+      } => shown
         .iter()
+        .filter_map(|(at, _)| sessions.get(*at))
         .enumerate()
         .map(|(i, s)| {
           // The row being asked about says what it is being asked, where it
@@ -2545,7 +2585,7 @@ impl App {
     // Only a filtered list has letters to pick out, and only the ones the
     // filter matched — the same cyan the `/` popup underlines its own with.
     let matched: &[(usize, Vec<u32>)] = match &overlay.list {
-      OverlayList::Models { shown, .. } => shown,
+      OverlayList::Models { shown, .. } | OverlayList::Sessions { shown, .. } => shown,
       _ => &[],
     };
     let dim = Style::default().add_modifier(Modifier::DIM);
@@ -3113,33 +3153,64 @@ fn key(item: &Match) -> String {
   }
 }
 
-/// Which models `query` leaves, best match first: each as its index into
-/// `models` and the letters of its id the query matched.
+/// A key typed at a picker's filter, answering whether it was one and
+/// changing `query` if it was.
+fn edit_query(query: &mut String, code: KeyCode) -> bool {
+  match code {
+    KeyCode::Char(c) => query.push(c),
+    KeyCode::Backspace if !query.is_empty() => {
+      query.pop();
+    }
+    // An empty query has nothing to delete, so `Backspace` is not a key the
+    // list answers to and the overlay's own handling gets it.
+    _ => return false,
+  }
+  true
+}
+
+/// Which of `rows` `query` leaves, best match first: each as its index into
+/// `rows` and the letters of it the query matched.
 ///
-/// The same fuzzy match the `/` popup is filtered by, over ids alone: a
-/// provider's display name is another spelling of the same thing, and
-/// matching both would rank a model twice for looking like itself.
-fn filter_models(matcher: &mut Matcher, models: &[ModelInfo], query: &str) -> Vec<(usize, Vec<u32>)> {
+/// The same fuzzy match the `/` popup is filtered by, over the one string a
+/// row is drawn as — so every letter picked out is a letter on screen.
+fn filter_rows<'a>(
+  matcher: &mut Matcher,
+  rows: impl IntoIterator<Item = &'a str>,
+  query: &str,
+) -> Vec<(usize, Vec<u32>)> {
+  let rows = rows.into_iter().enumerate();
   if query.is_empty() {
-    return (0..models.len()).map(|at| (at, Vec::new())).collect();
+    return rows.map(|(at, _)| (at, Vec::new())).collect();
   }
   let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
   let mut buf = Vec::new();
-  let mut scored: Vec<(u32, usize, Vec<u32>)> = models
-    .iter()
-    .enumerate()
-    .filter_map(|(at, model)| {
+  let mut scored: Vec<(u32, usize, Vec<u32>)> = rows
+    .filter_map(|(at, row)| {
       let mut highlights = Vec::new();
-      let score = pattern.indices(Utf32Str::new(&model.id, &mut buf), matcher, &mut highlights)?;
+      let score = pattern.indices(Utf32Str::new(row, &mut buf), matcher, &mut highlights)?;
       highlights.sort_unstable();
       highlights.dedup();
       Some((score, at, highlights))
     })
     .collect();
   // Ties keep the order the list was in, which is the order it was sorted
-  // into: a query matching a whole family of models lists them as a family.
+  // into: a query matching a whole family of models lists them as a family,
+  // and a query matching several sessions lists the newest of them first.
   scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
   scored.into_iter().map(|(_, at, hits)| (at, hits)).collect()
+}
+
+/// Which models `query` leaves, matched over ids alone: a provider's display
+/// name is another spelling of the same thing, and matching both would rank a
+/// model twice for looking like itself.
+fn filter_models(matcher: &mut Matcher, models: &[ModelInfo], query: &str) -> Vec<(usize, Vec<u32>)> {
+  filter_rows(matcher, models.iter().map(|model| model.id.as_str()), query)
+}
+
+/// Which sessions `query` leaves, matched over the titles: what a session is
+/// remembered by is its name, or the question it opened with.
+fn filter_sessions(matcher: &mut Matcher, sessions: &[SessionInfo], query: &str) -> Vec<(usize, Vec<u32>)> {
+  filter_rows(matcher, sessions.iter().map(SessionInfo::title), query)
 }
 
 fn filter_commands(matcher: &mut Matcher, query: &str) -> Vec<Match> {
@@ -4562,6 +4633,44 @@ mod tests {
     assert_eq!(matched[0].1, [7, 8, 9]);
     // Nothing typed, nothing picked out.
     assert!(filter_models(&mut matcher, &models, "")[0].1.is_empty());
+  }
+
+  #[test]
+  fn the_session_filter_matches_the_titles_the_rows_are_drawn_as() {
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let session = |name: Option<&str>, first: &str| SessionInfo {
+      path: PathBuf::from("/tmp/s.jsonl"),
+      id: "s".into(),
+      name: name.map(str::to_string),
+      cwd: "/home/u/work".into(),
+      modified: chrono::Local::now(),
+      message_count: 2,
+      first_message: first.into(),
+    };
+    let sessions = vec![
+      session(None, "fix the scrollbar"),
+      session(Some("release notes"), "unrelated first message"),
+      session(None, "add a filter to the picker"),
+    ];
+    let mut titles = |query| {
+      filter_sessions(&mut matcher, &sessions, query)
+        .into_iter()
+        .map(|(at, _)| sessions[at].title())
+        .collect::<Vec<_>>()
+    };
+    // Nothing typed leaves the list as the store listed it, newest first.
+    assert_eq!(
+      titles(""),
+      ["fix the scrollbar", "release notes", "add a filter to the picker"]
+    );
+    // A name stands in for the first message, and is what gets matched.
+    assert_eq!(titles("release"), ["release notes"]);
+    // Fuzzy, over the first message where there is no name.
+    assert_eq!(titles("scrlbr"), ["fix the scrollbar"]);
+    assert!(titles("zzz").is_empty());
+    // And the letters it matched are picked out where they are: f-i-lter.
+    let matched = filter_sessions(&mut matcher, &sessions, "fil");
+    assert_eq!(matched[0].1, [6, 7, 8]);
   }
 
   #[test]
