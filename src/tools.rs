@@ -234,99 +234,90 @@ impl Tool for ReadTool {
       None => (all_lines[start..].join("\n"), None),
     };
 
-    let head = truncate_head(&selected);
-    let output = if head.first_line_exceeds_limit {
+    let cut = keep(&selected, false);
+    let output = if cut.by.is_some() && cut.kept.is_empty() {
       format!(
         "[Line {start_display} is {}, exceeds {} limit. Use bash: sed -n '{start_display}p' {} | head -c {MAX_BYTES}]",
         format_size(all_lines[start].len()),
         format_size(MAX_BYTES),
         args.path
       )
-    } else if head.truncated {
-      let end_display = start_display + head.output_lines - 1;
+    } else if let Some(by) = cut.by {
+      let end_display = start_display + cut.kept.len() - 1;
       let next = end_display + 1;
-      if head.truncated_by == Some(TruncatedBy::Lines) {
-        format!(
-          "{}\n\n[Showing lines {start_display}-{end_display} of {total_lines}. Use offset={next} to continue.]",
-          head.content
-        )
-      } else {
-        format!(
-          "{}\n\n[Showing lines {start_display}-{end_display} of {total_lines} ({} limit). Use offset={next} to continue.]",
-          head.content,
-          format_size(MAX_BYTES)
-        )
-      }
+      let limit = match by {
+        TruncatedBy::Lines => String::new(),
+        TruncatedBy::Bytes => format!(" ({} limit)", format_size(MAX_BYTES)),
+      };
+      format!(
+        "{}\n\n[Showing lines {start_display}-{end_display} of {total_lines}{limit}. Use offset={next} to continue.]",
+        cut.text()
+      )
     } else if let Some(shown) = user_limited
       && start + shown < total_lines
     {
       let remaining = total_lines - (start + shown);
       let next = start + shown + 1;
-      format!(
-        "{}\n\n[{remaining} more lines in file. Use offset={next} to continue.]",
-        head.content
-      )
+      format!("{selected}\n\n[{remaining} more lines in file. Use offset={next} to continue.]")
     } else {
-      head.content
+      selected
     };
     Ok(vec![ToolResultContent::text(output)])
   }
 }
 
-struct HeadTruncation {
-  content: String,
-  truncated: bool,
-  truncated_by: Option<TruncatedBy>,
-  output_lines: usize,
-  first_line_exceeds_limit: bool,
+/// What of some output fits in `MAX_LINES` lines and `MAX_BYTES` bytes.
+struct Cut<'a> {
+  /// Every line, without the empty one after a final newline.
+  lines: Vec<&'a str>,
+  /// The lines kept: from the start, or up to the end, depending on which end
+  /// was kept.
+  kept: Vec<&'a str>,
+  /// Which limit made the cut; `None` when everything fits. A cut that kept
+  /// nothing is one line on its own longer than the byte budget.
+  by: Option<TruncatedBy>,
 }
 
-/// Keep the first `MAX_LINES` lines within `MAX_BYTES`.
-fn truncate_head(content: &str) -> HeadTruncation {
+impl Cut<'_> {
+  fn text(&self) -> String {
+    self.kept.join("\n")
+  }
+}
+
+/// Keep whole lines within the limits, from the start of `content` or from
+/// its end.
+fn keep(content: &str, from_end: bool) -> Cut<'_> {
   let mut lines: Vec<&str> = content.split('\n').collect();
   if content.ends_with('\n') {
     lines.pop();
   }
-  if lines.len() <= MAX_LINES && content.len() <= MAX_BYTES {
-    return HeadTruncation {
-      content: content.to_string(),
-      truncated: false,
-      truncated_by: None,
-      output_lines: lines.len(),
-      first_line_exceeds_limit: false,
-    };
+  let (mut kept, by) = match from_end {
+    true => within(lines.iter().rev().copied()),
+    false => within(lines.iter().copied()),
+  };
+  if from_end {
+    kept.reverse();
   }
-  if lines.first().is_some_and(|l| l.len() > MAX_BYTES) {
-    return HeadTruncation {
-      content: String::new(),
-      truncated: true,
-      truncated_by: Some(TruncatedBy::Bytes),
-      output_lines: 0,
-      first_line_exceeds_limit: true,
-    };
-  }
-  let mut kept: Vec<&str> = Vec::new();
+  Cut { lines, kept, by }
+}
+
+/// The lines, in the order given, until one of the limits is reached, and
+/// which one it was.
+fn within<'a>(lines: impl Iterator<Item = &'a str>) -> (Vec<&'a str>, Option<TruncatedBy>) {
+  let mut kept = Vec::new();
   let mut bytes = 0;
-  let mut by = TruncatedBy::Lines;
-  for (i, line) in lines.iter().enumerate().take(MAX_LINES) {
-    let line_bytes = line.len() + usize::from(i > 0);
+  for line in lines {
+    if kept.len() >= MAX_LINES {
+      return (kept, Some(TruncatedBy::Lines));
+    }
+    let line_bytes = line.len() + usize::from(!kept.is_empty());
     if bytes + line_bytes > MAX_BYTES {
-      by = TruncatedBy::Bytes;
-      break;
+      return (kept, Some(TruncatedBy::Bytes));
     }
     kept.push(line);
     bytes += line_bytes;
   }
-  if kept.len() >= MAX_LINES && bytes <= MAX_BYTES {
-    by = TruncatedBy::Lines;
-  }
-  HeadTruncation {
-    content: kept.join("\n"),
-    truncated: true,
-    truncated_by: Some(by),
-    output_lines: kept.len(),
-    first_line_exceeds_limit: false,
-  }
+  (kept, None)
 }
 
 /// A tool result cut to the size the built-in tools keep to, or `None` when
@@ -355,12 +346,10 @@ pub fn cap_reply(content: &[ToolResultContent]) -> Option<Vec<ToolResultContent>
     }
   }
   let text = said.join("\n");
-  let head = truncate_head(&text);
-  if !head.truncated {
-    return None;
-  }
+  let cut = keep(&text, false);
+  let by = cut.by?;
   let full = spill("fa-mcp", &text).map_or_else(|| "(unavailable)".to_string(), |p| p.display().to_string());
-  let kept = match head.first_line_exceeds_limit {
+  let kept = match cut.kept.is_empty() {
     // One line longer than the whole budget — a JSON document written flat,
     // usually. There is no line to stop at, so it is cut where the budget
     // runs out, at a character boundary rather than inside one.
@@ -373,21 +362,19 @@ pub fn cap_reply(content: &[ToolResultContent]) -> Option<Vec<ToolResultContent>
         "{}\n\n[Showing first {} of line 1 (line is {}). Full output: {full}]",
         &text[..end],
         format_size(end),
-        format_size(text.split('\n').next().unwrap_or_default().len())
+        format_size(cut.lines[0].len())
       )
     }
     false => {
-      let mut lines = text.split('\n').count();
-      if text.ends_with('\n') {
-        lines -= 1;
-      }
-      let limit = match head.truncated_by == Some(TruncatedBy::Bytes) {
-        true => format!(" ({} limit)", format_size(MAX_BYTES)),
-        false => String::new(),
+      let limit = match by {
+        TruncatedBy::Lines => String::new(),
+        TruncatedBy::Bytes => format!(" ({} limit)", format_size(MAX_BYTES)),
       };
       format!(
-        "{}\n\n[Showing lines 1-{} of {lines}{limit}. Full output: {full}]",
-        head.content, head.output_lines
+        "{}\n\n[Showing lines 1-{} of {}{limit}. Full output: {full}]",
+        cut.text(),
+        cut.kept.len(),
+        cut.lines.len()
       )
     }
   };
@@ -451,6 +438,9 @@ mod capping_tests {
     assert!(cap_reply(&content).is_none(), "nothing to cut, so nothing is rewritten");
     // Every line and byte of the budget still fits.
     let edge = "x".repeat(MAX_BYTES);
+    assert!(cap_reply(&[ToolResultContent::text(edge)]).is_none());
+    // The newline after the last line is not a byte of any line.
+    let edge = "x".repeat(MAX_BYTES) + "\n";
     assert!(cap_reply(&[ToolResultContent::text(edge)]).is_none());
     let edge = std::iter::repeat_n("y", MAX_LINES).collect::<Vec<_>>().join("\n");
     assert!(cap_reply(&[ToolResultContent::text(edge)]).is_none());
@@ -1350,50 +1340,21 @@ impl OutputAccumulator {
 /// Keep the last `MAX_LINES` lines within `MAX_BYTES`.
 /// Returns (content, truncated_by, output_lines, output_bytes, last_line_partial).
 fn truncate_tail(content: &str) -> (String, Option<TruncatedBy>, usize, usize, bool) {
-  let mut lines: Vec<&str> = content.split('\n').collect();
-  if content.ends_with('\n') {
-    lines.pop();
-  }
-  if lines.len() <= MAX_LINES && content.len() <= MAX_BYTES {
-    return (content.to_string(), None, lines.len(), content.len(), false);
-  }
-  let mut kept: Vec<&str> = Vec::new();
-  let mut bytes = 0;
-  let mut by = TruncatedBy::Lines;
-  let mut partial = false;
-  let mut partial_line = String::new();
-  for line in lines.iter().rev() {
-    if kept.len() >= MAX_LINES {
-      break;
+  let cut = keep(content, true);
+  match cut.by {
+    None => (content.to_string(), None, cut.kept.len(), content.len(), false),
+    // A single line larger than the budget: keep its end.
+    Some(by) if cut.kept.is_empty() => {
+      let line = cut.lines[cut.lines.len() - 1];
+      let tail = &line[line.ceil_char_boundary(line.len() - MAX_BYTES)..];
+      (tail.to_string(), Some(by), 1, tail.len(), true)
     }
-    let line_bytes = line.len() + usize::from(!kept.is_empty());
-    if bytes + line_bytes > MAX_BYTES {
-      by = TruncatedBy::Bytes;
-      if kept.is_empty() {
-        // A single line larger than the budget: keep its end.
-        let mut start = line.len() - MAX_BYTES;
-        while !line.is_char_boundary(start) {
-          start += 1;
-        }
-        partial_line = line[start..].to_string();
-        bytes = partial_line.len();
-        partial = true;
-      }
-      break;
+    Some(by) => {
+      let text = cut.text();
+      let bytes = text.len();
+      (text, Some(by), cut.kept.len(), bytes, false)
     }
-    kept.push(line);
-    bytes += line_bytes;
   }
-  if partial {
-    return (partial_line, Some(by), 1, bytes, true);
-  }
-  kept.reverse();
-  if kept.len() >= MAX_LINES && bytes <= MAX_BYTES {
-    by = TruncatedBy::Lines;
-  }
-  let out = kept.join("\n");
-  let bytes = out.len();
-  (out, Some(by), kept.len(), bytes, false)
 }
 
 fn format_size(bytes: usize) -> String {
