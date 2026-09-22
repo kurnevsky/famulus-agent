@@ -33,7 +33,7 @@ mod style {
   use super::*;
 
   pub fn heading(depth: u8) -> Style {
-    let style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
     if depth == 1 {
       style.add_modifier(Modifier::UNDERLINED)
     } else {
@@ -41,49 +41,16 @@ mod style {
     }
   }
 
-  pub fn code_block() -> Style {
-    Style::default().fg(Color::Green)
-  }
-
-  pub fn code_border() -> Style {
-    Style::default().fg(Color::DarkGray)
-  }
-
-  pub fn inline_code() -> Style {
-    Style::default().fg(Color::Cyan)
-  }
-
-  pub fn link() -> Style {
-    Style::default().fg(Color::Blue).add_modifier(Modifier::UNDERLINED)
-  }
-
-  pub fn link_url() -> Style {
-    Style::default().add_modifier(Modifier::DIM)
-  }
-
-  pub fn quote() -> Style {
-    Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)
-  }
-
-  pub fn quote_border() -> Style {
-    Style::default().fg(Color::DarkGray)
-  }
-
-  pub fn rule() -> Style {
-    Style::default().fg(Color::DarkGray)
-  }
-
-  pub fn bullet() -> Style {
-    Style::default().fg(Color::Green)
-  }
-
-  pub fn footnote() -> Style {
-    Style::default().fg(Color::Blue)
-  }
-
-  pub fn dim() -> Style {
-    Style::default().add_modifier(Modifier::DIM)
-  }
+  pub const CODE_BLOCK: Style = Style::new().fg(Color::Green);
+  /// Everything drawn around the text rather than in it: a code block's
+  /// fences, a quote's bar, a rule, a table's lines.
+  pub const BORDER: Style = Style::new().fg(Color::DarkGray);
+  pub const INLINE_CODE: Style = Style::new().fg(Color::Cyan);
+  pub const LINK: Style = Style::new().fg(Color::Blue).add_modifier(Modifier::UNDERLINED);
+  pub const DIM: Style = Style::new().add_modifier(Modifier::DIM);
+  pub const QUOTE: Style = Style::new().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
+  pub const BULLET: Style = Style::new().fg(Color::Green);
+  pub const FOOTNOTE: Style = Style::new().fg(Color::Blue);
 }
 
 /// Renders `md` into lines that each fit `width` columns.
@@ -114,11 +81,9 @@ pub fn render(md: &str, width: u16, streaming: bool) -> Vec<Line<'static>> {
   let refs = Refs::collect(&root);
   let mut out = Vec::new();
   blocks(children(&root), width, &refs, &mut out);
-  refs.render_footnotes(&root, width, &mut out);
+  refs.render_footnotes(width, &mut out);
   // A trailing blank line would push the transcript's own spacing around.
-  while out.last().is_some_and(|l| l.width() == 0) {
-    out.pop();
-  }
+  trim_blank(&mut out);
   out
 }
 
@@ -251,20 +216,22 @@ fn expand_tabs(text: &str) -> String {
 /// appear, not the order they are defined — and one that nothing refers to is
 /// dropped, as on github.com.
 #[derive(Default)]
-struct Refs {
+struct Refs<'a> {
   referenced: Vec<String>,
   /// Link and image definitions, by their (already lowercased) label.
   links: HashMap<String, String>,
+  /// Every footnote's body, referred to or not, in the order written.
+  footnotes: Vec<&'a Node>,
 }
 
-impl Refs {
-  fn collect(root: &Node) -> Self {
+impl<'a> Refs<'a> {
+  fn collect(root: &'a Node) -> Self {
     let mut refs = Refs::default();
     refs.walk(root);
     refs
   }
 
-  fn walk(&mut self, node: &Node) {
+  fn walk(&mut self, node: &'a Node) {
     match node {
       Node::FootnoteReference(reference) if !self.referenced.contains(&reference.identifier) => {
         self.referenced.push(reference.identifier.clone());
@@ -272,6 +239,7 @@ impl Refs {
       Node::Definition(definition) => {
         self.links.insert(definition.identifier.clone(), definition.url.clone());
       }
+      Node::FootnoteDefinition(_) => self.footnotes.push(node),
       _ => {}
     }
     for child in children(node) {
@@ -286,49 +254,28 @@ impl Refs {
   }
 
   /// Appends the footnote list, in reference order, after the body.
-  fn render_footnotes(&self, root: &Node, width: usize, out: &mut Vec<Line<'static>>) {
-    let mut definitions: Vec<(usize, &Node)> = Vec::new();
-    collect_footnote_definitions(root, self, &mut definitions);
+  fn render_footnotes(&self, width: usize, out: &mut Vec<Line<'static>>) {
+    let mut definitions: Vec<(usize, &Node)> = self
+      .footnotes
+      .iter()
+      .filter_map(|&node| match node {
+        Node::FootnoteDefinition(definition) => Some((self.number(&definition.identifier)?, node)),
+        _ => None,
+      })
+      .collect();
     if definitions.is_empty() {
       return;
     }
     definitions.sort_by_key(|(number, _)| *number);
     out.push(Line::default());
-    out.push(Line::styled("─".repeat(width.min(HR_MAX)), style::rule()));
+    out.push(Line::styled("─".repeat(width.min(HR_MAX)), style::BORDER));
     for (number, definition) in definitions {
-      let marker = format!("[{number}] ");
-      let continuation = " ".repeat(marker.width());
+      let marker = Span::styled(format!("[{number}] "), style::FOOTNOTE);
       let body = width.saturating_sub(marker.width()).max(1);
       let mut inner = Vec::new();
       blocks(children(definition), body, self, &mut inner);
-      while inner.last().is_some_and(|l| l.width() == 0) {
-        inner.pop();
-      }
-      for (i, line) in inner.into_iter().enumerate() {
-        // A blank line between the note's paragraphs needs no indent; padding
-        // it would only leave trailing whitespace behind.
-        if i > 0 && line.width() == 0 {
-          out.push(line);
-          continue;
-        }
-        let lead = if i == 0 { &marker } else { &continuation };
-        let style = if i == 0 { style::footnote() } else { Style::default() };
-        out.push(prefix(Span::styled(lead.clone(), style), line));
-      }
+      hang(inner, &marker, &mut false, out);
     }
-  }
-}
-
-/// Pairs each referenced definition with its number, wherever it was written.
-fn collect_footnote_definitions<'a>(node: &'a Node, refs: &Refs, out: &mut Vec<(usize, &'a Node)>) {
-  if let Node::FootnoteDefinition(definition) = node {
-    if let Some(number) = refs.number(&definition.identifier) {
-      out.push((number, node));
-    }
-    return;
-  }
-  for child in children(node) {
-    collect_footnote_definitions(child, refs, out);
   }
 }
 
@@ -373,7 +320,7 @@ fn block(node: &Node, width: usize, refs: &Refs, out: &mut Vec<Line<'static>>) {
     }
     Node::Code(code) => {
       let lang = code.lang.clone().unwrap_or_default();
-      out.push(Line::styled(format!("```{lang}"), style::code_border()));
+      out.push(Line::styled(format!("```{lang}"), style::BORDER));
       // A language we have a grammar for is coloured token by token; anything
       // else — no info string, a language not built in — keeps the one colour
       // the whole block used to have.
@@ -394,22 +341,20 @@ fn block(node: &Node, width: usize, refs: &Refs, out: &mut Vec<Line<'static>>) {
         // it could not finish leaves later lines plain rather than shifted.
         let spans = match highlighted.as_ref().and_then(|lines| lines.get(i)) {
           Some(spans) => trim_indent(spans.clone()),
-          None => vec![Span::styled(code.to_string(), style::code_block())],
+          None => vec![Span::styled(code.to_string(), style::CODE_BLOCK)],
         };
         for wrapped in wrap(spans, body) {
           out.push(prefix(Span::raw(indent.clone()), wrapped));
         }
       }
-      out.push(Line::styled("```", style::code_border()));
+      out.push(Line::styled("```", style::BORDER));
     }
     Node::List(list) => list_block(list, 0, width, refs, out),
     Node::Blockquote(_) => {
       let body = width.saturating_sub(QUOTE_PREFIX.width()).max(1);
       let mut inner = Vec::new();
       blocks(children(node), body, refs, &mut inner);
-      while inner.last().is_some_and(|l| l.width() == 0) {
-        inner.pop();
-      }
+      trim_blank(&mut inner);
       for line in inner {
         // The quote style is a floor, not an override: inline code and links
         // inside a quote keep their own colour.
@@ -418,21 +363,21 @@ fn block(node: &Node, width: usize, refs: &Refs, out: &mut Vec<Line<'static>>) {
             .spans
             .into_iter()
             .map(|span| {
-              let style = style::quote().patch(span.style);
+              let style = style::QUOTE.patch(span.style);
               Span::styled(span.content, style)
             })
             .collect::<Vec<_>>(),
         );
-        out.push(prefix(Span::styled(QUOTE_PREFIX, style::quote_border()), line));
+        out.push(prefix(Span::styled(QUOTE_PREFIX, style::BORDER), line));
       }
     }
     Node::ThematicBreak(_) => {
-      out.push(Line::styled("─".repeat(width.min(HR_MAX)), style::rule()));
+      out.push(Line::styled("─".repeat(width.min(HR_MAX)), style::BORDER));
     }
     Node::Table(table) => table_block(&table.children, &table.align, width, refs, out),
     Node::Html(html) => {
       for line in html.value.lines() {
-        out.extend(wrap(vec![Span::styled(line.to_string(), style::dim())], width));
+        out.extend(wrap(vec![Span::styled(line.to_string(), style::DIM)], width));
       }
     }
     Node::Math(math) => {
@@ -469,36 +414,18 @@ fn list_block(list: &List, depth: usize, width: usize, refs: &Refs, out: &mut Ve
       Some(false) => "[ ] ",
       None => "",
     };
-    let marker = format!("{indent}{bullet}{task}");
-    let continuation = " ".repeat(marker.width());
+    let marker = Span::styled(format!("{indent}{bullet}{task}"), style::BULLET);
     let body = width.saturating_sub(marker.width()).max(1);
 
     let mut inner: Vec<Line<'static>> = Vec::new();
     // Only the item's first line carries the marker; everything after it —
     // later paragraphs included — hangs under the text.
     let mut marked = false;
-    let flush = |inner: &mut Vec<Line<'static>>, marked: &mut bool, out: &mut Vec<Line<'static>>| {
-      while inner.last().is_some_and(|l| l.width() == 0) {
-        inner.pop();
-      }
-      for line in inner.drain(..) {
-        // A blank line between the item's paragraphs needs no indent; padding
-        // it would only leave trailing whitespace behind.
-        if *marked && line.width() == 0 {
-          out.push(line);
-          continue;
-        }
-        let lead = if *marked { &continuation } else { &marker };
-        let style = if *marked { Style::default() } else { style::bullet() };
-        out.push(prefix(Span::styled(lead.clone(), style), line));
-        *marked = true;
-      }
-    };
     for child in &item.children {
       // A nested list indents from the outer width rather than the item's, so
       // its markers line up in a column of their own.
       if let Node::List(nested) = child {
-        flush(&mut inner, &mut marked, out);
+        hang(std::mem::take(&mut inner), &marker, &mut marked, out);
         list_block(nested, depth + 1, width, refs, out);
         marked = true;
         continue;
@@ -508,9 +435,9 @@ fn list_block(list: &List, depth: usize, width: usize, refs: &Refs, out: &mut Ve
         inner.push(Line::default());
       }
     }
-    flush(&mut inner, &mut marked, out);
+    hang(inner, &marker, &mut marked, out);
     if !marked {
-      out.push(Line::from(Span::styled(marker.clone(), style::bullet())));
+      out.push(Line::from(marker));
     }
   }
 }
@@ -555,7 +482,7 @@ fn table_block(rows: &[Node], align: &[AlignKind], width: usize, refs: &Refs, ou
       s.push_str(&"─".repeat(w + 2));
       s.push_str(if i + 1 == widths.len() { right } else { mid });
     }
-    Line::styled(s, style::rule())
+    Line::styled(s, style::BORDER)
   };
 
   out.push(rule("┌", "┬", "┐"));
@@ -579,7 +506,7 @@ fn table_block(rows: &[Node], align: &[AlignKind], width: usize, refs: &Refs, ou
       .collect();
     let height = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
     for line in 0..height {
-      let mut spans = vec![Span::styled("│", style::rule())];
+      let mut spans = vec![Span::styled("│", style::BORDER)];
       for (c, column) in wrapped.iter().enumerate() {
         let content = column.get(line).cloned().unwrap_or_default();
         let used: usize = content.spans.iter().map(|s| s.content.width()).sum();
@@ -592,7 +519,7 @@ fn table_block(rows: &[Node], align: &[AlignKind], width: usize, refs: &Refs, ou
         spans.push(Span::raw(" ".repeat(before + 1)));
         spans.extend(content.spans);
         spans.push(Span::raw(" ".repeat(after + 1)));
-        spans.push(Span::styled("│", style::rule()));
+        spans.push(Span::styled("│", style::BORDER));
         let _ = c;
       }
       out.push(Line::from(spans));
@@ -630,18 +557,18 @@ fn fit(natural: &[usize], budget: usize) -> Vec<usize> {
 /// An autolink shows its own URL, so repeating it would only add noise.
 fn link_spans(children: &[Node], url: &str, base: Style, refs: &Refs, out: &mut Vec<Span<'static>>) {
   let start = out.len();
-  inline(children, base.patch(style::link()), refs, out);
+  inline(children, base.patch(style::LINK), refs, out);
   let text: String = out[start..].iter().map(|s| s.content.as_ref()).collect();
   let bare = url.strip_prefix("mailto:").unwrap_or(url);
   if text != url && text != bare {
-    out.push(Span::styled(format!(" ({url})"), base.patch(style::link_url())));
+    out.push(Span::styled(format!(" ({url})"), base.patch(style::DIM)));
   }
 }
 
 /// An image is a placeholder here: the transcript cannot show one inline.
 fn image_span(alt: &str, base: Style) -> Span<'static> {
   let alt = if alt.is_empty() { "image" } else { alt };
-  Span::styled(format!("[{alt}]"), base.patch(style::link_url()))
+  Span::styled(format!("[{alt}]"), base.patch(style::DIM))
 }
 
 /// Flattens inline nodes into styled spans, `base` being the style inherited
@@ -653,7 +580,7 @@ fn inline(nodes: &[Node], base: Style, refs: &Refs, out: &mut Vec<Span<'static>>
       Node::Strong(strong) => inline(&strong.children, base.add_modifier(Modifier::BOLD), refs, out),
       Node::Emphasis(emphasis) => inline(&emphasis.children, base.add_modifier(Modifier::ITALIC), refs, out),
       Node::Delete(delete) => inline(&delete.children, base.add_modifier(Modifier::CROSSED_OUT), refs, out),
-      Node::InlineCode(code) => out.push(Span::styled(code.value.clone(), base.patch(style::inline_code()))),
+      Node::InlineCode(code) => out.push(Span::styled(code.value.clone(), base.patch(style::INLINE_CODE))),
       Node::InlineMath(math) => out.push(Span::styled(math.value.clone(), base)),
       Node::Link(link) => link_spans(&link.children, &link.url, base, refs, out),
       // `[text][label]`, whose target lives in a definition elsewhere. Without
@@ -670,7 +597,7 @@ fn inline(nodes: &[Node], base: Style, refs: &Refs, out: &mut Vec<Span<'static>>
         // swallow the line it sits in. The list at the end uses the same
         // numbers, which is the only thing tying the two together here.
         if let Some(number) = refs.number(&reference.identifier) {
-          out.push(Span::styled(format!("[{number}]"), base.patch(style::footnote())));
+          out.push(Span::styled(format!("[{number}]"), base.patch(style::FOOTNOTE)));
         }
       }
       Node::Break(_) => out.push(Span::styled("\n", base)),
@@ -701,6 +628,34 @@ fn trim_indent(spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
     }
   }
   out
+}
+
+/// Drops the blank lines a run of blocks ends with.
+fn trim_blank(lines: &mut Vec<Line<'static>>) {
+  while lines.last().is_some_and(|l| l.width() == 0) {
+    lines.pop();
+  }
+}
+
+/// Hangs `lines` off `marker`: the first line carries it, unless `marked` says
+/// it has been put down already, and the rest are indented under the text.
+fn hang(mut lines: Vec<Line<'static>>, marker: &Span<'static>, marked: &mut bool, out: &mut Vec<Line<'static>>) {
+  trim_blank(&mut lines);
+  let continuation = " ".repeat(marker.width());
+  for line in lines {
+    // A blank line between paragraphs needs no indent; padding it would only
+    // leave trailing whitespace behind.
+    if *marked && line.width() == 0 {
+      out.push(line);
+      continue;
+    }
+    let lead = match *marked {
+      true => Span::raw(continuation.clone()),
+      false => marker.clone(),
+    };
+    out.push(prefix(lead, line));
+    *marked = true;
+  }
 }
 
 /// Puts `lead` in front of `line`, keeping the rest of its spans.

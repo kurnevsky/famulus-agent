@@ -70,37 +70,6 @@ pub fn normalize_for_fuzzy_match(text: &str) -> String {
     .collect()
 }
 
-struct FuzzyMatch {
-  index: usize,
-  len: usize,
-  fuzzy: bool,
-}
-
-fn fuzzy_find(content: &str, old_text: &str) -> Option<FuzzyMatch> {
-  if let Some(index) = content.find(old_text) {
-    return Some(FuzzyMatch {
-      index,
-      len: old_text.len(),
-      fuzzy: false,
-    });
-  }
-  let fuzzy_content = normalize_for_fuzzy_match(content);
-  let fuzzy_old = normalize_for_fuzzy_match(old_text);
-  fuzzy_content.find(&fuzzy_old).map(|index| FuzzyMatch {
-    index,
-    len: fuzzy_old.len(),
-    fuzzy: true,
-  })
-}
-
-fn count_occurrences(content: &str, old_text: &str) -> usize {
-  let fuzzy_old = normalize_for_fuzzy_match(old_text);
-  if fuzzy_old.is_empty() {
-    return 0;
-  }
-  normalize_for_fuzzy_match(content).matches(&fuzzy_old).count()
-}
-
 #[derive(Clone)]
 struct Replacement {
   edit_index: usize,
@@ -130,9 +99,10 @@ pub fn apply_edits(normalized: &str, edits: &[Edit], path: &str) -> Result<Appli
     }
   }
 
-  let used_fuzzy = edits
-    .iter()
-    .any(|e| fuzzy_find(normalized, &e.old_text).is_some_and(|m| m.fuzzy));
+  // An edit the file does not hold word for word is looked for again with
+  // quotes, dashes, odd spaces and trailing whitespace evened out, on both
+  // sides — and then every edit is, so they are all matched against one text.
+  let used_fuzzy = edits.iter().any(|e| !normalized.contains(&e.old_text));
   let base_for_replacement = if used_fuzzy {
     normalize_for_fuzzy_match(normalized)
   } else {
@@ -141,7 +111,14 @@ pub fn apply_edits(normalized: &str, edits: &[Edit], path: &str) -> Result<Appli
 
   let mut matched: Vec<Replacement> = Vec::with_capacity(edits.len());
   for (i, edit) in edits.iter().enumerate() {
-    let Some(found) = fuzzy_find(&base_for_replacement, &edit.old_text) else {
+    let needle = match used_fuzzy {
+      true => normalize_for_fuzzy_match(&edit.old_text),
+      false => edit.old_text.clone(),
+    };
+    let found = (!needle.is_empty())
+      .then(|| base_for_replacement.find(&needle))
+      .flatten();
+    let Some(index) = found else {
       return Err(if total == 1 {
         format!(
           "Could not find the exact text in {path}. The old text must match exactly including all whitespace and newlines."
@@ -152,7 +129,7 @@ pub fn apply_edits(normalized: &str, edits: &[Edit], path: &str) -> Result<Appli
         )
       });
     };
-    let occurrences = count_occurrences(&base_for_replacement, &edit.old_text);
+    let occurrences = base_for_replacement.matches(&needle).count();
     if occurrences > 1 {
       return Err(if total == 1 {
         format!(
@@ -166,8 +143,8 @@ pub fn apply_edits(normalized: &str, edits: &[Edit], path: &str) -> Result<Appli
     }
     matched.push(Replacement {
       edit_index: i,
-      index: found.index,
-      len: found.len,
+      index,
+      len: needle.len(),
       new_text: edit.new_text.clone(),
     });
   }
@@ -213,19 +190,6 @@ fn apply_replacements(content: &str, replacements: &[Replacement], offset: usize
   result
 }
 
-fn split_lines_with_endings(content: &str) -> Vec<&str> {
-  let mut lines = Vec::new();
-  let mut rest = content;
-  while let Some(i) = rest.find('\n') {
-    lines.push(&rest[..=i]);
-    rest = &rest[i + 1..];
-  }
-  if !rest.is_empty() {
-    lines.push(rest);
-  }
-  lines
-}
-
 /// When matching used fuzzy normalization, replaced regions come from the
 /// normalized text but every untouched line is copied verbatim from the
 /// original, so unrelated whitespace is never rewritten.
@@ -234,10 +198,10 @@ fn apply_preserving_unchanged_lines(
   base: &str,
   replacements: &[Replacement],
 ) -> Result<String, String> {
-  let original_lines = split_lines_with_endings(original);
+  let original_lines = original.split_inclusive('\n').collect::<Vec<_>>();
   let mut spans = Vec::new();
   let mut offset = 0;
-  for line in split_lines_with_endings(base) {
+  for line in base.split_inclusive('\n') {
     spans.push((offset, offset + line.len()));
     offset += line.len();
   }

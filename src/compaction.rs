@@ -3,7 +3,7 @@
 //! summarized by the model and replaced with a structured checkpoint, while the
 //! most recent ~`keep_recent_tokens` stay verbatim.
 
-use crate::agent::Summarizer;
+use crate::agent::Runtime;
 use rig_core::completion::CompletionError;
 use rig_core::completion::Message;
 use rig_core::message::{AssistantContent, ToolResultContent, UserContent};
@@ -361,7 +361,7 @@ pub fn summary_message(summary: &str) -> Message {
 ///
 /// Block order: conversation, previous summary, instructions.
 async fn summarize(
-  summarizer: &Summarizer,
+  summarizer: &Runtime,
   messages: &[Message],
   previous: Option<&str>,
 ) -> Result<String, CompletionError> {
@@ -381,7 +381,7 @@ async fn summarize(
 /// The same for the beginning of a split turn, which is asked for in terms of
 /// the rest of that turn rather than of the conversation: what was asked for,
 /// how far it got, and what the half still on screen needs to be read by.
-async fn summarize_turn(summarizer: &Summarizer, messages: &[Message]) -> Result<String, CompletionError> {
+async fn summarize_turn(summarizer: &Runtime, messages: &[Message]) -> Result<String, CompletionError> {
   let conversation = serialize(messages);
   answer(
     summarizer,
@@ -393,7 +393,7 @@ async fn summarize_turn(summarizer: &Summarizer, messages: &[Message]) -> Result
 /// What the summarizer said, which may not be nothing: an empty checkpoint
 /// stands for the conversation every bit as much as a full one does, and
 /// there would be no telling afterwards what it was standing for.
-async fn answer(summarizer: &Summarizer, prompt: String) -> Result<String, CompletionError> {
+async fn answer(summarizer: &Runtime, prompt: String) -> Result<String, CompletionError> {
   let summary = summarizer.ask(prompt).await?.trim().to_string();
   if summary.is_empty() {
     return Err(CompletionError::ResponseError(
@@ -410,7 +410,7 @@ async fn answer(summarizer: &Summarizer, prompt: String) -> Result<String, Compl
 /// `turn_summary` is on: the conversation before that turn, and the beginning
 /// of the turn itself, joined into the one message the history keeps.
 pub async fn compact(
-  summarizer: &Summarizer,
+  summarizer: &Runtime,
   history: Vec<Message>,
   settings: &Settings,
 ) -> Result<Option<Compacted>, CompletionError> {

@@ -131,58 +131,28 @@ pub enum AgentEvent {
 /// What a session runs on: one model with its tools, and the handle the UI
 /// stops and steers it by.
 ///
-/// Everything here but the two models — the tools, the preamble, the queue —
-/// outlives whichever model is in front of it, which is what lets `/model`
-/// swap one for another mid-session.
+/// Everything in the runtime but the model — the tools, the preamble, the
+/// queue — outlives whichever model is in front of it, which is what lets
+/// `/model` swap one for another mid-session.
 pub struct Agents {
   pub runtime: Arc<Runtime>,
-  /// Tool-less model used to summarize history during compaction.
-  pub summarizer: Arc<Summarizer>,
   pub control: Control,
-  /// Kept so a model chosen later is built into a runtime holding the same
-  /// tools this session came up with.
-  tools: ToolServerHandle,
-  preamble: String,
-  /// Whether this provider takes an image inside a tool result; fixed by the
-  /// provider rather than by the model, so it survives a change of model.
-  relay_images: bool,
 }
 
 impl Agents {
-  /// Point the session at `cfg.model`, building the handles for it.
-  ///
-  /// Neither is replaced until both are built, so a model that cannot be
-  /// reached leaves the session on the one it already had.
+  /// Point the session at `cfg.model`. The runtime is not replaced until the
+  /// new model is built, so one that cannot be reached leaves the session on
+  /// the one it already had.
   pub fn use_model(&mut self, cfg: &Config) -> Result<()> {
-    (self.runtime, self.summarizer) = handles(cfg, &self.tools, &self.preamble, self.relay_images)?;
+    let old = &self.runtime;
+    self.runtime = Arc::new(Runtime::new(
+      cfg,
+      old.tools.clone(),
+      old.preamble.clone(),
+      old.relay_images,
+    )?);
     Ok(())
   }
-}
-
-/// The two handles a session runs on: the model with its tools, and the same
-/// model with the summarizer's preamble and nothing else.
-fn handles(
-  cfg: &Config,
-  tools: &ToolServerHandle,
-  preamble: &str,
-  relay_images: bool,
-) -> Result<(Arc<Runtime>, Arc<Summarizer>)> {
-  let model = build_model(cfg, &cfg.model)?;
-  let runtime = Arc::new(Runtime {
-    model: model.clone(),
-    tools: tools.clone(),
-    preamble: preamble.to_string(),
-    compaction: cfg.compaction,
-    allowed: cfg.tools.clone(),
-    relay_images,
-    max_tokens: cfg.max_tokens,
-  });
-  let summarizer = Arc::new(Summarizer {
-    model,
-    preamble: compaction::SYSTEM_PROMPT.to_string(),
-    max_tokens: cfg.max_tokens,
-  });
-  Ok((runtime, summarizer))
 }
 
 /// One model a provider offers.
@@ -351,32 +321,52 @@ pub struct Runtime {
   max_tokens: Option<u64>,
 }
 
-/// The tool-less model compaction summarizes with.
-pub struct Summarizer {
-  model: Arc<dyn Model>,
-  preamble: String,
-  max_tokens: Option<u64>,
+impl Runtime {
+  fn new(cfg: &Config, tools: ToolServerHandle, preamble: String, relay_images: bool) -> Result<Self> {
+    Ok(Self {
+      model: build_model(cfg)?,
+      tools,
+      preamble,
+      compaction: cfg.compaction,
+      allowed: cfg.tools.clone(),
+      relay_images,
+      max_tokens: cfg.max_tokens,
+    })
+  }
+
+  /// One question to the model with no tools and the summarizer's preamble,
+  /// and its answer: how compaction summarizes. Nothing here is a
+  /// conversation.
+  pub async fn ask(&self, prompt: String) -> Result<String, CompletionError> {
+    let request = request(
+      compaction::SYSTEM_PROMPT,
+      vec![Message::user(prompt)],
+      Vec::new(),
+      self.max_tokens,
+    );
+    self.model.answer(request).await
+  }
 }
 
-impl Summarizer {
-  /// One question, one answer. Nothing here is a conversation.
-  pub async fn ask(&self, prompt: String) -> Result<String, CompletionError> {
-    self
-      .model
-      .answer(CompletionRequest {
-        model: None,
-        preamble: Some(self.preamble.clone()),
-        chat_history: vec![Message::user(prompt)],
-        documents: Vec::new(),
-        tools: Vec::new(),
-        temperature: None,
-        max_tokens: self.max_tokens,
-        tool_choice: None,
-        additional_params: None,
-        output_schema: None,
-        record_telemetry_content: false,
-      })
-      .await
+/// A request with nothing but what this program sets on one.
+fn request(
+  preamble: &str,
+  chat_history: Vec<Message>,
+  tools: Vec<ToolDefinition>,
+  max_tokens: Option<u64>,
+) -> CompletionRequest {
+  CompletionRequest {
+    model: None,
+    preamble: Some(preamble.to_string()),
+    chat_history,
+    documents: Vec::new(),
+    tools,
+    temperature: None,
+    max_tokens,
+    tool_choice: None,
+    additional_params: None,
+    output_schema: None,
+    record_telemetry_content: false,
   }
 }
 
@@ -477,30 +467,33 @@ fn relays_images(provider: Provider) -> bool {
   !matches!(provider, Provider::Gemini | Provider::Anthropic)
 }
 
-/// The handle one model is reached through, whichever provider offers it.
+/// A provider's client, with the configured key — or the one given, since
+/// llamafile's client takes no key at all and says so in its type — and the
+/// base URL when there is one. Each builder is a type of its own, so this is
+/// spelled once here rather than once per provider.
+macro_rules! client {
+  ($cfg:expr, $builder:expr, $what:literal) => {
+    client!($cfg, $builder, $what, $cfg.api_key.as_str())
+  };
+  ($cfg:expr, $builder:expr, $what:literal, $key:expr) => {{
+    let mut builder = $builder.api_key($key);
+    if let Some(url) = $cfg.base_url.as_deref() {
+      builder = builder.base_url(url.trim_end_matches('/'));
+    }
+    builder.build().context(concat!("failed to build ", $what, " client"))?
+  }};
+}
+
+/// The handle `cfg.model` is reached through, whichever provider offers it.
 ///
 /// Summarizing asks the same model the same way, so it is the same handle —
 /// what makes that call a summary is the preamble it carries, which belongs
 /// to the request rather than to the model.
-fn build_model(cfg: &Config, model: &str) -> Result<Arc<dyn Model>> {
-  let base_url = cfg.base_url.as_deref().map(|u| u.trim_end_matches('/'));
-
-  // Each builder is a type of its own, so the key and the optional base URL
-  // are spelled once here rather than once per provider below. The key is
-  // the configured one unless an arm passes its own — llamafile's client
-  // takes no key at all, and says so in its type.
+fn build_model(cfg: &Config) -> Result<Arc<dyn Model>> {
   macro_rules! model {
-    ($builder:expr, $what:literal) => {
-      model!($builder, $what, cfg.api_key.as_str())
+    ($($client:tt)*) => {
+      Arc::new(client!(cfg, $($client)*).completion_model(cfg.model.clone())) as Arc<dyn Model>
     };
-    ($builder:expr, $what:literal, $key:expr) => {{
-      let mut builder = $builder.api_key($key);
-      if let Some(url) = base_url {
-        builder = builder.base_url(url);
-      }
-      let client = builder.build().context(concat!("failed to build ", $what, " client"))?;
-      Arc::new(client.completion_model(model.to_string())) as Arc<dyn Model>
-    }};
   }
 
   Ok(match cfg.provider {
@@ -513,14 +506,10 @@ fn build_model(cfg: &Config, model: &str) -> Result<Arc<dyn Model>> {
     // what the named model allows, and falls back to a small cap for one it
     // does not know — which is what `--max-tokens` is for, since a figure on
     // the request wins over the model's own.
-    Provider::Anthropic => {
-      let mut builder = anthropic::Client::builder().api_key(cfg.api_key.as_str());
-      if let Some(url) = base_url {
-        builder = builder.base_url(url);
-      }
-      let client = builder.build().context("failed to build Anthropic client")?;
-      Arc::new(anthropic::completion::CompletionModel::with_model(client, model)) as Arc<dyn Model>
-    }
+    Provider::Anthropic => Arc::new(anthropic::completion::CompletionModel::with_model(
+      client!(cfg, anthropic::Client::builder(), "Anthropic"),
+      &cfg.model,
+    )),
     Provider::Cohere => model!(cohere::Client::builder(), "Cohere"),
     Provider::DeepSeek => model!(deepseek::Client::builder(), "DeepSeek"),
     Provider::Doubleword => model!(doubleword::Client::builder(), "Doubleword"),
@@ -542,22 +531,13 @@ fn build_model(cfg: &Config, model: &str) -> Result<Arc<dyn Model>> {
 /// OpenRouter — and the rest answer with names alone, which is why the window
 /// a model is given falls back to the configured one.
 pub async fn list_models(cfg: &Config) -> Result<Vec<ModelInfo>> {
-  let base_url = cfg.base_url.as_deref().map(|u| u.trim_end_matches('/'));
-
-  // As in `build_model`: one client per provider, each of its own type, so
-  // the key and base URL are spelled once rather than once an arm.
   macro_rules! list {
-    ($builder:expr, $what:literal) => {{
-      let mut builder = $builder.api_key(cfg.api_key.as_str());
-      if let Some(url) = base_url {
-        builder = builder.base_url(url);
-      }
-      let client = builder.build().context(concat!("failed to build ", $what, " client"))?;
-      client
+    ($builder:expr, $what:literal) => {
+      client!(cfg, $builder, $what)
         .list_models()
         .await
         .context(concat!($what, " would not say what models it has"))?
-    }};
+    };
   }
 
   let models = match cfg.provider {
@@ -621,15 +601,9 @@ pub fn build_agents(
   // brought: a tool is a tool, and the transcript draws them all the same.
   let tools = crate::mcp::attach(tools, servers).run();
 
-  let relay_images = relays_images(cfg.provider);
-  let (runtime, summarizer) = handles(cfg, &tools, &preamble, relay_images)?;
   Ok(Agents {
-    runtime,
-    summarizer,
+    runtime: Arc::new(Runtime::new(cfg, tools, preamble, relays_images(cfg.provider))?),
     control: Control::default(),
-    tools,
-    preamble,
-    relay_images,
   })
 }
 
@@ -784,19 +758,7 @@ async fn run(
     first = false;
 
     let sent = chat.len();
-    let request = CompletionRequest {
-      model: None,
-      preamble: Some(rt.preamble.clone()),
-      chat_history: chat,
-      documents: Vec::new(),
-      tools: definitions.clone(),
-      temperature: None,
-      max_tokens: rt.max_tokens,
-      tool_choice: None,
-      additional_params: None,
-      output_schema: None,
-      record_telemetry_content: false,
-    };
+    let request = request(&rt.preamble, chat, definitions.clone(), rt.max_tokens);
     let mut stream = match rt.model.stream(request).await {
       Ok(stream) => stream,
       Err(err) => return Some(Stop::Failed(err.to_string())),
@@ -1195,13 +1157,13 @@ fn default_system_prompt(cwd: &Path, tools: Option<&[String]>) -> String {
 /// Summarize older history in the background; the result arrives as
 /// `AgentEvent::Compacted` (or `AgentEvent::Error` followed by `Ended`).
 pub fn start_compaction(
-  summarizer: Arc<Summarizer>,
+  runtime: Arc<Runtime>,
   history: Vec<Message>,
   settings: Settings,
   tx: mpsc::UnboundedSender<AgentEvent>,
 ) -> JoinHandle<()> {
   tokio::spawn(async move {
-    let event = match compaction::compact(&summarizer, history, &settings).await {
+    let event = match compaction::compact(&runtime, history, &settings).await {
       Ok(result) => AgentEvent::Compacted(result),
       Err(err) => {
         let _ = tx.send(AgentEvent::Error(format!("compaction failed: {err}")));
@@ -1657,7 +1619,7 @@ mod tests {
       Message::user("second question"),
       Message::assistant("second answer"),
     ];
-    start_compaction(agents.summarizer.clone(), history, TEST_SETTINGS, tx.clone())
+    start_compaction(agents.runtime.clone(), history, TEST_SETTINGS, tx.clone())
       .await
       .unwrap();
     let compacted = match rx.recv().await {
@@ -1676,7 +1638,7 @@ mod tests {
       keep_recent_tokens: 1000,
       ..TEST_SETTINGS
     };
-    start_compaction(agents.summarizer.clone(), compacted.history, roomy, tx.clone())
+    start_compaction(agents.runtime.clone(), compacted.history, roomy, tx.clone())
       .await
       .unwrap();
     let Some(AgentEvent::Compacted(None)) = rx.recv().await else {
@@ -1690,7 +1652,7 @@ mod tests {
       Message::user("third question"),
       Message::assistant("third answer"),
     ];
-    start_compaction(agents.summarizer.clone(), history, TEST_SETTINGS, tx.clone())
+    start_compaction(agents.runtime.clone(), history, TEST_SETTINGS, tx.clone())
       .await
       .unwrap();
     let compacted = match rx.recv().await {
@@ -1915,12 +1877,7 @@ mod tests {
     let (tx, mut rx) = mpsc::unbounded_channel();
     collect(&runtime, Vec::new(), "hello", &mut rx, &tx).await;
 
-    let summarizer = Summarizer {
-      model: recording.clone(),
-      preamble: String::new(),
-      max_tokens: Some(99),
-    };
-    let _ = summarizer.ask("summarize".to_string()).await;
+    let _ = runtime.ask("summarize".to_string()).await;
 
     assert_eq!(*recording.caps.lock().unwrap(), vec![Some(99), Some(99)]);
   }

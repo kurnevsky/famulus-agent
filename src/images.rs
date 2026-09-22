@@ -19,7 +19,8 @@ const MAX_WIDTH: u32 = 2000;
 const MAX_HEIGHT: u32 = 2000;
 /// Limit on the base64-encoded size.
 const MAX_BASE64_BYTES: usize = (4.5 * 1024.0 * 1024.0) as usize;
-const JPEG_QUALITIES: [u8; 5] = [80, 85, 70, 55, 40];
+const JPEG_QUALITIES: [u8; 4] = [80, 70, 55, 40];
+const UNCONVERTIBLE: &str = "[Image omitted: could not be converted to a supported inline image format.]";
 
 pub struct ProcessedImage {
   /// The image as the model will be given it: PNG or JPEG, within the size
@@ -59,17 +60,6 @@ pub fn detect(bytes: &[u8]) -> Option<ImageFormat> {
   image::guess_format(bytes).ok().filter(|f| supported(*f))
 }
 
-pub fn mime_type(format: ImageFormat) -> &'static str {
-  match format {
-    ImageFormat::Png => "image/png",
-    ImageFormat::Jpeg => "image/jpeg",
-    ImageFormat::Gif => "image/gif",
-    ImageFormat::WebP => "image/webp",
-    ImageFormat::Bmp => "image/bmp",
-    _ => "application/octet-stream",
-  }
-}
-
 fn base64_len(bytes: usize) -> usize {
   bytes.div_ceil(3) * 4
 }
@@ -77,8 +67,7 @@ fn base64_len(bytes: usize) -> usize {
 /// Prepare an image for the model. `Err` carries the note shown in place of
 /// the image when it cannot be delivered.
 pub fn process(bytes: &[u8], format: ImageFormat) -> Result<ProcessedImage, String> {
-  let decoded = image::load_from_memory_with_format(bytes, format)
-    .map_err(|_| "[Image omitted: could not be converted to a supported inline image format.]".to_string())?;
+  let decoded = image::load_from_memory_with_format(bytes, format).map_err(|_| UNCONVERTIBLE.to_string())?;
   let (width, height) = decoded.dimensions();
   let mut hints = Vec::new();
 
@@ -87,9 +76,8 @@ pub fn process(bytes: &[u8], format: ImageFormat) -> Result<ProcessedImage, Stri
     ImageFormat::Png => (bytes.to_vec(), ImageMediaType::PNG),
     ImageFormat::Jpeg => (bytes.to_vec(), ImageMediaType::JPEG),
     other => {
-      let png = encode_png(&decoded)
-        .ok_or_else(|| "[Image omitted: could not be converted to a supported inline image format.]".to_string())?;
-      hints.push(format!("[Image converted from {} to image/png.]", mime_type(other)));
+      let png = encode_png(&decoded).ok_or_else(|| UNCONVERTIBLE.to_string())?;
+      hints.push(format!("[Image converted from {} to image/png.]", other.to_mime_type()));
       (png, ImageMediaType::PNG)
     }
   };
@@ -128,17 +116,15 @@ fn shrink(image: &DynamicImage) -> Option<(Vec<u8>, ImageMediaType, u32, u32)> {
     } else {
       image.resize_exact(w, h, FilterType::Lanczos3)
     };
-    let mut candidates: Vec<(Vec<u8>, ImageMediaType)> = Vec::new();
-    if let Some(png) = encode_png(&resized) {
-      candidates.push((png, ImageMediaType::PNG));
-    }
-    for quality in JPEG_QUALITIES {
-      if let Some(jpeg) = encode_jpeg(&resized, quality) {
-        candidates.push((jpeg, ImageMediaType::JPEG));
-      }
-    }
-    if let Some((bytes, media_type)) = candidates
-      .into_iter()
+    // Encoded one at a time, stopping at the first that fits: an encode of a
+    // large image is the expensive part.
+    let png = std::iter::once_with(|| encode_png(&resized).map(|b| (b, ImageMediaType::PNG)));
+    let jpegs = JPEG_QUALITIES
+      .iter()
+      .map(|&quality| encode_jpeg(&resized, quality).map(|b| (b, ImageMediaType::JPEG)));
+    if let Some((bytes, media_type)) = png
+      .chain(jpegs)
+      .flatten()
       .find(|(b, _)| base64_len(b.len()) < MAX_BASE64_BYTES)
     {
       return Some((bytes, media_type, w, h));

@@ -495,7 +495,7 @@ mod capping_tests {
 const NON_VISION_NOTE: &str = "[Current model does not support images. The image will be omitted from this request.]";
 
 fn read_image(bytes: &[u8], format: image::ImageFormat, vision: bool) -> Vec<ToolResultContent> {
-  let mime = images::mime_type(format);
+  let mime = format.to_mime_type();
   match images::process(bytes, format) {
     Ok(image) => {
       let mut note = image.note(format!("Read image file [{}]", image.media_type.to_mime_type()));
@@ -1036,19 +1036,15 @@ impl Tool for BashTool {
     let mut output = OutputAccumulator::new();
     let mut throttle = UpdateThrottle::new(ctx.get::<Output>().cloned());
     let far_future = tokio::time::Instant::now() + Duration::from_secs(365 * 24 * 3600);
+    // The timeout while the command runs; once it has exited, how long what
+    // it left behind may keep the pipe open.
     let mut deadline = timeout.map(|t| tokio::time::Instant::now() + t);
-    let mut drain_deadline: Option<tokio::time::Instant> = None;
     let mut exit = None;
     let mut timed_out = false;
     let mut open = true;
     let mut buf = [0u8; 8192];
 
     while open || exit.is_none() {
-      let wake = match (deadline, drain_deadline) {
-        (Some(a), Some(b)) => a.min(b),
-        (Some(a), None) | (None, Some(a)) => a,
-        (None, None) => far_future,
-      };
       tokio::select! {
           r = merged.read(&mut buf), if open => match r {
               Ok(n) if n > 0 => {
@@ -1059,10 +1055,9 @@ impl Tool for BashTool {
           },
           status = child.wait(), if exit.is_none() => {
               exit = Some(status?);
-              deadline = None;
-              drain_deadline = Some(tokio::time::Instant::now() + DRAIN_GRACE);
+              deadline = Some(tokio::time::Instant::now() + DRAIN_GRACE);
           }
-          _ = tokio::time::sleep_until(wake), if deadline.is_some() || drain_deadline.is_some() => {
+          _ = tokio::time::sleep_until(deadline.unwrap_or(far_future)), if deadline.is_some() => {
               if exit.is_none() {
                   timed_out = true;
                   guard.kill();
@@ -1074,10 +1069,8 @@ impl Tool for BashTool {
           }
       }
     }
-    let status = match exit {
-      Some(status) => status,
-      None => child.wait().await?,
-    };
+    // The loop only ends once the command has exited.
+    let status = exit.expect("the command has exited");
     if !timed_out {
       guard.disarm();
     }
@@ -1561,7 +1554,7 @@ impl Tool for AskTool {
     ask::validate(&questions).map_err(ToolError)?;
     let (tx, rx) = oneshot::channel();
     sink(questions.clone(), tx);
-    let outcome = rx.await.unwrap_or_else(|_| Outcome::declined());
+    let outcome = rx.await.unwrap_or_default();
     Ok(outcome.response(&questions))
   }
 }
@@ -1597,7 +1590,6 @@ mod ask_tests {
         assert_eq!(questions.len(), 1);
         let _ = reply.send(Outcome {
           answers: vec![(0, crate::ask::Answer::Chose("Disk".into()))],
-          cancelled: false,
         });
       })),
     };

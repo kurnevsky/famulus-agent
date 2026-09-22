@@ -13,7 +13,7 @@
 //! that extension's envelope, word for word, so a prompt written for one reads
 //! the same coming out of the other.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Color, Modifier, Style};
@@ -216,23 +216,15 @@ impl Answer {
 }
 
 /// What the dialog came back with: the questions that were answered, in the
-/// order they were asked, and whether the user walked away from the rest.
+/// order they were asked. Empty when the user walked away — the questionnaire
+/// was dismissed, or there was no terminal to show it in — however much of it
+/// they had answered by then.
 #[derive(Clone, Debug, Default)]
 pub struct Outcome {
   pub answers: Vec<(usize, Answer)>,
-  pub cancelled: bool,
 }
 
 impl Outcome {
-  /// Nobody answered anything — the questionnaire was dismissed, or there was
-  /// no terminal to show it in.
-  pub fn declined() -> Self {
-    Self {
-      answers: Vec::new(),
-      cancelled: true,
-    }
-  }
-
   /// What the model reads.
   ///
   /// A cancelled questionnaire and an empty one say the same sentence: the
@@ -240,7 +232,7 @@ impl Outcome {
   /// apart. Answering some of the questions and not the rest is allowed, and
   /// the ones left blank simply say nothing here.
   pub fn response(&self, questions: &[Question]) -> String {
-    if self.cancelled || self.answers.is_empty() {
+    if self.answers.is_empty() {
       return DECLINED.to_string();
     }
     let segments: Vec<String> = self
@@ -251,9 +243,6 @@ impl Outcome {
         Some(format!("\"{}\"=\"{}\".", question.question, answer.scalar()))
       })
       .collect();
-    if segments.is_empty() {
-      return DECLINED.to_string();
-    }
     format!("{ENVELOPE_PREFIX} {} {ENVELOPE_SUFFIX}", segments.join(" "))
   }
 }
@@ -328,11 +317,7 @@ pub struct Dialog {
   /// The free-text row has the keyboard, so printable keys are text rather
   /// than commands.
   typing: bool,
-  answers: HashMap<usize, Answer>,
-  /// Boxes ticked on the tab shown, by the option they tick. Kept as indices
-  /// of the current question only; leaving the tab writes them into `answers`
-  /// and coming back reads them out again.
-  ticked: HashSet<usize>,
+  answers: BTreeMap<usize, Answer>,
   /// What was typed on each question's free-text row, kept while the user
   /// looks at the other options and at the other questions.
   drafts: HashMap<usize, Draft>,
@@ -347,8 +332,7 @@ impl Dialog {
       tab: 0,
       row: 0,
       typing: false,
-      answers: HashMap::new(),
-      ticked: HashSet::new(),
+      answers: BTreeMap::new(),
       drafts: HashMap::new(),
       submit: 0,
     }
@@ -399,58 +383,29 @@ impl Dialog {
     self.row = 0;
     self.typing = false;
     self.submit = 0;
-    self.ticked = self.ticked_from_answer(tab);
   }
 
-  /// The boxes a multi-select question was left with, read back out of its
-  /// answer so returning to a tab shows what leaving it recorded.
-  fn ticked_from_answer(&self, tab: usize) -> HashSet<usize> {
-    let Some(question) = self.questions.get(tab).filter(|q| q.multi_select) else {
-      return HashSet::new();
+  /// Whether the box on option `index` of the tab shown is ticked, which is
+  /// what its answer says: ticking a box is answering the question.
+  fn is_ticked(&self, index: usize) -> bool {
+    let Some(Answer::Ticked(labels)) = self.answers.get(&self.tab) else {
+      return false;
     };
-    let Some(Answer::Ticked(labels)) = self.answers.get(&tab) else {
-      return HashSet::new();
-    };
-    question
-      .options
-      .iter()
-      .enumerate()
-      .filter(|(_, option)| labels.contains(&option.label))
-      .map(|(index, _)| index)
-      .collect()
+    let option = &self.questions[self.tab].options[index];
+    labels.contains(&option.label)
   }
 
   /// The labels of the ticked boxes, in the order the question asked them.
   fn ticked_labels(&self) -> Vec<String> {
-    let Some(question) = self.questions.get(self.tab) else {
-      return Vec::new();
-    };
-    question
-      .options
-      .iter()
-      .enumerate()
-      .filter(|(index, _)| self.ticked.contains(index))
-      .map(|(_, option)| option.label.clone())
-      .collect()
-  }
-
-  fn answered(&self) -> Outcome {
-    let mut answers: Vec<(usize, Answer)> = self
-      .answers
-      .iter()
-      .map(|(index, answer)| (*index, answer.clone()))
-      .collect();
-    answers.sort_by_key(|(index, _)| *index);
-    Outcome {
-      answers,
-      cancelled: false,
+    match self.answers.get(&self.tab) {
+      Some(Answer::Ticked(labels)) => labels.clone(),
+      _ => Vec::new(),
     }
   }
 
-  fn cancelled(&self) -> Outcome {
+  fn answered(&self) -> Outcome {
     Outcome {
-      cancelled: true,
-      ..self.answered()
+      answers: self.answers.clone().into_iter().collect(),
     }
   }
 
@@ -458,10 +413,8 @@ impl Dialog {
   /// dialog when this was the last thing left to answer.
   fn confirm(&mut self, answer: Answer) -> Option<Outcome> {
     // A typed answer and a set of ticked boxes are two answers to one
-    // question, so the boxes go out when the typing comes in.
-    if matches!(answer, Answer::Typed(_)) {
-      self.ticked.clear();
-    }
+    // question, so the boxes go out when the typing comes in: the one answer
+    // replaces the other.
     self.answers.insert(self.tab, answer);
     match self.next_tab() {
       Some(tab) => {
@@ -476,10 +429,10 @@ impl Dialog {
   /// with it, so the tab strip says the question is answered as soon as one
   /// box is.
   fn toggle(&mut self, index: usize) {
-    if !self.ticked.remove(&index) {
-      self.ticked.insert(index);
-    }
-    let labels = self.ticked_labels();
+    let labels: Vec<String> = (0..self.questions[self.tab].options.len())
+      .filter(|&at| self.is_ticked(at) != (at == index))
+      .map(|at| self.questions[self.tab].options[at].label.clone())
+      .collect();
     match labels.is_empty() {
       true => {
         self.answers.remove(&self.tab);
@@ -506,7 +459,7 @@ impl Dialog {
     // Esc leaves from everywhere, including mid-word in the free-text row:
     // the row is a way of answering the question, not a place to be stuck in.
     if key.code == KeyCode::Esc {
-      return Some(self.cancelled());
+      return Some(Outcome::default());
     }
     if self.typing {
       return self.typing_key(key, ctrl);
@@ -629,7 +582,7 @@ impl Dialog {
       // Submitting is allowed with questions left blank: the warning above the
       // picker says which, and a partial answer beats a dismissed dialog.
       KeyCode::Enter => match self.submit {
-        1 => Some(self.cancelled()),
+        1 => Some(Outcome::default()),
         _ => Some(self.answered()),
       },
       _ => None,
@@ -711,7 +664,7 @@ impl Dialog {
       match row {
         Row::Choice(at) => {
           let option = &question.options[at];
-          let ticked = question.multi_select.then(|| self.ticked.contains(&at));
+          let ticked = question.multi_select.then(|| self.is_ticked(at));
           let label = match self.confirmed_mark(Some(&option.label), active) {
             true => format!("{} ✔", option.label),
             false => option.label.clone(),
@@ -1192,7 +1145,6 @@ mod tests {
     assert!(dialog.on_submit_tab());
     let outcome = press(&mut dialog, KeyCode::Enter).expect("an answer");
     assert_eq!(outcome.answers, vec![(0, Answer::Chose("Memory".into()))]);
-    assert!(!outcome.cancelled);
   }
 
   #[test]
@@ -1204,7 +1156,7 @@ mod tests {
     let mut dialog = Dialog::new(questions.clone());
     press(&mut dialog, KeyCode::Enter);
     let outcome = press(&mut dialog, KeyCode::Esc).expect("Esc ends it");
-    assert!(outcome.cancelled);
+    assert!(outcome.answers.is_empty());
     assert_eq!(outcome.response(&questions), DECLINED);
     // The cancel row of the submit tab says the same thing.
     let mut dialog = Dialog::new(questions.clone());
@@ -1224,7 +1176,10 @@ mod tests {
     let mut dialog = Dialog::new(questions);
     press(&mut dialog, KeyCode::Char(' '));
     press(&mut dialog, KeyCode::Tab);
-    assert!(dialog.ticked.is_empty(), "the boxes belong to the tab that has them");
+    assert!(
+      dialog.ticked_labels().is_empty(),
+      "the boxes belong to the tab that has them"
+    );
     press(&mut dialog, KeyCode::BackTab);
     assert_eq!(dialog.ticked_labels(), vec!["Logs".to_string()]);
   }

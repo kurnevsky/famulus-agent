@@ -716,18 +716,12 @@ impl Session {
     if self.lineage(self.leaf(), true).contains(&root.as_str()) {
       bail!("entry {root} is on the conversation the session is on");
     }
-    // Everything under the root, found by sweeping the entries until a sweep
-    // adds nothing: a child is written after its parent, so it is usually one.
+    // Everything under the root, in one sweep: an entry is only ever added
+    // under one that is already there, so a child comes after its parent.
     let mut gone: HashSet<String> = HashSet::from([root]);
-    loop {
-      let before = gone.len();
-      for node in &self.nodes {
-        if node.parent.as_ref().is_some_and(|p| gone.contains(p)) {
-          gone.insert(node.id.clone());
-        }
-      }
-      if gone.len() == before {
-        break;
+    for node in &self.nodes {
+      if node.parent.as_ref().is_some_and(|p| gone.contains(p)) {
+        gone.insert(node.id.clone());
       }
     }
     if let Some((path, _)) = &self.file {

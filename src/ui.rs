@@ -630,7 +630,7 @@ pub struct App {
   /// Rendered markdown, keyed by message text and width rather than by entry,
   /// so reloading a session or compacting cannot serve another entry's lines.
   /// Rebuilt each draw by moving live entries across, which evicts the rest.
-  markdown: HashMap<(u64, u16, bool), Vec<Line<'static>>>,
+  markdown: RenderCache,
   usage: Usage,
   /// Size of the last completion request, for the footer. `None` until a
   /// call has come back, and again after a compaction: what that call was
@@ -2014,7 +2014,7 @@ impl App {
     self.entries.push(Entry::Info("Compacting context…".into()));
     self.compacting = true;
     self.run = Some(start_compaction(
-      self.agents.summarizer.clone(),
+      self.agents.runtime.clone(),
       self.session.history.clone(),
       self.cfg.compaction,
       self.tx.clone(),
@@ -2488,11 +2488,7 @@ impl App {
         } else {
           Style::default()
         };
-        let hit = base.fg(Color::Cyan).underlined();
-        let mut spans = vec![Span::styled(
-          if selected { "› " } else { "  " },
-          Style::default().fg(Color::Cyan).bold(),
-        )];
+        let mut spans = vec![pointer(selected)];
         let (sigil, name, highlights, trailing, width, right) = match m {
           Match::Command { index, highlights } => {
             let (name, description, _) = COMMANDS[*index];
@@ -2521,11 +2517,7 @@ impl App {
           ),
         };
         spans.push(Span::styled(sigil, base));
-        // Matched letters get their own styled spans.
-        for (pos, ch) in name.chars().enumerate() {
-          let style = if highlights.contains(&(pos as u32)) { hit } else { base };
-          spans.push(Span::styled(ch.to_string(), style));
-        }
+        spans.extend(picked_out(&name, highlights, base));
         let shown = name.chars().count() + trailing.chars().count();
         spans.push(Span::styled(trailing, base.fg(Color::Cyan)));
         spans.push(Span::raw(" ".repeat(width.saturating_sub(shown))));
@@ -2661,23 +2653,11 @@ impl App {
         true => Style::default().bold(),
         false => Style::default(),
       };
-      let hit = base.fg(Color::Cyan).underlined();
-      // The letters the filter matched, the same cyan the `/` popup
-      // underlines its own with. Nothing typed is nothing picked out.
+      // The letters the filter matched, picked out the way the `/` popup
+      // picks out its own. Nothing typed is nothing picked out.
       let highlights = shown.get(i).map(|(_, hits)| hits.as_slice()).unwrap_or(&[]);
-      let mut spans = vec![Span::styled(
-        if selected { "› " } else { "  " },
-        Style::default().fg(Color::Cyan).bold(),
-      )];
-      // One span a letter only where there are letters to pick out: every
-      // other list is one span, as it was before there was a filter.
-      match highlights.is_empty() {
-        true => spans.push(Span::styled(title, base)),
-        false => spans.extend(title.chars().enumerate().map(|(at, ch)| {
-          let style = if highlights.contains(&(at as u32)) { hit } else { base };
-          Span::styled(ch.to_string(), style)
-        })),
-      }
+      let mut spans = vec![pointer(selected)];
+      spans.extend(picked_out(&title, highlights, base));
       spans.push(Span::raw(" ".repeat(pad)));
       spans.push(Span::styled(note, dim));
       lines.push(Line::from(spans));
@@ -2775,24 +2755,15 @@ impl App {
           // the same way a tool's picture is: at the width the transcript
           // has, folded, and cached by its bytes and that width.
           for image in images {
-            let cols = width.saturating_sub(3);
-            let key = (hash(IMAGE_KIND, image), cols, false);
-            let drawn = match cached.remove(&key) {
-              Some(drawn) => drawn,
-              None => crate::images::blocks(image, cols, IMAGE_MAX_LINES)
-                .unwrap_or_else(|| vec![Line::styled("[image could not be drawn]", dim)]),
-            };
-            Preview {
-              body: drawn.iter().map(|line| line.spans.clone()).collect(),
-              gutter: Span::styled("│", Style::default().fg(Color::Cyan)),
-              cap: IMAGE_LINES,
-              expanded: self.expand_tools,
-              width: width as usize,
-              from_end: false,
-              cursor: false,
-            }
-            .draw(&mut lines);
-            live.insert(key, drawn);
+            let gutter = Span::styled("│", Style::default().fg(Color::Cyan));
+            draw_image(
+              image,
+              gutter,
+              width,
+              self.expand_tools,
+              (&mut cached, &mut live),
+              &mut lines,
+            );
           }
         }
         Entry::Assistant(text) => {
@@ -2906,26 +2877,14 @@ impl App {
           // rendered markdown is. The fold is not part of the key: it is how
           // much of the same drawing is shown.
           for image in images {
-            // Two columns of indent and the gutter, as every other block of
-            // a tool's output is drawn.
-            let cols = width.saturating_sub(3);
-            let key = (hash(IMAGE_KIND, image), cols, false);
-            let drawn = match cached.remove(&key) {
-              Some(drawn) => drawn,
-              None => crate::images::blocks(image, cols, IMAGE_MAX_LINES)
-                .unwrap_or_else(|| vec![Line::styled("[image could not be drawn]", dim)]),
-            };
-            Preview {
-              body: drawn.iter().map(|line| line.spans.clone()).collect(),
-              gutter: stripe.clone(),
-              cap: IMAGE_LINES,
-              expanded: self.expand_tools,
-              width: width as usize,
-              from_end: false,
-              cursor: false,
-            }
-            .draw(&mut lines);
-            live.insert(key, drawn);
+            draw_image(
+              image,
+              stripe.clone(),
+              width,
+              self.expand_tools,
+              (&mut cached, &mut live),
+              &mut lines,
+            );
           }
           if name == "bash" && (*running || took.is_some()) {
             let (label, elapsed) = match took {
@@ -3037,6 +2996,73 @@ impl App {
       .flat_map(|line| crate::markdown::wrap_line(line, width))
       .collect()
   }
+}
+
+/// The mark a picker puts on the row the cursor is on.
+fn pointer(selected: bool) -> Span<'static> {
+  Span::styled(
+    if selected { "› " } else { "  " },
+    Style::default().fg(Color::Cyan).bold(),
+  )
+}
+
+/// `text` in `base`, with the letters at `highlights` picked out in cyan and
+/// underlined — the letters of a picker's row a query matched.
+fn picked_out(text: &str, highlights: &[u32], base: Style) -> Vec<Span<'static>> {
+  // One span a letter only where there are letters to pick out.
+  if highlights.is_empty() {
+    return vec![Span::styled(text.to_string(), base)];
+  }
+  let hit = base.fg(Color::Cyan).underlined();
+  text
+    .chars()
+    .enumerate()
+    .map(|(at, ch)| {
+      Span::styled(
+        ch.to_string(),
+        if highlights.contains(&(at as u32)) { hit } else { base },
+      )
+    })
+    .collect()
+}
+
+/// Rendered text and pictures, by what they were drawn from and at what width.
+type RenderCache = HashMap<(u64, u16, bool), Vec<Line<'static>>>;
+
+/// An image in the transcript, under `gutter`, folded like any other block.
+/// Its drawing is taken from last frame's cache when it is there, and kept for
+/// the next.
+fn draw_image(
+  image: &[u8],
+  gutter: Span<'static>,
+  width: u16,
+  expanded: bool,
+  (cached, live): (&mut RenderCache, &mut RenderCache),
+  lines: &mut Vec<Line<'static>>,
+) {
+  // Two columns of indent and the gutter, as every other block of a tool's
+  // output is drawn.
+  let cols = width.saturating_sub(3);
+  let key = (hash(IMAGE_KIND, image), cols, false);
+  let drawn = cached.remove(&key).unwrap_or_else(|| {
+    crate::images::blocks(image, cols, IMAGE_MAX_LINES).unwrap_or_else(|| {
+      vec![Line::styled(
+        "[image could not be drawn]",
+        Style::default().add_modifier(Modifier::DIM),
+      )]
+    })
+  });
+  Preview {
+    body: drawn.iter().map(|line| line.spans.clone()).collect(),
+    gutter,
+    cap: IMAGE_LINES,
+    expanded,
+    width: width as usize,
+    from_end: false,
+    cursor: false,
+  }
+  .draw(lines);
+  live.insert(key, drawn);
 }
 
 /// Identifies a message or an image by content, for the rendered-text cache.
@@ -3273,29 +3299,10 @@ fn point_label(point: &Point) -> String {
 }
 
 fn filter_commands(matcher: &mut Matcher, query: &str) -> Vec<Match> {
-  if query.is_empty() {
-    return (0..COMMANDS.len())
-      .map(|index| Match::Command {
-        index,
-        highlights: Vec::new(),
-      })
-      .collect();
-  }
-  let pattern = Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart);
-  let mut buf = Vec::new();
-  let mut scored: Vec<(u32, Match)> = COMMANDS
-    .iter()
-    .enumerate()
-    .filter_map(|(index, (name, ..))| {
-      let mut highlights = Vec::new();
-      let score = pattern.indices(Utf32Str::new(name, &mut buf), matcher, &mut highlights)?;
-      highlights.sort_unstable();
-      highlights.dedup();
-      Some((score, Match::Command { index, highlights }))
-    })
-    .collect();
-  scored.sort_by(|a, b| b.0.cmp(&a.0).then(key(&a.1).cmp(&key(&b.1))));
-  scored.into_iter().map(|(_, m)| m).collect()
+  filter_rows(matcher, COMMANDS.iter().map(|(name, ..)| *name), query)
+    .into_iter()
+    .map(|(index, highlights)| Match::Command { index, highlights })
+    .collect()
 }
 
 /// Stop the clock on every command still drawing output, because the run
@@ -3370,7 +3377,7 @@ fn wrote_by<'a>(entries: &'a [Entry], call: &str) -> Option<(&'a str, &'a str)> 
 /// A write is not a change to be marked up — it is the file, so it is shown
 /// as the file, with none of a diff's pluses and none of its green.
 fn file_lines(path: &str, content: &str) -> Vec<Vec<Span<'static>>> {
-  code_lines(language_of(path), content)
+  marked_code("", mark_style(None), language_of(path), content)
 }
 
 /// What a file's name says it is written in — its extension, which is all a
@@ -3381,24 +3388,6 @@ fn language_of(path: &str) -> &str {
     .extension()
     .and_then(|extension| extension.to_str())
     .unwrap_or_default()
-}
-
-/// Lines of code in `language`, highlighted where there is a grammar for it
-/// and plain where there is not.
-fn code_lines(language: &str, content: &str) -> Vec<Vec<Span<'static>>> {
-  let highlighted = crate::highlight::highlight(language, content);
-  content
-    .split('\n')
-    .enumerate()
-    .map(|(i, line)| match highlighted.as_ref().and_then(|lines| lines.get(i)) {
-      Some(spans) if !spans.is_empty() => {
-        let mut row = vec![Span::raw(" ")];
-        row.extend(spans.iter().cloned());
-        row
-      }
-      _ => vec![Span::styled(format!(" {line}"), mark_style(None))],
-    })
-    .collect()
 }
 
 /// What a tool answered, laid out and highlighted as the JSON it is — or
@@ -3419,7 +3408,7 @@ fn structured(name: &str, output: &str) -> Option<Vec<Vec<Span<'static>>>> {
     return None;
   }
   let pretty = serde_json::to_string_pretty(&value).ok()?;
-  Some(code_lines("json", &pretty))
+  Some(marked_code("", mark_style(None), "json", &pretty))
 }
 
 /// A diff as the transcript shows it: `+12` still says what became of the
