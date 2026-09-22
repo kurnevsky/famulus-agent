@@ -241,55 +241,66 @@ struct Completion {
 struct Overlay {
   list: OverlayList,
   selected: usize,
+  /// What the list is narrowed by. Every list has one; the questionnaire,
+  /// which is not a list, does not.
+  filter: Option<Filter>,
+}
+
+/// The query a list is being narrowed by, and what it leaves.
+///
+/// The query is typed in the box at the bottom of the screen, which is the
+/// box a prompt is typed in and the same widget — so a query is edited with
+/// every key a prompt is edited with, the arrows and `Home` and `End` and the
+/// Ctrl keys included, rather than with the two a filter in a title could
+/// spare. The prompt the box was holding is put back the moment the list is
+/// dismissed: the box is borrowed, not taken.
+struct Filter {
+  field: TextArea<'static>,
+  /// Which rows of the list the query leaves, best match first, and which
+  /// letters of each it matched — for drawing them picked out, as the `/`
+  /// popup picks out its own. Worked out when the query changes rather than
+  /// while drawing, because matching is what the matcher does and drawing
+  /// does not get to borrow it.
+  shown: Vec<(usize, Vec<u32>)>,
+}
+
+impl Filter {
+  /// A filter over a list of `len` rows, with nothing typed yet: every row is
+  /// shown, in the order the list was built in, with nothing picked out in
+  /// any of them.
+  fn new(len: usize) -> Self {
+    let mut field = TextArea::default();
+    field.set_cursor_line_style(Style::default());
+    field.set_placeholder_text("Type to filter.");
+    field.set_placeholder_style(Style::default().fg(Color::DarkGray));
+    Self {
+      field,
+      shown: (0..len).map(|at| (at, Vec::new())).collect(),
+    }
+  }
+
+  /// What has been typed, as the one line it is: `Enter` is the list's, so
+  /// there is never a second one.
+  fn query(&self) -> String {
+    self.field.lines().join("")
+  }
 }
 
 enum OverlayList {
   /// `/resume`: every saved session, most recent first.
   Sessions {
     sessions: Vec<SessionInfo>,
-    /// What has been typed to narrow the list down, matched against the
-    /// titles — a session is remembered by what was asked in it, and a
-    /// directory worked in for a month has more sessions than rows.
-    query: String,
-    /// Which of `sessions` the query leaves, best match first, and which
-    /// letters of each title it matched. As for `Models`: worked out when the
-    /// query changes rather than while drawing.
-    shown: Vec<(usize, Vec<u32>)>,
-    /// `Delete` has been pressed on the selected row and the deletion is
+    /// `Ctrl+D` has been pressed on the selected row and the deletion is
     /// waiting to be confirmed. A session file is gone for good, so it is
     /// asked about first.
     confirming: bool,
   },
   /// `/tree`: every point this session can go back to, oldest first.
-  Tree {
-    points: Vec<Point>,
-    /// What has been typed to narrow the list down, matched against the rows
-    /// as they are drawn — a long conversation has far more points than rows,
-    /// and what you are going back to is something you remember a few words
-    /// of.
-    query: String,
-    /// Which of `points` the query leaves, best match first, and which
-    /// letters of each row it matched. As for `Sessions` and `Models`: worked
-    /// out when the query changes rather than while drawing.
-    shown: Vec<(usize, Vec<u32>)>,
-  },
+  Tree(Vec<Point>),
   /// `/fork`: the prompts, to start a new session from one of them.
   Fork(Vec<Point>),
-  /// `/model`: what the provider last said it offers, and what has been
-  /// typed to narrow it down.
-  Models {
-    models: Vec<ModelInfo>,
-    /// The filter, which is typed at the list rather than into a field of
-    /// its own: a picker of four hundred models is one you type at. The
-    /// session picker is typed at the same way.
-    query: String,
-    /// Which of `models` the query leaves, best match first, and which
-    /// letters of each the query matched — for drawing them picked out, as
-    /// the `/` popup picks out its own. Worked out when the query changes
-    /// rather than while drawing, because matching is what the matcher does
-    /// and drawing does not get to borrow it.
-    shown: Vec<(usize, Vec<u32>)>,
-  },
+  /// `/model`: what the provider last said it offers.
+  Models(Vec<ModelInfo>),
   /// What the `ask` tool put to the user, and the channel the answer goes
   /// back down. The dialog keeps its own cursor, so `Overlay::selected` says
   /// nothing about this one.
@@ -320,36 +331,67 @@ struct Point {
 }
 
 impl Overlay {
-  fn len(&self) -> usize {
-    match &self.list {
-      OverlayList::Sessions { shown, .. } | OverlayList::Models { shown, .. } | OverlayList::Tree { shown, .. } => {
-        shown.len()
-      }
-      OverlayList::Fork(points) => points.len(),
+  /// A list the filter has yet to touch, at the row `selected`.
+  fn new(list: OverlayList, selected: usize) -> Self {
+    let len = match &list {
+      OverlayList::Sessions { sessions, .. } => sessions.len(),
+      OverlayList::Tree(points) | OverlayList::Fork(points) => points.len(),
+      OverlayList::Models(models) => models.len(),
       OverlayList::Question { .. } => 0,
+    };
+    Self {
+      list,
+      selected,
+      filter: Some(Filter::new(len)),
     }
+  }
+
+  /// Rows the list is showing, which is what the filter left of it.
+  fn len(&self) -> usize {
+    self.filter.as_ref().map_or(0, |filter| filter.shown.len())
+  }
+
+  /// Which row of the list the cursor is on: an index into the whole of it,
+  /// rather than the place in the narrowed list the cursor stands at.
+  fn at(&self) -> Option<usize> {
+    let filter = self.filter.as_ref()?;
+    filter.shown.get(self.selected).map(|(at, _)| *at)
+  }
+
+  /// The letters of each shown row the query matched, for picking out.
+  fn matched(&self) -> &[(usize, Vec<u32>)] {
+    self.filter.as_ref().map_or(&[], |filter| filter.shown.as_slice())
+  }
+
+  /// Work out again which rows the query leaves. Called when the query
+  /// changes, and when a row has gone from under it.
+  fn refilter(&mut self, matcher: &mut Matcher) {
+    let Overlay { list, filter, .. } = self;
+    let Some(filter) = filter else { return };
+    let query = &filter.query();
+    filter.shown = match list {
+      OverlayList::Sessions { sessions, .. } => filter_sessions(matcher, sessions, query),
+      OverlayList::Tree(points) => filter_points(matcher, points, query),
+      // The fork list draws its prompts flat, so that is what is matched:
+      // what is picked out has to sit under what was typed.
+      OverlayList::Fork(points) => filter_rows(matcher, points.iter().map(|p| p.label.as_str()), query),
+      OverlayList::Models(models) => filter_models(matcher, models, query),
+      OverlayList::Question { .. } => Vec::new(),
+    };
   }
 
   fn title(&self) -> String {
     match &self.list {
       // A deletion waiting to be confirmed says so where the keys are said,
       // since the keys it is waiting for are not the usual ones.
-      OverlayList::Sessions { confirming: true, .. } => " Delete session? — Del confirm · Esc cancel ".into(),
-      OverlayList::Sessions { query, .. } => match query.is_empty() {
-        true => " Resume — type to filter · ↑↓ select · Enter resume · Del delete · Esc cancel ".into(),
-        false => format!(" Resume: {query}▏ — ↑↓ select · Enter resume · Del delete · Esc cancel "),
-      },
-      OverlayList::Tree { query, .. } => match query.is_empty() {
-        true => " Tree — type to filter · ↑↓ PgUp/PgDn select · Enter go there · Esc cancel ".into(),
-        false => format!(" Tree: {query}▏ — ↑↓ PgUp/PgDn select · Enter go there · Esc cancel "),
-      },
+      OverlayList::Sessions { confirming: true, .. } => " Delete session? — Ctrl+D confirm · Esc cancel ".into(),
+      // What narrows the list is said by the box the query is typed in,
+      // which is on screen under the list saying it. What is left to say up
+      // here is what the keys the box does not take do.
+      OverlayList::Sessions { .. } => " Resume — ↑↓ select · Enter resume · Ctrl+D delete · Esc cancel ".into(),
+      OverlayList::Tree(_) => " Tree — ↑↓ PgUp/PgDn select · Enter go there · Esc cancel ".into(),
       OverlayList::Fork(_) => " Fork — ↑↓ PgUp/PgDn select · Enter fork · Esc cancel ".into(),
-      // The filter is drawn where the title is, since that is where the list
-      // says what it is a list of — and with a query it is a list of that.
-      OverlayList::Models { query, .. } => match query.is_empty() {
-        true => " Model — type to filter · ↑↓ select · Enter use · Esc cancel ".into(),
-        false => format!(" Model: {query}▏ — ↑↓ select · Enter use · Esc cancel "),
-      },
+      OverlayList::Models(_) => " Model — ↑↓ select · Enter use · Esc cancel ".into(),
       // The dialog says which keys do what along its own bottom, where the
       // answer to that changes with the question.
       OverlayList::Question { .. } => " The model is asking ".into(),
@@ -776,7 +818,7 @@ impl App {
       return;
     }
     if self.overlay.is_some() {
-      self.handle_overlay_key(key.code, ctrl);
+      self.handle_overlay_key(key, ctrl);
       return;
     }
     if self.completion.is_some() && self.handle_completion_key(key.code, ctrl) {
@@ -871,8 +913,17 @@ impl App {
       dialog.paste(&text);
       return;
     }
-    // The other overlays are lists to look through, with nowhere to put text.
-    if self.overlay.is_some() {
+    // The other overlays are lists, and text pasted at one narrows it: the
+    // box at the bottom of the screen is holding the query, and a path or a
+    // title copied from somewhere else is a reasonable thing to look for.
+    // Its newlines are not, so it arrives as the one line the query is.
+    if let Some(overlay) = &mut self.overlay {
+      let Some(filter) = &mut overlay.filter else {
+        return;
+      };
+      filter.field.insert_str(text.replace('\n', " "));
+      overlay.refilter(&mut self.matcher);
+      overlay.selected = 0;
       return;
     }
     self.prompts.stop();
@@ -1132,144 +1183,117 @@ impl App {
     self.overlay = None;
   }
 
-  fn handle_overlay_key(&mut self, code: KeyCode, ctrl: bool) {
+  fn handle_overlay_key(&mut self, key: KeyEvent, ctrl: bool) {
     let len = self.overlay.as_ref().map_or(0, Overlay::len);
-    if !ctrl && self.handle_delete_key(code) {
+    if self.handle_delete_key(key.code, ctrl) {
       return;
     }
-    // The pickers that are typed at take letters as narrowing rather than as
-    // what a letter means in the other lists — `q` closes those, and is the
-    // start of a model name, a session title or a point here.
-    if !ctrl && self.handle_filter_key(code) {
-      return;
-    }
-    match code {
-      KeyCode::Esc | KeyCode::Char('q') => self.overlay = None,
+    match key.code {
+      KeyCode::Esc => self.overlay = None,
       KeyCode::Char('c') if ctrl => self.quit = true,
-      KeyCode::Up | KeyCode::Char('k') => {
+      KeyCode::Up => {
         if let Some(o) = &mut self.overlay {
           o.selected = o.selected.saturating_sub(1);
         }
       }
-      KeyCode::Down | KeyCode::Char('j') => {
+      KeyCode::Down => {
         if let Some(o) = &mut self.overlay {
           o.selected = (o.selected + 1).min(len.saturating_sub(1));
         }
       }
       // A tree of every tool result is long enough to need more than one row
-      // at a time.
-      KeyCode::PageUp | KeyCode::Home => {
+      // at a time. Home and End, which used to take the list to its ends, are
+      // the query's now — they are what moves a cursor through text, and a
+      // list can be filtered down to its far end instead.
+      KeyCode::PageUp => {
         if let Some(o) = &mut self.overlay {
-          o.selected = if code == KeyCode::Home {
-            0
-          } else {
-            o.selected.saturating_sub(OVERLAY_PAGE)
-          };
+          o.selected = o.selected.saturating_sub(OVERLAY_PAGE);
         }
       }
-      KeyCode::PageDown | KeyCode::End => {
+      KeyCode::PageDown => {
         if let Some(o) = &mut self.overlay {
-          let last = len.saturating_sub(1);
-          o.selected = if code == KeyCode::End {
-            last
-          } else {
-            (o.selected + OVERLAY_PAGE).min(last)
-          };
+          o.selected = (o.selected + OVERLAY_PAGE).min(len.saturating_sub(1));
         }
       }
       KeyCode::Enter => {
-        let Some(Overlay { list, selected }) = self.overlay.take() else {
+        let Some(overlay) = self.overlay.take() else {
           return;
         };
-        match list {
-          // As for the models below: the row taken is the one the filter left
-          // there, which is an index into the whole list rather than a place
-          // in it.
-          OverlayList::Sessions { sessions, shown, .. } => {
-            if let Some(info) = shown.get(selected).and_then(|(at, _)| sessions.get(*at)) {
+        // The row taken is the one the filter left under the cursor, which is
+        // an index into the whole list rather than a place in it.
+        let Some(at) = overlay.at() else {
+          return;
+        };
+        match overlay.list {
+          OverlayList::Sessions { sessions, .. } => {
+            if let Some(info) = sessions.get(at) {
               self.load_session(&info.path.clone());
             }
           }
-          OverlayList::Tree { mut points, shown, .. } => {
-            if let Some(at) = shown.get(selected).map(|(at, _)| *at)
-              && at < points.len()
-            {
-              self.go_to(points.remove(at));
-            }
-          }
-          OverlayList::Fork(mut points) if selected < points.len() => self.fork_to(points.remove(selected)),
-          // The row taken is the one the filter left there, which is an
-          // index into the whole list rather than a place in it.
-          OverlayList::Models { models, shown, .. } => {
-            if let Some(model) = shown.get(selected).and_then(|(at, _)| models.get(*at)) {
+          OverlayList::Tree(mut points) if at < points.len() => self.go_to(points.remove(at)),
+          OverlayList::Fork(mut points) if at < points.len() => self.fork_to(points.remove(at)),
+          OverlayList::Models(models) => {
+            if let Some(model) = models.get(at) {
               self.set_model(model.id.clone());
             }
           }
           _ => {}
         }
       }
-      _ => {}
+      // Everything else belongs to the box at the bottom of the screen, which
+      // is holding the query.
+      _ => self.handle_filter_key(key),
     }
   }
 
-  /// A key typed at a picker's filter, answering whether it was one.
+  /// A key the list did not claim, which is the query's.
   ///
-  /// Only letters and `Backspace`: there is no cursor in the query, because
-  /// the arrows belong to the list under it — which is what is being looked
-  /// for, and the thing worth steering.
-  fn handle_filter_key(&mut self, code: KeyCode) -> bool {
+  /// The box keeps it: what a key does to text is the box's business, and it
+  /// is the same box and the same widget a prompt is typed in. Only a key
+  /// that changed what is written there narrows the list again — the arrows
+  /// within the query move a cursor and leave the rows alone.
+  fn handle_filter_key(&mut self, key: KeyEvent) {
     // Taken as two borrows of two fields rather than through a method, so
     // the matcher is free while the overlay is held.
-    let Some(Overlay { list, selected }) = &mut self.overlay else {
-      return false;
+    let Some(overlay) = &mut self.overlay else {
+      return;
     };
-    match list {
-      OverlayList::Models { models, query, shown } => {
-        if !edit_query(query, code) {
-          return false;
-        }
-        *shown = filter_models(&mut self.matcher, models, query);
-      }
-      OverlayList::Sessions {
-        sessions, query, shown, ..
-      } => {
-        if !edit_query(query, code) {
-          return false;
-        }
-        *shown = filter_sessions(&mut self.matcher, sessions, query);
-      }
-      OverlayList::Tree { points, query, shown } => {
-        if !edit_query(query, code) {
-          return false;
-        }
-        *shown = filter_points(&mut self.matcher, points, query);
-      }
-      _ => return false,
+    let Some(filter) = &mut overlay.filter else {
+      return;
+    };
+    let before = filter.query();
+    filter.field.input(key);
+    if filter.query() == before {
+      return;
     }
+    overlay.refilter(&mut self.matcher);
     // The best match is the one wanted, and the rows under it have been
     // reordered anyway — a cursor left where it stood would mean nothing.
-    *selected = 0;
-    true
+    overlay.selected = 0;
   }
 
   /// The keys that delete a session from the picker, answering whether this
   /// was one of them.
   ///
-  /// `Delete` asks, and a second `Delete` goes through with it. Anything
+  /// `Ctrl+D` asks, and a second `Ctrl+D` goes through with it. Anything
   /// else is not an answer to the question: it puts the question away and
   /// then means what it usually means — apart from `Esc`, which was the
   /// answer no and leaves the picker open.
-  fn handle_delete_key(&mut self, code: KeyCode) -> bool {
+  ///
+  /// `Delete` itself is the query's: it is a key that edits text, and the
+  /// query is text. Ctrl+D is what is left, and what a shell deletes with.
+  fn handle_delete_key(&mut self, code: KeyCode, ctrl: bool) -> bool {
     let Some(overlay) = &mut self.overlay else {
       return false;
     };
     let OverlayList::Sessions { confirming, .. } = &mut overlay.list else {
       return false;
     };
-    match (code, *confirming) {
-      (KeyCode::Delete, false) => *confirming = true,
-      (KeyCode::Delete, true) => self.delete_selected(),
-      (_, true) => {
+    let asked = ctrl && code == KeyCode::Char('d');
+    match (asked, *confirming) {
+      (true, false) => *confirming = true,
+      (true, true) => self.delete_selected(),
+      (false, true) => {
         *confirming = false;
         return code == KeyCode::Esc;
       }
@@ -1283,17 +1307,15 @@ impl App {
     let Some(overlay) = &mut self.overlay else {
       return;
     };
-    let OverlayList::Sessions {
-      sessions,
-      query,
-      shown,
-      confirming,
-    } = &mut overlay.list
-    else {
+    let at = overlay.at();
+    let OverlayList::Sessions { sessions, confirming } = &mut overlay.list else {
       return;
     };
     *confirming = false;
-    let Some(info) = shown.get(overlay.selected).and_then(|(at, _)| sessions.get(*at)) else {
+    let Some(at) = at else {
+      return;
+    };
+    let Some(info) = sessions.get(at) else {
       return;
     };
     let (path, title) = (info.path.clone(), info.title().to_string());
@@ -1312,14 +1334,13 @@ impl App {
         .push(Entry::Error(format!("Could not delete session: {err:#}")));
       return;
     }
-    let at = shown[overlay.selected].0;
     sessions.remove(at);
+    let emptied = sessions.is_empty();
     // Every index past the deleted one has moved, so the rows are worked out
     // again rather than patched up — the query is the same, so what is left
     // is the same list one row shorter.
-    *shown = filter_sessions(&mut self.matcher, sessions, query);
-    overlay.selected = overlay.selected.min(shown.len().saturating_sub(1));
-    let emptied = sessions.is_empty();
+    overlay.refilter(&mut self.matcher);
+    overlay.selected = overlay.selected.min(overlay.len().saturating_sub(1));
     self.entries.push(Entry::Info(format!("Deleted session {title}.")));
     // Nothing left to pick from is nothing to keep a picker open for.
     if emptied {
@@ -1714,16 +1735,7 @@ impl App {
       .iter()
       .position(|model| model.id == self.cfg.model)
       .unwrap_or(0);
-    self.overlay = Some(Overlay {
-      list: OverlayList::Models {
-        // Nothing typed yet, so every model is shown, in the order they were
-        // listed in, with nothing picked out in any of them.
-        shown: (0..self.models.len()).map(|at| (at, Vec::new())).collect(),
-        models: self.models.clone(),
-        query: String::new(),
-      },
-      selected,
-    });
+    self.overlay = Some(Overlay::new(OverlayList::Models(self.models.clone()), selected));
   }
 
   /// Point the session at `id` and rebuild the agents around it.
@@ -1843,17 +1855,13 @@ impl App {
       self.entries.push(Entry::Info("No saved sessions.".into()));
       return;
     }
-    self.overlay = Some(Overlay {
-      list: OverlayList::Sessions {
-        // Nothing typed yet, so every session is shown, most recent first,
-        // with nothing picked out in any of them.
-        shown: (0..sessions.len()).map(|at| (at, Vec::new())).collect(),
+    self.overlay = Some(Overlay::new(
+      OverlayList::Sessions {
         sessions,
-        query: String::new(),
         confirming: false,
       },
-      selected: 0,
-    });
+      0,
+    ));
   }
 
   /// List where the conversation can go, with where it is now selected.
@@ -1876,16 +1884,9 @@ impl App {
     let selected = points.iter().rposition(|point| point.here).unwrap_or(points.len() - 1);
     let list = match fork {
       true => OverlayList::Fork(points),
-      false => OverlayList::Tree {
-        // Nothing typed yet, so every point is shown in the order the walk
-        // put them in, with nothing picked out in any of them — which is what
-        // leaves the selection above standing where the session is.
-        shown: (0..points.len()).map(|at| (at, Vec::new())).collect(),
-        points,
-        query: String::new(),
-      },
+      false => OverlayList::Tree(points),
     };
-    self.overlay = Some(Overlay { list, selected });
+    self.overlay = Some(Overlay::new(list, selected));
   }
 
   /// Move this session's end to `point`.
@@ -2208,6 +2209,9 @@ impl App {
             reply: Some(reply),
           },
           selected: 0,
+          // A questionnaire is answered rather than looked through, and it
+          // takes the keyboard whole — there is nothing here to narrow.
+          filter: None,
         });
       }
       AgentEvent::Error(err) => {
@@ -2311,7 +2315,14 @@ impl App {
   // ------------------------------------------------------------ drawing
 
   fn draw(&mut self, f: &mut Frame) {
-    let input_height = self.input.lines().len().clamp(1, MAX_INPUT_LINES) as u16 + 2;
+    // A query is one line, whatever the prompt the box is holding for the
+    // moment came to.
+    let filtering = self.overlay.as_ref().is_some_and(|o| o.filter.is_some());
+    let lines = match filtering {
+      true => 1,
+      false => self.input.lines().len(),
+    };
+    let input_height = lines.clamp(1, MAX_INPUT_LINES) as u16 + 2;
     let popup_height = self
       .completion
       .as_ref()
@@ -2334,7 +2345,11 @@ impl App {
       self.draw_transcript(f, transcript_area);
     }
 
-    // Input box.
+    // Input box. A list that is being narrowed borrows it for the query,
+    // which is why the query is not drawn in the list's own title: it is
+    // typed into a box, so it is shown in one, and the box is already there.
+    // What was half-written in it is not lost — it is drawn again the moment
+    // the list is gone.
     let border_color = if self.run.is_some() {
       Color::DarkGray
     } else {
@@ -2344,14 +2359,19 @@ impl App {
       .borders(Borders::ALL)
       .border_type(BorderType::Rounded)
       .border_style(Style::default().fg(border_color));
-    // What the `@tokens` in the box found, said along the bottom border
-    // rather than on a line of its own: it costs the transcript nothing,
-    // and it is gone again the moment the tokens are.
-    if let Some(strip) = self.attachment_strip(input_area.width) {
-      block = block.title_bottom(strip);
+    if let Some(filter) = self.overlay.as_mut().and_then(|o| o.filter.as_mut()) {
+      filter.field.set_block(block.title(" filter "));
+      f.render_widget(&filter.field, input_area);
+    } else {
+      // What the `@tokens` in the box found, said along the bottom border
+      // rather than on a line of its own: it costs the transcript nothing,
+      // and it is gone again the moment the tokens are.
+      if let Some(strip) = self.attachment_strip(input_area.width) {
+        block = block.title_bottom(strip);
+      }
+      self.input.set_block(block);
+      f.render_widget(&self.input, input_area);
     }
-    self.input.set_block(block);
-    f.render_widget(&self.input, input_area);
     self.draw_footer(f, footer_area);
   }
 
@@ -2531,15 +2551,17 @@ impl App {
       );
       return;
     }
+    // Only the rows the filter left, which is all of them until something is
+    // typed.
+    let shown = overlay.matched();
     // A filter that has narrowed the list to nothing says so, rather than
     // leaving an empty box to be read as a provider with no models, or as a
     // directory with nothing saved in it.
-    let emptied = match &overlay.list {
-      OverlayList::Models { shown, .. } if shown.is_empty() => Some("  No model matches."),
-      OverlayList::Sessions { shown, .. } if shown.is_empty() => Some("  No session matches."),
-      OverlayList::Tree { shown, .. } if shown.is_empty() => Some("  No point matches."),
-      _ => None,
-    };
+    let emptied = shown.is_empty().then_some(match &overlay.list {
+      OverlayList::Models(_) => "  No model matches.",
+      OverlayList::Sessions { .. } => "  No session matches.",
+      _ => "  No point matches.",
+    });
     if let Some(text) = emptied {
       let line = Line::from(Span::styled(text, Style::default().add_modifier(Modifier::DIM)));
       f.render_widget(Paragraph::new(line), inner);
@@ -2551,12 +2573,7 @@ impl App {
     // Each row is a title and a dim note about it, the title clipped so the
     // note always fits.
     let rows: Vec<(String, String)> = match &overlay.list {
-      OverlayList::Sessions {
-        sessions,
-        shown,
-        confirming,
-        ..
-      } => shown
+      OverlayList::Sessions { sessions, confirming } => shown
         .iter()
         .filter_map(|(at, _)| sessions.get(*at))
         .enumerate()
@@ -2564,7 +2581,7 @@ impl App {
           // The row being asked about says what it is being asked, where it
           // otherwise says what it is.
           let note = match *confirming && i == overlay.selected {
-            true => "delete? Del to confirm".to_string(),
+            true => "delete? Ctrl+D to confirm".to_string(),
             false => format!(
               "{}  {} msgs  {}",
               shorten_home(Path::new(&s.cwd)),
@@ -2578,7 +2595,7 @@ impl App {
       // The tree is indented at its branch points, so a conversation that
       // went two ways reads as two ways. Both lists say how long the
       // conversation would be once you got there.
-      OverlayList::Tree { points, shown, .. } => shown
+      OverlayList::Tree(points) => shown
         .iter()
         .filter_map(|(at, _)| points.get(*at))
         .map(|p| {
@@ -2589,14 +2606,17 @@ impl App {
           (point_label(p), note)
         })
         .collect(),
-      OverlayList::Fork(points) => points
+      // Prompts alone, drawn flat: a fork is started from a question rather
+      // than from a place in a shape, and there is no branch to read here.
+      OverlayList::Fork(points) => shown
         .iter()
+        .filter_map(|(at, _)| points.get(*at))
         .map(|p| (p.label.clone(), format!("keeps {}", messages(p.len))))
         .collect(),
       // The window on the right where a session says its size: it is the
       // one thing about a model worth choosing between, and most providers
       // do not report it at all.
-      OverlayList::Models { models, shown, .. } => shown
+      OverlayList::Models(models) => shown
         .iter()
         .filter_map(|(at, _)| models.get(*at))
         .map(|model| {
@@ -2612,14 +2632,6 @@ impl App {
       // Drawn above, where it draws itself.
       OverlayList::Question { .. } => Vec::new(),
     };
-    // Only a filtered list has letters to pick out, and only the ones the
-    // filter matched — the same cyan the `/` popup underlines its own with.
-    let matched: &[(usize, Vec<u32>)] = match &overlay.list {
-      OverlayList::Models { shown, .. } | OverlayList::Sessions { shown, .. } | OverlayList::Tree { shown, .. } => {
-        shown
-      }
-      _ => &[],
-    };
     let dim = Style::default().add_modifier(Modifier::DIM);
     let mut lines = Vec::new();
     for (i, (title, note)) in rows.into_iter().enumerate().skip(first).take(height) {
@@ -2632,7 +2644,9 @@ impl App {
         false => Style::default(),
       };
       let hit = base.fg(Color::Cyan).underlined();
-      let highlights = matched.get(i).map(|(_, hits)| hits.as_slice()).unwrap_or(&[]);
+      // The letters the filter matched, the same cyan the `/` popup
+      // underlines its own with. Nothing typed is nothing picked out.
+      let highlights = shown.get(i).map(|(_, hits)| hits.as_slice()).unwrap_or(&[]);
       let mut spans = vec![Span::styled(
         if selected { "› " } else { "  " },
         Style::default().fg(Color::Cyan).bold(),
@@ -3183,21 +3197,6 @@ fn key(item: &Match) -> String {
     Match::Command { index, .. } => COMMANDS[*index].0.to_string(),
     Match::Path { insert, .. } => insert.clone(),
   }
-}
-
-/// A key typed at a picker's filter, answering whether it was one and
-/// changing `query` if it was.
-fn edit_query(query: &mut String, code: KeyCode) -> bool {
-  match code {
-    KeyCode::Char(c) => query.push(c),
-    KeyCode::Backspace if !query.is_empty() => {
-      query.pop();
-    }
-    // An empty query has nothing to delete, so `Backspace` is not a key the
-    // list answers to and the overlay's own handling gets it.
-    _ => return false,
-  }
-  true
 }
 
 /// Which of `rows` `query` leaves, best match first: each as its index into

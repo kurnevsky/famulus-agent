@@ -107,8 +107,16 @@ models on OpenRouter need: letters narrow it to what they fuzzily match
 (`snt` finds `claude-sonnet-5`), `Backspace` widens it again, and the arrows
 steer what is left. The letters that matched are picked out in each row the
 way the `/` popup picks out its own, so a fuzzy match reads as the match it
-was. The filter is drawn in the list's own title, since a list being filtered
-is a list of that.
+was.
+
+The query is typed into the box at the bottom of the screen — the box a prompt
+is typed in, borrowed while the list is up and given back the moment it is
+dismissed. It is the same widget, so it is edited with the same keys: `Left`
+and `Right` and `Home` and `End` walk through what has been typed, `Delete`
+takes a letter back out of the middle of it, `Ctrl+W` takes a word, and text
+pasted at a list narrows it. Every list fa opens is typed at this way — the
+sessions, the tree, and the fork list — with the arrows and `PgUp`/`PgDn`
+staying the list's, since a query is one line and has no use for them.
 
 `/model <id>` names one outright, listed or not: the list is what a provider
 admits to, not the whole of what it answers to, and a local server that lists
@@ -380,14 +388,16 @@ sessions whose titles they fuzzily match, `Backspace` widens it again, the
 arrows steer what is left, and the matched letters are picked out in each row.
 A title is the session's name where it has one and its first message where it
 does not — which is what a conversation is remembered by, and a directory
-worked in for a month has more sessions than rows. The query is drawn in the
-list's own title, and `Enter` takes the row the filter left under the cursor.
+worked in for a month has more sessions than rows. `Enter` takes the row the
+filter left under the cursor.
 
-A session is deleted from the picker: `Delete` on a row asks, and a second
-`Delete` removes the file. Since that is the only copy of the conversation, it
-is asked about first, and any other key answers no. The session on screen is
-not one of them — it is still writing to its file — so deleting it means
-starting another with `/new` first.
+A session is deleted from the picker: `Ctrl+D` on a row asks, and a second
+`Ctrl+D` removes the file. Since that is the only copy of the conversation, it
+is asked about first, and any other key answers no. `Delete` itself is a key
+that edits text, and the query is text, so the question is asked of the one
+key left over — which is the one a shell deletes with. The session on screen
+is not one it will remove — it is still writing to its file — so deleting it
+means starting another with `/new` first.
 
 - `src/session.rs` – store, session file, listing, and replay. Tool results
   travel in a message of their own, after the one that asked for them, so
@@ -466,11 +476,15 @@ you can go back, try something else, and later walk into the answer you
 abandoned:
 
 ```
-╭ Tree — type to filter · ↑↓ PgUp/PgDn select · Enter go there · Esc cancel ─╮
+╭ Tree — ↑↓ PgUp/PgDn select · Enter go there · Esc cancel ──────────────────╮
 │  ❯ what does main.rs do?                                       0 messages  │
 │  ⚙ read                                                        3 messages  │
 │›   Actually it prints hi and exits 0.                                here  │
 │    It prints hi.                                               4 messages  │
+╰────────────────────────────────────────────────────────────────────────────╯
+╭ filter ────────────────────────────────────────────────────────────────────╮
+│ Type to filter.                                                            │
+╰────────────────────────────────────────────────────────────────────────────╯
 ```
 
 The list is typed at the way the session picker is: letters narrow it to the
@@ -479,9 +493,10 @@ steer what is left, and the matched letters are picked out in each row. What is
 matched is the row as it is drawn, indent and all, so what is picked out sits
 under what was typed. A turn that ran twenty commands is twenty points, and a
 conversation of a few hours is more of them than there are rows on the screen —
-but the one you mean is one you remember a word or two of. The query is drawn
-in the list's own title, and `Enter` goes to the row the filter left under the
-cursor.
+but the one you mean is one you remember a word or two of. The query is typed
+into the box under the list, which is the box a prompt is typed in and is
+edited with the same keys, and `Enter` goes to the row the filter left under
+the cursor.
 
 `/fork` is the same list narrowed to your prompts, and it branches into a file
 instead of within one: the conversation up to that point is carried into a
@@ -490,8 +505,8 @@ came from is left on disk exactly as it was, still its own thing to resume. The
 fork's header names its parent. Only the one path is copied — the branches
 beside it stay with the session being left, and the fork starts as a straight
 line. Use `/tree` to take this conversation a different way, `/fork` to start
-another one beside it. It is not typed at: prompts alone are a list you can
-read, and the arrows are enough for it.
+another one beside it. It is typed at like the others, over the prompts as it
+draws them.
 
 There is no branch summary — going back is a plain move, with nothing
 summarized and nothing lost.
@@ -746,13 +761,14 @@ what it spent.
 | `Ctrl+T` | Thinking in full, or only its last lines |
 | `Ctrl+O` | Tool output in full, or only its preview |
 | `↑` / `↓`, `Enter`, `Space`, `Tab`, `Esc` | Answer what `ask` put on the screen — see [Asking you](#asking-you) |
+| Any list | `↑`/`↓` and `PgUp`/`PgDn` steer it, `Enter` takes the row, `Esc` closes it — everything else is typed into the box at the bottom and narrows it |
 | `/compact` | Summarize older history now |
 | `/continue` | Run the model again with no new message |
 | `/model` | Pick the model from what the provider offers, asked for afresh each time — type to filter, or `/model <id>` to name one outright |
 | `/new` | Start a new session |
-| `/resume` | Pick a saved session to resume — type to filter, `Delete` removes the selected one, a second `Delete` confirms |
+| `/resume` | Pick a saved session to resume — type to filter, `Ctrl+D` removes the selected one, a second `Ctrl+D` confirms |
 | `/tree` | Move to another point in this session, on any branch — type to filter |
-| `/fork` | Branch a new session from an earlier prompt |
+| `/fork` | Branch a new session from an earlier prompt — type to filter |
 | `/name <name>` | Name the current session |
 | `/session` | Show session id, file, and stats |
 | `/quit` | Quit |

@@ -632,6 +632,19 @@ impl Term {
     panic!("waited for {needle:?}, screen was:\n{screen}");
   }
 
+  /// Wait for the box at the bottom of the screen to hold `query`, which is
+  /// where a list being narrowed says what it is being narrowed by.
+  fn wait_for_query(&self, query: &str) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+      if self.typed() == query {
+        return;
+      }
+      std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("waited for the query {query:?}, the box held {:?}", self.typed());
+  }
+
   /// Wait for a line to settle before reading it, for assertions about what
   /// is *not* there yet.
   fn settle(&self) {
@@ -699,7 +712,10 @@ impl Term {
   fn typed(&self) -> String {
     let screen = self.screen();
     let lines: Vec<&str> = screen.lines().collect();
-    let top = lines.iter().position(|line| line.contains('╭')).unwrap_or(0);
+    // The lowest box on the screen, which is the one above the footer: with a
+    // list open there is one over the transcript as well, and the box being
+    // typed in is the one at the bottom either way.
+    let top = lines.iter().rposition(|line| line.contains('╭')).unwrap_or(0);
     lines
       .get(top + 1)
       .map(|line| line.trim_matches(|c| c == '│' || c == ' ').to_string())
@@ -1607,7 +1623,7 @@ fn typing_at_the_session_picker_narrows_it_to_what_was_typed() {
 
   // A fuzzy match, as everywhere else in fa: "apl" is a-p-p-l-e.
   term.type_in("apl");
-  term.wait_for("Resume: apl");
+  term.wait_for_query("apl");
   let (rows, on) = term.overlay();
   assert_eq!(listed(&rows), 1, "only what matches is left: {rows:?}");
   assert!(rows[on].contains("apple"), "and it is the one meant: {rows:?}");
@@ -1626,12 +1642,80 @@ fn typing_at_the_session_picker_narrows_it_to_what_was_typed() {
   // What the filter left is what `Enter` resumes, rather than whichever row
   // stood in that place before anything was typed.
   term.type_in("apl");
-  term.wait_for("Resume: apl");
+  term.wait_for_query("apl");
   term.type_in("Enter");
   term.wait_for("Resumed session");
   term.type_in("Up");
   term.settle();
   assert_eq!(term.typed(), "apple", "the filtered-to session's own prompt");
+}
+
+/// The query is typed into the box at the bottom of the screen, and that box
+/// is a box: the cursor moves through what has been typed the way it moves
+/// through a prompt, and the list follows whatever the editing leaves.
+#[test]
+fn the_query_is_edited_with_the_keys_that_edit_a_prompt() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![Turn::Echo]);
+  let term = Term::start("query-keys", &provider, &[]);
+  let listed = |rows: &[String]| {
+    rows
+      .iter()
+      .filter(|row| !row.trim_matches(|c| c == '│' || c == ' ').is_empty())
+      .count()
+  };
+  term.submit("apple");
+  term.wait_for("Answer to apple.");
+  term.submit("/new");
+  term.wait_for("New session.");
+  term.submit("pear");
+  term.wait_for("Answer to pear.");
+
+  term.submit("/resume");
+  term.wait_for("Esc cancel");
+  term.type_in("aple");
+  term.wait_for_query("aple");
+
+  // The arrows walk back into the query rather than steering the list, which
+  // is what the letter typed between two others proves: dropped at the end
+  // instead, "aplep" would match nothing.
+  term.type_in("Left");
+  term.type_in("Left");
+  term.type_in("p");
+  term.wait_for_query("apple");
+  let (rows, on) = term.overlay();
+  assert_eq!(listed(&rows), 1, "still the one session: {rows:?}");
+  assert!(rows[on].contains("apple"), "and it is the one meant: {rows:?}");
+
+  // Home goes to the start of the query, where a letter narrows it to
+  // nothing.
+  term.type_in("Home");
+  term.type_in("z");
+  term.wait_for_query("zapple");
+  term.wait_for("No session matches.");
+
+  // And Delete is the query's too: it takes the letter back rather than
+  // asking about the session under the cursor, which is Ctrl+D's question.
+  term.type_in("Home");
+  term.type_in("DC");
+  term.wait_for_query("apple");
+  let screen = term.screen();
+  assert!(
+    !screen.contains("delete?"),
+    "Delete edits the query and asks nothing:\n{screen}"
+  );
+
+  // End goes back to the far end of it, so Backspace can empty it out and
+  // leave the whole list standing again.
+  term.type_in("End");
+  for _ in 0..5 {
+    term.type_in("BSpace");
+  }
+  term.settle();
+  let (rows, _) = term.overlay();
+  assert_eq!(listed(&rows), 2, "both sessions again: {rows:?}");
 }
 
 /// A session file is the only copy of the conversation in it, so the picker
@@ -1653,13 +1737,13 @@ fn the_picker_deletes_a_session_once_it_has_asked_about_it() {
   term.wait_for("Answer to pear.");
   assert_eq!(term.session_files().len(), 2);
 
-  // `DC` is what tmux calls the Delete key.
+  // `C-d` is what tmux calls Ctrl+D.
   term.submit("/resume");
   term.wait_for("Esc cancel");
   term.point_at("pear");
-  term.type_in("DC");
-  term.wait_for("delete? Del to confirm");
-  term.type_in("DC");
+  term.type_in("C-d");
+  term.wait_for("delete? Ctrl+D to confirm");
+  term.type_in("C-d");
   term.settle();
   let (rows, _) = term.overlay();
   assert!(
@@ -1670,13 +1754,13 @@ fn the_picker_deletes_a_session_once_it_has_asked_about_it() {
 
   // Anything but a second Delete answers no, and only puts the question away.
   term.point_at("apple");
-  term.type_in("DC");
-  term.wait_for("delete? Del to confirm");
+  term.type_in("C-d");
+  term.wait_for("delete? Ctrl+D to confirm");
   term.type_in("Up");
   term.settle();
   let screen = term.screen();
   assert!(
-    !screen.contains("delete? Del to confirm"),
+    !screen.contains("delete? Ctrl+D to confirm"),
     "the question is answered:\n{screen}"
   );
   assert_eq!(term.session_files().len(), 2, "and nothing is deleted");
@@ -1684,10 +1768,10 @@ fn the_picker_deletes_a_session_once_it_has_asked_about_it() {
   // The row deleted is the one the filter left under the cursor, rather than
   // whichever row stood in that place before anything was typed.
   term.type_in("aple");
-  term.wait_for("Resume: aple");
-  term.type_in("DC");
-  term.wait_for("delete? Del to confirm");
-  term.type_in("DC");
+  term.wait_for_query("aple");
+  term.type_in("C-d");
+  term.wait_for("delete? Ctrl+D to confirm");
+  term.type_in("C-d");
   term.wait_for("No session matches.");
   for _ in 0..4 {
     term.type_in("BSpace");
@@ -1834,7 +1918,7 @@ fn typing_at_the_tree_narrows_it_to_what_was_typed() {
   // A fuzzy match, as everywhere else in fa: "aple" is a-p-p-l-e, and it
   // leaves the prompt and the answer that say it.
   term.type_in("aple");
-  term.wait_for("Tree: aple");
+  term.wait_for_query("aple");
   let (rows, _) = term.overlay();
   assert_eq!(listed(&rows), 2, "only what matches is left: {rows:?}");
   assert!(
@@ -1856,7 +1940,7 @@ fn typing_at_the_tree_narrows_it_to_what_was_typed() {
   // What the filter left is what `Enter` goes to: the row taken is the point
   // it stands for, not the place it sits in the narrowed list.
   term.type_in("pear");
-  term.wait_for("Tree: pear");
+  term.wait_for_query("pear");
   term.choose("❯ pear");
   term.wait_for("Moved to 2 messages.");
   assert_eq!(term.typed(), "pear", "the filtered-to prompt comes back");
@@ -1880,6 +1964,15 @@ fn forking_starts_a_session_of_its_own_and_leaves_the_first_alone() {
   assert!(
     !rows.iter().any(|row| row.contains("Answer to")),
     "a fork starts from a question: {rows:?}"
+  );
+  // This list is typed at like the others, and the row the query leaves is
+  // the one forked from.
+  term.type_in("pea");
+  term.wait_for_query("pea");
+  let (rows, _) = term.overlay();
+  assert!(
+    !rows.iter().any(|row| row.contains("apple")),
+    "only the prompts that match are left: {rows:?}"
   );
   term.choose("❯ pear");
   term.wait_for("Forked, 2 messages kept.");
@@ -3077,7 +3170,7 @@ fn typing_at_the_model_picker_narrows_it_to_what_was_typed() {
 
   // A fuzzy match, as everywhere else in fa: "omd" is o-ther-m-o-d-el.
   term.type_in("omd");
-  term.wait_for("Model: omd");
+  term.wait_for_query("omd");
   let (rows, on) = term.overlay();
   assert_eq!(listed(&rows), 1, "only what matches is left: {rows:?}");
   assert!(rows[on].contains("other-model"), "and it is the one meant: {rows:?}");
@@ -3107,7 +3200,7 @@ fn typing_at_the_model_picker_narrows_it_to_what_was_typed() {
 
   // `q` is a letter here, not the key that closes the other lists.
   term.type_in("mini");
-  term.wait_for("Model: mini");
+  term.wait_for_query("mini");
   term.type_in("Enter");
   term.wait_for("Model mock-mini");
   term.submit("go");
