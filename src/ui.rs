@@ -192,6 +192,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
   ("compact", "Manually compact the session context", false),
   ("continue", "Resume the loop without a new message", false),
   ("fork", "Start a new session from an earlier message", false),
+  ("goto", "Scroll to an earlier prompt", false),
   ("model", "Choose the model, or name one: /model <id>", true),
   ("name", "Set session display name", true),
   ("new", "Start a new session", false),
@@ -298,6 +299,16 @@ enum OverlayList {
   Fork(Vec<Point>),
   /// `/model`: what the provider last said it offers.
   Models(Vec<ModelInfo>),
+  /// `/goto`: the prompts on screen, to scroll the transcript to one of them.
+  Goto(Vec<Mark>),
+}
+
+/// A prompt in the transcript, as `/goto` lists it.
+struct Mark {
+  /// Index into the transcript's entries.
+  entry: usize,
+  /// The prompt's first line.
+  label: String,
 }
 
 /// What the `ask` tool put to the user, and the channel the answer goes back
@@ -336,6 +347,7 @@ impl Overlay {
       OverlayList::Sessions(sessions) => sessions.len(),
       OverlayList::Tree(points) | OverlayList::Fork(points) => points.len(),
       OverlayList::Models(models) => models.len(),
+      OverlayList::Goto(marks) => marks.len(),
     };
     Self {
       list,
@@ -373,6 +385,7 @@ impl Overlay {
       // what is picked out has to sit under what was typed.
       OverlayList::Fork(points) => filter_rows(matcher, points.iter().map(|p| p.label.as_str()), query),
       OverlayList::Models(models) => filter_models(matcher, models, query),
+      OverlayList::Goto(marks) => filter_rows(matcher, marks.iter().map(|m| m.label.as_str()), query),
     };
   }
 
@@ -389,6 +402,7 @@ impl Overlay {
       OverlayList::Tree(_) => " Tree — ↑↓ PgUp/PgDn select · Enter go there · Ctrl+D delete · Esc cancel ".into(),
       OverlayList::Fork(_) => " Fork — ↑↓ PgUp/PgDn select · Enter fork · Esc cancel ".into(),
       OverlayList::Models(_) => " Model — ↑↓ select · Enter use · Esc cancel ".into(),
+      OverlayList::Goto(_) => " Go to — ↑↓ PgUp/PgDn select · Enter scroll there · Esc cancel ".into(),
     }
   }
 }
@@ -612,6 +626,8 @@ pub struct App {
   /// A thumb drag in flight, holding how far down the thumb it was grabbed so
   /// the cursor keeps hold of the same row of it.
   dragging: Option<u16>,
+  /// The line each entry starts at in `rendered`, one per entry.
+  starts: Vec<usize>,
   /// The transcript as the last draw wrapped it, one line per row on screen.
   /// What is on screen is a window onto this, and what the mouse points at is
   /// a cell of it.
@@ -699,6 +715,7 @@ impl App {
       view: (0, 0),
       thumb: None,
       dragging: None,
+      starts: Vec::new(),
       rendered: Vec::new(),
       content: Rect::ZERO,
       selection: None,
@@ -1215,6 +1232,11 @@ impl App {
               self.set_model(model.id.clone());
             }
           }
+          OverlayList::Goto(marks) => {
+            if let Some(mark) = marks.get(at) {
+              self.goto(mark.entry);
+            }
+          }
           _ => {}
         }
       }
@@ -1603,7 +1625,7 @@ impl App {
     // What a run makes of what is typed at it is a message, which is what
     // was meant by all but these: they were typed at fa, and are answered
     // here whether or not a run has the floor.
-    let for_us = matches!(text.as_str(), "/quit" | "/new" | "/model") || text.starts_with("/model ");
+    let for_us = matches!(text.as_str(), "/quit" | "/new" | "/model" | "/goto") || text.starts_with("/model ");
     if self.run.is_some() && !for_us {
       // Handed to the run, which reads it at the top of its next turn
       // rather than after the whole answer. It is kept there and nowhere
@@ -1649,6 +1671,7 @@ impl App {
         }
       }
       "/session" => self.session_info(),
+      "/goto" => self.open_marks(),
       t if t == "/model" || t.starts_with("/model ") => {
         let named = t["/model".len()..].trim().to_string();
         match named.is_empty() {
@@ -1908,6 +1931,43 @@ impl App {
       false => OverlayList::Tree(points),
     };
     self.overlay = Some(Overlay::new(list, selected));
+  }
+
+  /// List the prompts in the transcript, the latest selected.
+  ///
+  /// Only the view moves: where the session is stays where it was, which is
+  /// why this one is open while a run is going.
+  fn open_marks(&mut self) {
+    let marks: Vec<Mark> = self
+      .entries
+      .iter()
+      .enumerate()
+      .filter_map(|(entry, e)| match e {
+        Entry::User { text, .. } => Some(Mark {
+          entry,
+          label: first_line(text),
+        }),
+        _ => None,
+      })
+      .collect();
+    if marks.is_empty() {
+      self.entries.push(Entry::Info("No prompts to go to.".into()));
+      return;
+    }
+    let selected = marks.len() - 1;
+    self.overlay = Some(Overlay::new(OverlayList::Goto(marks), selected));
+  }
+
+  /// Scroll the transcript so the prompt at `entry` is at the top of it.
+  ///
+  /// The lines are the last draw's, which was at the width the next one will
+  /// be: the list is drawn where the transcript was.
+  fn goto(&mut self, entry: usize) {
+    // A prompt's first line is the blank one above it; the one worth having
+    // at the top is the one it is written on.
+    if let Some(start) = self.starts.get(entry) {
+      self.scroll_to(start + 1);
+    }
   }
 
   /// Move this session's end to `point`.
@@ -2570,6 +2630,7 @@ impl App {
     let emptied = shown.is_empty().then_some(match &overlay.list {
       OverlayList::Models(_) => "  No model matches.",
       OverlayList::Sessions(_) => "  No session matches.",
+      OverlayList::Goto(_) => "  No prompt matches.",
       _ => "  No point matches.",
     });
     if let Some(text) = emptied {
@@ -2624,6 +2685,11 @@ impl App {
         .iter()
         .filter_map(|(at, _)| points.get(*at))
         .map(|p| (p.label.clone(), format!("keeps {}", messages(p.len))))
+        .collect(),
+      OverlayList::Goto(marks) => shown
+        .iter()
+        .filter_map(|(at, _)| marks.get(*at))
+        .map(|m| (m.label.clone(), String::new()))
         .collect(),
       // The window on the right where a session says its size: it is the
       // one thing about a model worth choosing between, and most providers
@@ -2740,7 +2806,9 @@ impl App {
     // Only the last entry can still be growing, and only while a turn is in
     // flight. Everything else is final, and is parsed as written.
     let streaming = self.run.is_some().then(|| self.entries.len().saturating_sub(1));
+    let mut starts = Vec::with_capacity(self.entries.len());
     for (at, entry) in self.entries.iter().enumerate() {
+      starts.push(lines.len());
       match entry {
         Entry::User { text, images } => {
           lines.push(Line::default());
@@ -2987,6 +3055,7 @@ impl App {
         lines.push(Line::styled(format!("Queued: {}", first_line(text)), dim.italic()));
       }
     }
+    self.starts = starts;
     self.markdown = live;
     // Every entry that renders itself has already wrapped to the width; this
     // is for the ones shown as they were written — a prompt, an error, a

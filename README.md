@@ -779,6 +779,7 @@ what it spent.
 | `/resume` | Pick a saved session to resume — type to filter, `Ctrl+D` removes the selected one, a second `Ctrl+D` confirms |
 | `/tree` | Move to another point in this session, on any branch — type to filter, `Ctrl+D` deletes the selected branch, a second `Ctrl+D` confirms |
 | `/fork` | Branch a new session from an earlier prompt — type to filter |
+| `/goto` | Scroll the transcript to an earlier prompt, leaving the session where it is — type to filter, works mid-run |
 | `/name <name>` | Name the current session |
 | `/session` | Show session id, file, and stats |
 | `/quit` | Quit |
