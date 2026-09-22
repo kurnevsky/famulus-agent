@@ -466,12 +466,22 @@ you can go back, try something else, and later walk into the answer you
 abandoned:
 
 ```
-╭ Tree — ↑↓ PgUp/PgDn select · Enter go there · Esc cancel ──────────────────╮
+╭ Tree — type to filter · ↑↓ PgUp/PgDn select · Enter go there · Esc cancel ─╮
 │  ❯ what does main.rs do?                                       0 messages  │
 │  ⚙ read                                                        3 messages  │
 │›   Actually it prints hi and exits 0.                                here  │
 │    It prints hi.                                               4 messages  │
 ```
+
+The list is typed at the way the session picker is: letters narrow it to the
+points whose rows they fuzzily match, `Backspace` widens it again, the arrows
+steer what is left, and the matched letters are picked out in each row. What is
+matched is the row as it is drawn, indent and all, so what is picked out sits
+under what was typed. A turn that ran twenty commands is twenty points, and a
+conversation of a few hours is more of them than there are rows on the screen —
+but the one you mean is one you remember a word or two of. The query is drawn
+in the list's own title, and `Enter` goes to the row the filter left under the
+cursor.
 
 `/fork` is the same list narrowed to your prompts, and it branches into a file
 instead of within one: the conversation up to that point is carried into a
@@ -480,7 +490,8 @@ came from is left on disk exactly as it was, still its own thing to resume. The
 fork's header names its parent. Only the one path is copied — the branches
 beside it stay with the session being left, and the fork starts as a straight
 line. Use `/tree` to take this conversation a different way, `/fork` to start
-another one beside it.
+another one beside it. It is not typed at: prompts alone are a list you can
+read, and the arrows are enough for it.
 
 There is no branch summary — going back is a plain move, with nothing
 summarized and nothing lost.
@@ -740,7 +751,7 @@ what it spent.
 | `/model` | Pick the model from what the provider offers, asked for afresh each time — type to filter, or `/model <id>` to name one outright |
 | `/new` | Start a new session |
 | `/resume` | Pick a saved session to resume — type to filter, `Delete` removes the selected one, a second `Delete` confirms |
-| `/tree` | Move to another point in this session, on any branch |
+| `/tree` | Move to another point in this session, on any branch — type to filter |
 | `/fork` | Branch a new session from an earlier prompt |
 | `/name <name>` | Name the current session |
 | `/session` | Show session id, file, and stats |

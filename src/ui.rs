@@ -261,7 +261,18 @@ enum OverlayList {
     confirming: bool,
   },
   /// `/tree`: every point this session can go back to, oldest first.
-  Tree(Vec<Point>),
+  Tree {
+    points: Vec<Point>,
+    /// What has been typed to narrow the list down, matched against the rows
+    /// as they are drawn — a long conversation has far more points than rows,
+    /// and what you are going back to is something you remember a few words
+    /// of.
+    query: String,
+    /// Which of `points` the query leaves, best match first, and which
+    /// letters of each row it matched. As for `Sessions` and `Models`: worked
+    /// out when the query changes rather than while drawing.
+    shown: Vec<(usize, Vec<u32>)>,
+  },
   /// `/fork`: the prompts, to start a new session from one of them.
   Fork(Vec<Point>),
   /// `/model`: what the provider last said it offers, and what has been
@@ -309,18 +320,13 @@ struct Point {
 }
 
 impl Overlay {
-  fn points(&self) -> &[Point] {
-    match &self.list {
-      OverlayList::Tree(points) | OverlayList::Fork(points) => points,
-      OverlayList::Sessions { .. } | OverlayList::Models { .. } | OverlayList::Question { .. } => &[],
-    }
-  }
-
   fn len(&self) -> usize {
     match &self.list {
-      OverlayList::Sessions { shown, .. } | OverlayList::Models { shown, .. } => shown.len(),
+      OverlayList::Sessions { shown, .. } | OverlayList::Models { shown, .. } | OverlayList::Tree { shown, .. } => {
+        shown.len()
+      }
+      OverlayList::Fork(points) => points.len(),
       OverlayList::Question { .. } => 0,
-      _ => self.points().len(),
     }
   }
 
@@ -333,7 +339,10 @@ impl Overlay {
         true => " Resume — type to filter · ↑↓ select · Enter resume · Del delete · Esc cancel ".into(),
         false => format!(" Resume: {query}▏ — ↑↓ select · Enter resume · Del delete · Esc cancel "),
       },
-      OverlayList::Tree(_) => " Tree — ↑↓ PgUp/PgDn select · Enter go there · Esc cancel ".into(),
+      OverlayList::Tree { query, .. } => match query.is_empty() {
+        true => " Tree — type to filter · ↑↓ PgUp/PgDn select · Enter go there · Esc cancel ".into(),
+        false => format!(" Tree: {query}▏ — ↑↓ PgUp/PgDn select · Enter go there · Esc cancel "),
+      },
       OverlayList::Fork(_) => " Fork — ↑↓ PgUp/PgDn select · Enter fork · Esc cancel ".into(),
       // The filter is drawn where the title is, since that is where the list
       // says what it is a list of — and with a query it is a list of that.
@@ -1128,9 +1137,9 @@ impl App {
     if !ctrl && self.handle_delete_key(code) {
       return;
     }
-    // The model picker is typed at, so letters narrow it rather than meaning
+    // The pickers that are typed at take letters as narrowing rather than as
     // what a letter means in the other lists — `q` closes those, and is the
-    // start of a model name here.
+    // start of a model name, a session title or a point here.
     if !ctrl && self.handle_filter_key(code) {
       return;
     }
@@ -1181,7 +1190,13 @@ impl App {
               self.load_session(&info.path.clone());
             }
           }
-          OverlayList::Tree(mut points) if selected < points.len() => self.go_to(points.remove(selected)),
+          OverlayList::Tree { mut points, shown, .. } => {
+            if let Some(at) = shown.get(selected).map(|(at, _)| *at)
+              && at < points.len()
+            {
+              self.go_to(points.remove(at));
+            }
+          }
           OverlayList::Fork(mut points) if selected < points.len() => self.fork_to(points.remove(selected)),
           // The row taken is the one the filter left there, which is an
           // index into the whole list rather than a place in it.
@@ -1222,6 +1237,12 @@ impl App {
           return false;
         }
         *shown = filter_sessions(&mut self.matcher, sessions, query);
+      }
+      OverlayList::Tree { points, query, shown } => {
+        if !edit_query(query, code) {
+          return false;
+        }
+        *shown = filter_points(&mut self.matcher, points, query);
       }
       _ => return false,
     }
@@ -1855,7 +1876,14 @@ impl App {
     let selected = points.iter().rposition(|point| point.here).unwrap_or(points.len() - 1);
     let list = match fork {
       true => OverlayList::Fork(points),
-      false => OverlayList::Tree(points),
+      false => OverlayList::Tree {
+        // Nothing typed yet, so every point is shown in the order the walk
+        // put them in, with nothing picked out in any of them — which is what
+        // leaves the selection above standing where the session is.
+        shown: (0..points.len()).map(|at| (at, Vec::new())).collect(),
+        points,
+        query: String::new(),
+      },
     };
     self.overlay = Some(Overlay { list, selected });
   }
@@ -2509,6 +2537,7 @@ impl App {
     let emptied = match &overlay.list {
       OverlayList::Models { shown, .. } if shown.is_empty() => Some("  No model matches."),
       OverlayList::Sessions { shown, .. } if shown.is_empty() => Some("  No session matches."),
+      OverlayList::Tree { shown, .. } if shown.is_empty() => Some("  No point matches."),
       _ => None,
     };
     if let Some(text) = emptied {
@@ -2549,14 +2578,15 @@ impl App {
       // The tree is indented at its branch points, so a conversation that
       // went two ways reads as two ways. Both lists say how long the
       // conversation would be once you got there.
-      OverlayList::Tree(points) => points
+      OverlayList::Tree { points, shown, .. } => shown
         .iter()
+        .filter_map(|(at, _)| points.get(*at))
         .map(|p| {
           let note = match p.here {
             true => "here".to_string(),
             false => messages(p.len),
           };
-          (format!("{}{}", "  ".repeat(p.depth), p.label), note)
+          (point_label(p), note)
         })
         .collect(),
       OverlayList::Fork(points) => points
@@ -2585,7 +2615,9 @@ impl App {
     // Only a filtered list has letters to pick out, and only the ones the
     // filter matched — the same cyan the `/` popup underlines its own with.
     let matched: &[(usize, Vec<u32>)] = match &overlay.list {
-      OverlayList::Models { shown, .. } | OverlayList::Sessions { shown, .. } => shown,
+      OverlayList::Models { shown, .. } | OverlayList::Sessions { shown, .. } | OverlayList::Tree { shown, .. } => {
+        shown
+      }
       _ => &[],
     };
     let dim = Style::default().add_modifier(Modifier::DIM);
@@ -3211,6 +3243,23 @@ fn filter_models(matcher: &mut Matcher, models: &[ModelInfo], query: &str) -> Ve
 /// remembered by is its name, or the question it opened with.
 fn filter_sessions(matcher: &mut Matcher, sessions: &[SessionInfo], query: &str) -> Vec<(usize, Vec<u32>)> {
   filter_rows(matcher, sessions.iter().map(SessionInfo::title), query)
+}
+
+/// Which points `query` leaves, matched over the rows they are drawn as —
+/// indent and all, so the letters picked out sit under the letters typed.
+///
+/// The rows are built to be matched and built again to be drawn, which is two
+/// short strings a keystroke and a list that cannot say one thing and match
+/// another.
+fn filter_points(matcher: &mut Matcher, points: &[Point], query: &str) -> Vec<(usize, Vec<u32>)> {
+  let labels: Vec<String> = points.iter().map(point_label).collect();
+  filter_rows(matcher, labels.iter().map(String::as_str), query)
+}
+
+/// A point as its row reads: indented by the branch points crossed to reach
+/// it.
+fn point_label(point: &Point) -> String {
+  format!("{}{}", "  ".repeat(point.depth), point.label)
 }
 
 fn filter_commands(matcher: &mut Matcher, query: &str) -> Vec<Match> {
@@ -4671,6 +4720,50 @@ mod tests {
     // And the letters it matched are picked out where they are: f-i-lter.
     let matched = filter_sessions(&mut matcher, &sessions, "fil");
     assert_eq!(matched[0].1, [6, 7, 8]);
+  }
+
+  #[test]
+  fn the_point_filter_matches_the_rows_the_tree_is_drawn_as() {
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let point = |label: &str, depth: usize| Point {
+      leaf: Some("n".into()),
+      text: None,
+      label: label.into(),
+      depth,
+      len: 2,
+      here: false,
+    };
+    let points = vec![
+      point("❯ what does main.rs do?", 0),
+      point("⚙ read", 0),
+      point("It prints hi.", 1),
+      point("Actually it prints hi and exits 0.", 1),
+    ];
+    let mut labels = |query| {
+      filter_points(&mut matcher, &points, query)
+        .into_iter()
+        .map(|(at, _)| points[at].label.as_str())
+        .collect::<Vec<_>>()
+    };
+    // Nothing typed leaves the list as the walk built it, so a branch still
+    // hangs under the point it parts at.
+    assert_eq!(
+      labels(""),
+      [
+        "❯ what does main.rs do?",
+        "⚙ read",
+        "It prints hi.",
+        "Actually it prints hi and exits 0."
+      ]
+    );
+    // A tool row is found by the tool it ran, and a turn by what it said.
+    assert_eq!(labels("read"), ["⚙ read"]);
+    assert_eq!(labels("exits"), ["Actually it prints hi and exits 0."]);
+    assert!(labels("zzz").is_empty());
+    // The indent counts as part of the row, so the letters picked out land on
+    // the letters the row draws: two spaces, then I-t, and p a space later.
+    let matched = filter_points(&mut matcher, &points, "itp");
+    assert_eq!(matched[0].1, [2, 3, 5]);
   }
 
   #[test]

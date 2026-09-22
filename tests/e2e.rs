@@ -1806,6 +1806,62 @@ fn going_back_leaves_a_branch_that_can_be_walked_into_again() {
   );
 }
 
+/// The tree is typed at the same way the session picker is: letters narrow it
+/// to the points whose rows they match, and `Enter` goes to what is left
+/// standing under the cursor rather than to whatever stood in that place
+/// before anything was typed.
+#[test]
+fn typing_at_the_tree_narrows_it_to_what_was_typed() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![Turn::Echo]);
+  let term = asked_twice("tree-filter", &provider, &[]);
+  // The rows a list has drawn something on: the box is as tall as the screen
+  // whatever is in it, and the blank ones are not points.
+  let listed = |rows: &[String]| {
+    rows
+      .iter()
+      .filter(|row| !row.trim_matches(|c| c == '│' || c == ' ').is_empty())
+      .count()
+  };
+
+  term.submit("/tree");
+  term.wait_for("Esc cancel");
+  let (rows, _) = term.overlay();
+  assert_eq!(listed(&rows), 4, "both prompts and both answers: {rows:?}");
+
+  // A fuzzy match, as everywhere else in fa: "aple" is a-p-p-l-e, and it
+  // leaves the prompt and the answer that say it.
+  term.type_in("aple");
+  term.wait_for("Tree: aple");
+  let (rows, _) = term.overlay();
+  assert_eq!(listed(&rows), 2, "only what matches is left: {rows:?}");
+  assert!(
+    !rows.iter().any(|row| row.contains("pear")),
+    "and nothing that does not: {rows:?}"
+  );
+
+  // Backspace widens it again, and a query nothing matches says so rather
+  // than leaving an empty box.
+  for _ in 0..4 {
+    term.type_in("BSpace");
+  }
+  term.type_in("zzz");
+  term.wait_for("No point matches.");
+  for _ in 0..3 {
+    term.type_in("BSpace");
+  }
+
+  // What the filter left is what `Enter` goes to: the row taken is the point
+  // it stands for, not the place it sits in the narrowed list.
+  term.type_in("pear");
+  term.wait_for("Tree: pear");
+  term.choose("❯ pear");
+  term.wait_for("Moved to 2 messages.");
+  assert_eq!(term.typed(), "pear", "the filtered-to prompt comes back");
+}
+
 #[test]
 fn forking_starts_a_session_of_its_own_and_leaves_the_first_alone() {
   if !have_tmux() {
