@@ -597,9 +597,10 @@ output.
 
 Every tool shows a preview of what it has to say rather than all of it, the
 way a thinking block does, with a line saying how much is folded away;
-`Ctrl+O` swaps between the preview and the whole thing, including for a call
-still being written, so a long file can be watched arriving in full or kept to
-its last lines. A command keeps the
+`Ctrl+O` steps from the preview to the whole thing, then to nothing but the
+tool's name — no arguments, no output — and back, including for a call still
+being written, so a long file can be watched arriving in full, kept to its last
+lines, or kept out of the way. A command keeps the
 end of its output and a file the start of its contents, since that is the end
 that matters in each.
 
@@ -725,7 +726,9 @@ worth, stay verbatim as entries of their own, so `/tree` can still go back to
 any of them; tool call/result pairs are never split. Where that cut falls is
 chars/4 and nothing else — it needs a size per message, and no provider
 reports one. A later compaction updates the existing summary instead of
-nesting it.
+nesting it. In the transcript the summary is folded to its first lines like
+any other long block; `Ctrl+S` steps it to the whole thing, then to nothing but
+its heading, and back.
 
 The tail starts wherever the budget runs out, at the nearest message the
 model can carry on from: a user turn, or a turn of its own. So a turn may be
@@ -805,8 +808,9 @@ what it spent.
 | Drag over the transcript | Select and copy — letting go copies what was covered, dragging along the top or bottom row scrolls |
 | `Ctrl+C` | Abort if running, otherwise quit |
 | `Ctrl+D` | Quit (empty input) |
-| `Ctrl+T` | Thinking in full, or only its last lines |
-| `Ctrl+O` | Tool output in full, or only its preview |
+| `Ctrl+T` | Thinking: its last lines, in full, or hidden (cycles) |
+| `Ctrl+O` | Tool output: its preview, in full, or hidden (cycles) |
+| `Ctrl+S` | Context summary: its first lines, in full, or hidden (cycles) |
 | `↑` / `↓`, `Enter`, `Space`, `Tab`, `Esc` | Answer what `ask` put on the screen — see [Asking you](#asking-you) |
 | Any list | `↑`/`↓` and `PgUp`/`PgDn` steer it, `Enter` takes the row, `Esc` closes it — everything else is typed into the box at the bottom and narrows it |
 | `/compact` | Summarize older history now |

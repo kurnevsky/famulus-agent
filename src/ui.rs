@@ -39,6 +39,8 @@ const MAX_INPUT_LINES: usize = 8;
 const TOOL_OUTPUT_LINES: usize = 10;
 const DIFF_LINES: usize = 30;
 const REASONING_LINES: usize = 6;
+/// Lines of a context summary shown before it folds.
+const SUMMARY_LINES: usize = 10;
 /// Lines of an image shown before it folds, as every other block of a tool's
 /// output folds.
 const IMAGE_LINES: usize = 16;
@@ -52,6 +54,7 @@ const REASONING_INDENT: &str = "  ";
 const ASSISTANT_KIND: u8 = 0;
 const REASONING_KIND: u8 = 1;
 const IMAGE_KIND: u8 = 2;
+const SUMMARY_KIND: u8 = 3;
 /// Transcript lines moved per mouse wheel notch.
 const WHEEL_LINES: usize = 3;
 /// How long the `auto` scrollbar stays visible after the last scroll.
@@ -648,10 +651,12 @@ pub struct App {
   /// press to the release that copies it, and no longer — so nothing has to
   /// notice that the lines under it have moved.
   selection: Option<Selection>,
-  /// Ctrl+T shows reasoning blocks in full instead of their last few lines.
-  expand_thinking: bool,
-  /// Ctrl+O shows tool output in full instead of the preview.
-  expand_tools: bool,
+  /// How much of a reasoning block to show, cycled by Ctrl+T.
+  thinking_fold: Fold,
+  /// How much of a tool's output to show, cycled by Ctrl+O.
+  tools_fold: Fold,
+  /// How much of a context summary to show, cycled by Ctrl+S.
+  summary_fold: Fold,
   /// Rendered markdown, keyed by message text and width rather than by entry,
   /// so reloading a session or compacting cannot serve another entry's lines.
   /// Rebuilt each draw by moving live entries across, which evicts the rest.
@@ -729,8 +734,9 @@ impl App {
       rendered: Vec::new(),
       content: Rect::ZERO,
       selection: None,
-      expand_thinking: false,
-      expand_tools: false,
+      thinking_fold: Fold::Preview,
+      tools_fold: Fold::Preview,
+      summary_fold: Fold::Preview,
       markdown: HashMap::new(),
       usage: Usage::new(),
       context_tokens: None,
@@ -849,8 +855,8 @@ impl App {
       }
       (KeyCode::Char('d'), true) if self.input.is_empty() => self.quit = true,
       (KeyCode::Char('t'), true) => {
-        self.expand_thinking = !self.expand_thinking;
-        self.notify(if self.expand_thinking { "Thinking expanded" } else { "Thinking collapsed" });
+        self.thinking_fold = self.thinking_fold.next();
+        self.notify(format!("Thinking {}", self.thinking_fold.label()));
         // Expanding moves everything below the block, so go back to following
         // the bottom rather than leaving the reader mid-paragraph. Only the
         // view changes: the conversation is the same one, and so is anything
@@ -858,8 +864,13 @@ impl App {
         self.anchor = None;
       }
       (KeyCode::Char('o'), true) => {
-        self.expand_tools = !self.expand_tools;
-        self.notify(if self.expand_tools { "Tool output expanded" } else { "Tool output collapsed" });
+        self.tools_fold = self.tools_fold.next();
+        self.notify(format!("Tool output {}", self.tools_fold.label()));
+        self.anchor = None;
+      }
+      (KeyCode::Char('s'), true) => {
+        self.summary_fold = self.summary_fold.next();
+        self.notify(format!("Context summary {}", self.summary_fold.label()));
         self.anchor = None;
       }
       (KeyCode::Esc, _) if self.run.is_some() => self.abort(),
@@ -2866,7 +2877,7 @@ impl App {
               image,
               gutter,
               width,
-              self.expand_tools,
+              self.tools_fold,
               (&mut cached, &mut live),
               &mut lines,
             );
@@ -2899,16 +2910,13 @@ impl App {
             Some(wrapped) => wrapped,
             None => crate::markdown::wrap_text(text, body, thinking),
           };
-          let shown = if self.expand_thinking {
-            wrapped.len()
-          } else {
-            wrapped.len().min(REASONING_LINES)
-          };
-          let hidden = wrapped.len() - shown;
-          let header = match hidden {
-            0 => "· thinking…".to_string(),
-            1 => "· thinking… (1 earlier line hidden)".to_string(),
-            n => format!("· thinking… ({n} earlier lines hidden)"),
+          let hidden = self.thinking_fold.hidden(wrapped.len(), REASONING_LINES);
+          // Collapsed, the header stands for the whole block and says nothing
+          // about its size.
+          let header = match (self.thinking_fold, hidden) {
+            (Fold::Collapsed, _) | (_, 0) => "· thinking…".to_string(),
+            (_, 1) => "· thinking… (1 earlier line hidden)".to_string(),
+            (_, n) => format!("· thinking… ({n} earlier lines hidden)"),
           };
           lines.push(Line::styled(header, thinking));
           for line in &wrapped[hidden..] {
@@ -2918,7 +2926,7 @@ impl App {
         }
         Entry::ToolCall { name, summary, .. } => {
           lines.push(Line::default());
-          lines.extend(call_lines(name, summary, dim));
+          lines.extend(call_lines(name, self.tools_fold.summary(summary), dim));
         }
         Entry::ToolResult {
           name,
@@ -2965,7 +2973,7 @@ impl App {
               body,
               gutter: stripe.clone(),
               cap,
-              expanded: self.expand_tools,
+              fold: self.tools_fold,
               width: width as usize,
               from_end,
               cursor: false,
@@ -2987,12 +2995,12 @@ impl App {
               image,
               stripe.clone(),
               width,
-              self.expand_tools,
+              self.tools_fold,
               (&mut cached, &mut live),
               &mut lines,
             );
           }
-          if name == "bash" && (*running || took.is_some()) {
+          if name == "bash" && (*running || took.is_some()) && self.tools_fold != Fold::Collapsed {
             let (label, elapsed) = match took {
               Some(took) => ("Took", *took),
               None => ("Elapsed", started.elapsed()),
@@ -3019,9 +3027,27 @@ impl App {
             "▤ Context summary",
             Style::default().fg(Color::Magenta).bold(),
           ));
-          for l in text.lines() {
-            lines.push(Line::styled(format!("  {l}"), dim));
+          // Counted in lines as drawn, as a reasoning block is, so a long
+          // paragraph cannot slip past the fold as one line.
+          let body = width.saturating_sub(2);
+          let key = (hash(SUMMARY_KIND, text), body, false);
+          let wrapped = match cached.remove(&key) {
+            Some(wrapped) => wrapped,
+            None => crate::markdown::wrap_text(text, body, dim),
+          };
+          // The summary opens with the goal, so a preview keeps its start.
+          let hidden = self.summary_fold.hidden(wrapped.len(), SUMMARY_LINES);
+          for line in &wrapped[..wrapped.len() - hidden] {
+            lines.push(prefix("  ", line.clone()));
           }
+          if hidden > 0 && self.summary_fold == Fold::Preview {
+            let note = match hidden {
+              1 => "  … 1 more line (ctrl+s)".to_string(),
+              n => format!("  … {n} more lines (ctrl+s)"),
+            };
+            lines.push(Line::styled(note, mark_style(None)));
+          }
+          live.insert(key, wrapped);
         }
       }
     }
@@ -3061,10 +3087,11 @@ impl App {
       };
       // Drawn and highlighted as it is typed, so nothing moves or recolours
       // under the reader when the call is finally made.
-      let mut header = call_lines(&writing.name, &summary, dim);
+      let mut header = call_lines(&writing.name, self.tools_fold.summary(&summary), dim);
       // The cursor follows the model: at the end of the arguments until there
-      // is a body to write into, then at the end of what has arrived.
-      if body.is_empty()
+      // is a body to write into, then at the end of what has arrived — or
+      // stays on the arguments when the body is folded away entirely.
+      if (body.is_empty() || self.tools_fold == Fold::Collapsed)
         && let Some(last) = header.last_mut()
       {
         last.spans.push(Span::styled("▌", Style::default().fg(Color::Yellow)));
@@ -3075,7 +3102,7 @@ impl App {
         // Nothing has gone right or wrong yet, so the plain gutter.
         gutter: gutter(true, false),
         cap: TOOL_OUTPUT_LINES,
-        expanded: self.expand_tools,
+        fold: self.tools_fold,
         width: width as usize,
         // The tail is what is being written; what came before is already said.
         from_end: true,
@@ -3143,7 +3170,7 @@ fn draw_image(
   image: &[u8],
   gutter: Span<'static>,
   width: u16,
-  expanded: bool,
+  fold: Fold,
   (cached, live): (&mut RenderCache, &mut RenderCache),
   lines: &mut Vec<Line<'static>>,
 ) {
@@ -3163,7 +3190,7 @@ fn draw_image(
     body: drawn.iter().map(|line| line.spans.clone()).collect(),
     gutter,
     cap: IMAGE_LINES,
-    expanded,
+    fold,
     width: width as usize,
     from_end: false,
     cursor: false,
@@ -3674,6 +3701,53 @@ fn mark_style(mark: Option<char>) -> Style {
   }
 }
 
+/// How much of a folding block is shown: nothing, the first or last few lines
+/// of it, or all of it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Fold {
+  Collapsed,
+  Preview,
+  Full,
+}
+
+impl Fold {
+  /// The next one the key steps to. From the preview a press shows the rest,
+  /// as it always has, and a second one folds the block away.
+  fn next(self) -> Fold {
+    match self {
+      Fold::Preview => Fold::Full,
+      Fold::Full => Fold::Collapsed,
+      Fold::Collapsed => Fold::Preview,
+    }
+  }
+
+  fn label(self) -> &'static str {
+    match self {
+      Fold::Collapsed => "collapsed",
+      Fold::Preview => "previewed",
+      Fold::Full => "expanded",
+    }
+  }
+
+  /// What of a call's arguments is shown on its line: none of them once its
+  /// block is collapsed, which leaves only the tool's name.
+  fn summary(self, summary: &str) -> &str {
+    match self {
+      Fold::Collapsed => "",
+      _ => summary,
+    }
+  }
+
+  /// How many of `len` lines are folded away, when a preview keeps `cap`.
+  fn hidden(self, len: usize, cap: usize) -> usize {
+    match self {
+      Fold::Collapsed => len,
+      Fold::Preview => len.saturating_sub(cap),
+      Fold::Full => 0,
+    }
+  }
+}
+
 /// A block of a tool's text under its line: what it said, what it changed, or
 /// what it is still writing.
 ///
@@ -3688,7 +3762,7 @@ struct Preview {
   /// the plain gutter until then.
   gutter: Span<'static>,
   cap: usize,
-  expanded: bool,
+  fold: Fold,
   /// The columns the transcript has, which is what a folded line is cut to.
   width: usize,
   /// Keep the end rather than the start, for text whose point is its latest.
@@ -3703,21 +3777,22 @@ impl Preview {
       body,
       gutter,
       cap,
-      expanded,
+      fold,
       width,
       from_end,
       cursor,
     } = self;
-    let hidden = match expanded {
-      true => 0,
-      false => body.len().saturating_sub(cap),
-    };
+    // Collapsed, the block is not drawn at all, not even to say it is there.
+    if fold == Fold::Collapsed {
+      return;
+    }
+    let hidden = fold.hidden(body.len(), cap);
     let row = |line: Vec<Span<'static>>, tip: bool| {
       let mut spans = vec![Span::raw("  "), gutter.clone()];
       // Folded, a line is a row: one that wraps spends rows the fold was
       // counting, so a block held to ten lines could still fill the screen.
       // Unfolding shows the rest — of a long line as much as of a long block.
-      spans.extend(match expanded {
+      spans.extend(match fold == Fold::Full {
         true => line,
         // The two columns of indent, the gutter, and the cursor when there is
         // one, are the room the text does not have.
@@ -3728,9 +3803,9 @@ impl Preview {
       }
       Line::from(spans)
     };
-    let note = |hidden, earlier| vec![Span::styled(fold_note(hidden, earlier), mark_style(None))];
+    let note = vec![Span::styled(fold_note(hidden, from_end), mark_style(None))];
     if hidden > 0 && from_end {
-      out.push(row(note(hidden, true), false));
+      out.push(row(note.clone(), false));
     }
     let kept: Vec<Vec<Span<'static>>> = match from_end {
       true => body.into_iter().skip(hidden).collect(),
@@ -3744,7 +3819,7 @@ impl Preview {
       out.push(row(line, cursor && i == last));
     }
     if hidden > 0 && !from_end {
-      out.push(row(note(hidden, false), false));
+      out.push(row(note, false));
     }
   }
 }
@@ -3924,6 +3999,8 @@ fn code_spans(language: &str, code: &str, style: Style) -> Vec<Vec<Span<'static>
 fn call_lines(name: &str, summary: &str, style: Style) -> Vec<Line<'static>> {
   const MARK: &str = "⚙ ";
   let body = match name {
+    // Nothing but the name, for a call whose arguments are folded away.
+    _ if summary.is_empty() => vec![Vec::new()],
     "bash" => code_spans("bash", summary, style),
     name if !crate::tools::BUILT_IN.contains(&name) => code_spans("json", summary, style),
     _ => summary
@@ -5195,13 +5272,13 @@ mod tests {
   #[test]
   fn only_a_folded_block_cuts_its_lines() {
     let long = "x".repeat(40);
-    let block = |expanded| {
+    let block = |fold| {
       let mut out = Vec::new();
       Preview {
         body: vec![vec![Span::raw(long.clone())]],
         gutter: gutter(false, false),
         cap: TOOL_OUTPUT_LINES,
-        expanded,
+        fold,
         width: 20,
         from_end: false,
         cursor: false,
@@ -5211,11 +5288,13 @@ mod tests {
     };
     // Folded, the line is a row: cut to the width the transcript has, indent
     // and gutter included.
-    let folded = drawn(&block(false));
+    let folded = drawn(&block(Fold::Preview));
     assert_eq!(folded, ["   ".to_string() + &"x".repeat(16) + "…"]);
     // Unfolded, it is whole, over as many rows as the wrap takes.
     assert_eq!(folded[0].chars().count(), 20);
-    assert_eq!(drawn(&block(true)), [format!("   {long}")]);
+    assert_eq!(drawn(&block(Fold::Full)), [format!("   {long}")]);
+    // Collapsed, nothing at all.
+    assert!(block(Fold::Collapsed).is_empty());
   }
 
   #[test]
