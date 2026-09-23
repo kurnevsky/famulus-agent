@@ -9,6 +9,8 @@ mod edit;
 mod elicit;
 mod highlight;
 mod images;
+#[cfg(feature = "mcp")]
+mod keyring;
 mod markdown;
 mod mcp;
 mod modal;

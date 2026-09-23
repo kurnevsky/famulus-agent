@@ -42,7 +42,8 @@ use rmcp::transport::streamable_http_client::StreamableHttpError;
 use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::OnceCell;
+
+use crate::keyring;
 
 /// How long a person has to sign in. Longer than anything the network is
 /// given, since it is someone finding a password rather than a server
@@ -351,17 +352,6 @@ fn escape(text: &str) -> String {
 
 // ---------------------------------------------------------------- the keyring
 
-/// The one keyring every server's login is kept in, or why there is none.
-static KEYRING: OnceCell<Result<oo7::Keyring, String>> = OnceCell::const_new();
-
-async fn keyring() -> Result<&'static oo7::Keyring, String> {
-  KEYRING
-    .get_or_init(|| async { oo7::Keyring::new().await.map_err(|err| err.to_string()) })
-    .await
-    .as_ref()
-    .map_err(Clone::clone)
-}
-
 /// Where one server's login is kept: the keyring, under its URL, with a copy
 /// for the session in case the keyring is not there to keep it.
 #[derive(Clone)]
@@ -397,7 +387,7 @@ impl Store {
   }
 
   async fn read(&self) -> Result<Option<StoredCredentials>, String> {
-    let keyring = keyring().await?;
+    let keyring = keyring::shared().await?;
     let items = keyring
       .search_items(&self.attributes())
       .await
@@ -405,17 +395,14 @@ impl Store {
     let Some(item) = items.first() else {
       return Ok(None);
     };
-    if item.is_locked().await.map_err(|e| e.to_string())? {
-      item.unlock().await.map_err(|e| e.to_string())?;
-    }
-    let secret = item.secret().await.map_err(|e| e.to_string())?;
+    let secret = keyring::secret(item).await?;
     // An entry this cannot read is one from some other version of it, and
     // the answer to that is signing in again, not refusing to start.
     Ok(serde_json::from_slice(secret.as_bytes()).ok())
   }
 
   async fn write(&self, credentials: &StoredCredentials) -> Result<(), String> {
-    let keyring = keyring().await?;
+    let keyring = keyring::shared().await?;
     let secret = serde_json::to_vec(credentials).map_err(|e| e.to_string())?;
     let label = format!("fa: MCP login for {}", self.url);
     keyring
@@ -454,7 +441,7 @@ impl CredentialStore for Store {
   }
 
   async fn clear(&self) -> Result<(), AuthError> {
-    if let Ok(keyring) = keyring().await
+    if let Ok(keyring) = keyring::shared().await
       && let Err(err) = keyring.delete(&self.attributes()).await
     {
       self.note(err);

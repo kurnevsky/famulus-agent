@@ -314,6 +314,7 @@ A server is a `command` to run, spoken to over its own stdin and stdout, or a
 | `url` | Endpoint of a server that speaks streamable HTTP |
 | `token` | The bearer token to call it with, sent as `Authorization: Bearer …`; no login is started |
 | `token-command` | The same, as the output of a line of shell |
+| `token-keyring` | The same, kept in the system keyring: the attributes of the one item holding it |
 | `headers` | Sent with every request to it |
 | `headers-command` | The same, each value the output of a line of shell rather than written out |
 | `timeout` | Seconds one of this server's tools may take, `0` to wait forever (default 300) |
@@ -341,6 +342,26 @@ wait for an answer nobody could give it. One that fails is a note naming the
 value, the command and the first line of what it said for itself, never what it
 printed. A value is fetched once per session and held, so a token that expires
 mid-session is a session to restart.
+
+A token can also be kept in the system keyring — the one the sign-in below
+uses — and named by the attributes of the item it is in, with no command in
+between:
+
+```sh
+secret-tool store --label="docs MCP token" service work account mcp
+```
+
+```toml
+[docs]
+url = "https://example.com/mcp"
+token-keyring = { service = "work", account = "mcp" }
+```
+
+It has to be exactly one item: none, or several with those attributes, is a
+note saying which, rather than a guess. A locked keyring asks to be unlocked in
+its own dialog. The search is of the default collection, which is where
+`secret-tool store` and most other tools put things. A token is given one way —
+`token`, `token-command` or `token-keyring` — and two of them are refused.
 
 The file is fa's own, so it reads the way the rest of fa does — a command is
 the line you would type, not an argv — and a key it does not know is an error
@@ -970,6 +991,8 @@ comes back to say otherwise.
   for rather than holding, and handing each server's tools to the agent. Rig
   speaks the protocol; this only decides who to speak to. Holding the result is what keeps the servers running, so it
   lives as long as the program does.
+- `src/keyring.rs` – the system keyring through oo7, opened once for the
+  session: what a sign-in is kept in, and where `token-keyring` looks.
 - `src/oauth.rs` – signing in to an MCP endpoint that wants it: the browser
   sent to the server and the code taken back on a loopback port, and the
   keyring the tokens are kept in between sessions. rmcp does the protocol.

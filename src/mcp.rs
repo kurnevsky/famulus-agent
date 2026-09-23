@@ -16,7 +16,8 @@
 //! A value that should not sit in a file is written as the line of shell that
 //! produces it, under `env-command`, `token-command` or `headers-command`
 //! rather than `env`, `token` or `headers`: run once, when the server starts,
-//! with its output for the value.
+//! with its output for the value. A token can also be named by where it sits
+//! in the system keyring, under `token-keyring`.
 //!
 //! An endpoint that wants a login and is given no token gets one through
 //! `oauth`, in the browser, and keeps it in the system keyring.
@@ -27,7 +28,7 @@
 //!
 //! [docs]
 //! url = "https://example.com/mcp"
-//! token-command = "pass show work/mcp"
+//! token-keyring = { service = "work", account = "mcp" }
 //! timeout = 60
 //! ```
 
@@ -88,6 +89,10 @@ pub struct Server {
   /// whose output is the token — `pass`, `gh auth token`, `op read`.
   #[serde(default, rename = "token-command")]
   pub token_command: Option<String>,
+  /// The same, kept in the system keyring: the attributes of the one item
+  /// whose secret is the token.
+  #[serde(default, rename = "token-keyring")]
+  pub token_keyring: BTreeMap<String, String>,
   /// Sent with every request to that endpoint.
   #[serde(default)]
   pub headers: BTreeMap<String, String>,
@@ -352,9 +357,7 @@ async fn endpoint(
     let sent = values(&server.headers, &server.headers_command, "header").await?;
     let mut config = StreamableHttpClientTransportConfig::with_uri(url);
     config.custom_headers = headers(&sent)?;
-    config.auth_header = one(server.token.as_ref(), server.token_command.as_ref(), "token")
-      .await?
-      .map(|token| bearer(&token).to_string());
+    config.auth_header = token(server).await?.map(|token| bearer(&token).to_string());
     Ok(config)
   })
   .await?;
@@ -434,6 +437,24 @@ async fn values(
   let mut values = literal.clone();
   values.extend(futures::future::try_join_all(run).await?);
   Ok(values)
+}
+
+/// The token a server is given, from wherever the file says it is.
+#[cfg(feature = "mcp")]
+async fn token(server: &Server) -> anyhow::Result<Option<String>> {
+  use anyhow::Context;
+
+  let keyring = !server.token_keyring.is_empty();
+  if keyring && (server.token.is_some() || server.token_command.is_some()) {
+    anyhow::bail!("token is given more than one way");
+  }
+  if keyring {
+    return crate::keyring::lookup(&server.token_keyring)
+      .await
+      .context("token-keyring")
+      .map(Some);
+  }
+  one(server.token.as_ref(), server.token_command.as_ref(), "token").await
 }
 
 /// One value, written out or as the line of shell that prints it.
@@ -533,7 +554,7 @@ mod tests {
 
         [docs]
         url = "https://example.com/mcp"
-        token-command = "pass show work/token"
+        token-keyring = { service = "work", account = "mcp" }
         headers.Authorization = "Bearer k"
         headers-command.X-Api-Key = "pass show work/mcp"
         timeout = 60
@@ -547,7 +568,8 @@ mod tests {
     assert_eq!(files.timeout, None, "a server says nothing about time by default");
     let docs = &read["docs"];
     assert_eq!(docs.url.as_deref(), Some("https://example.com/mcp"));
-    assert_eq!(docs.token_command.as_deref(), Some("pass show work/token"));
+    assert_eq!(docs.token_keyring["service"], "work");
+    assert_eq!(docs.token_keyring["account"], "mcp");
     assert_eq!(docs.headers["Authorization"], "Bearer k");
     assert_eq!(docs.headers_command["X-Api-Key"], "pass show work/mcp");
     assert_eq!(docs.timeout, Some(60));
@@ -622,17 +644,25 @@ mod tests {
 
     // A token is one or the other too, and is the token, whatever scheme it
     // was written with.
-    let token = |value: &str| value.to_string();
-    let read = one(Some(&token("k")), None, "token").await.expect("written");
+    let text = |value: &str| value.to_string();
+    let read = one(Some(&text("k")), None, "token").await.expect("written");
     assert_eq!(read.as_deref(), Some("k"));
-    let read = one(None, Some(&token("echo k")), "token").await.expect("printed");
+    let read = one(None, Some(&text("echo k")), "token").await.expect("printed");
     assert_eq!(read.as_deref(), Some("k"));
-    let err = one(Some(&token("k")), Some(&token("echo k")), "token")
+    let err = one(Some(&text("k")), Some(&text("echo k")), "token")
       .await
       .expect_err("twice")
       .to_string();
     assert!(err.contains("token is given both"), "{err}");
     assert_eq!(one(None, None, "token").await.expect("none"), None);
+    // The keyring is a third way, and not one to give beside the others.
+    let both = Server {
+      token_command: Some("echo k".into()),
+      token_keyring: map(&[("service", "work")]),
+      ..Server::default()
+    };
+    let err = token(&both).await.expect_err("twice").to_string();
+    assert!(err.contains("more than one way"), "{err}");
     assert_eq!(bearer("Bearer k"), "k");
     assert_eq!(bearer("bearer  k"), "k");
     assert_eq!(bearer("k"), "k");
