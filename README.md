@@ -66,10 +66,11 @@ allows — or 2048 for a model rig does not recognise, which is when
 
 | Flag | Env | Default | Meaning |
 |------|-----|---------|---------|
+| `--config` | `FA_CONFIG` | XDG search path | Read settings from this file instead; see below |
 | `--provider` | `FA_PROVIDER` | `openai` | API flavour to speak; see the table above |
 | `--base-url` | `FA_BASE_URL` | provider default | Endpoint root, e.g. `http://localhost:8080/v1` |
 | `--api-key` | `FA_API_KEY` | the provider's own variable, else `none` | API key (any value for servers without auth; Ollama and llamafile need none) |
-| `-m, --model` | `FA_MODEL` | required | Model name; `/model` changes it later |
+| `-m, --model` | `FA_MODEL` | required, here or in the file | Model name; `/model` changes it later |
 | `--system-prompt` | `FA_SYSTEM_PROMPT` | built-in | Replace the system prompt |
 | `--max-tokens` | `FA_MAX_TOKENS` | the provider's own | Cap on what one answer may come to, in tokens |
 | `--context-window` | `FA_CONTEXT_WINDOW` | what the provider reports once `/model` has been opened, else `128000` | Model context size in tokens; given here it stands whatever model is chosen |
@@ -89,6 +90,42 @@ allows — or 2048 for a model rig does not recognise, which is when
 | `--no-mcp` | | | Start no MCP servers this session |
 | `--tools` | `FA_TOOLS` | all of them | Offer the model only these tools, by name |
 | `--no-tools` | `FA_NO_TOOLS` | | Keep these tools from the model, by name |
+
+Everything but the session flags (`-c`, `-r`, `--session`) can be kept in
+`config.toml` instead, under the flag's own name:
+
+```toml
+# ~/.config/fa/config.toml
+provider = "openai"
+base-url = "http://localhost:9931/v1"
+model = "Qwen3.8-27B-Q4_K_M.gguf"
+tools = ["read", "bash", "ask"]
+no-bell = true
+```
+
+A value is written the way the flag takes it — `provider = "ollama"`,
+`scrollbar = "always"` — a list is a TOML array, and a flag that takes nothing
+is `true`. The file only fills in what was not given: a flag, or its variable,
+has the last word, so `-m` still picks another model for one session. A switch
+the file turns on cannot be turned back off by a flag, since the flags have no
+negative; `--config /dev/null` starts from none of it.
+
+The key has a command form, as a value in `mcp.toml` does: `api-key-command`
+is a line of shell whose output is the key, run once at start and only when
+no flag or variable gave one — `--api-key`, `FA_API_KEY`, or the provider's
+own (`OPENAI_API_KEY` and the rest). It has ten seconds and no terminal, and
+one that fails says what it said for itself, never what it printed. Both in
+one file is refused.
+
+`~` at the front of `sessions-dir` or `mcp-config` is the home directory; there
+is no shell reading the file to say so.
+
+It is found the way `mcp.toml` is: `$XDG_CONFIG_HOME/fa/config.toml`, then each
+of `$XDG_CONFIG_DIRS`, and never beside the project. Where two files both give
+a key, the nearer one's is used, key by key. A key fa does not know, or a value
+it cannot take, is an error naming the file and the line, and fa does not start
+— unlike a broken `mcp.toml`, which is only a note, since a session on the
+wrong model or endpoint is worse than none.
 
 The agent works in the current directory. If `AGENTS.md` (or `CLAUDE.md`)
 exists there, it is appended to the system prompt.
@@ -859,8 +896,11 @@ comes back to say otherwise.
   and the per-line spans the markdown renderer draws. Grammars ship their own
   highlight queries and are used as they come, except Haskell, whose query is
   written for neovim's pattern precedence and needs one of our own.
-- `src/mcp.rs` – finding MCP servers and starting them: the XDG search for
-  `mcp.toml`, the table-per-server file it reads, the values it runs a command
+- `src/config.rs` – `config.toml`: the XDG search both files are found by,
+  the settings it holds and how the files are merged, and running the line of
+  shell a value is written as instead of the value.
+- `src/mcp.rs` – finding MCP servers and starting them: the
+  table-per-server file `mcp.toml` is, the values it runs a command
   for rather than holding, and handing each server's tools to the agent. Rig
   speaks the protocol; this only decides who to speak to. Holding the result is what keeps the servers running, so it
   lives as long as the program does.

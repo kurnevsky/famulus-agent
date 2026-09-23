@@ -3,6 +3,7 @@ mod ask;
 mod attach;
 mod clipboard;
 mod compaction;
+mod config;
 mod edit;
 mod highlight;
 mod images;
@@ -15,7 +16,7 @@ mod ui;
 use std::io::stdout;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use ratatui::crossterm::event::{
   DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, KeyboardEnhancementFlags,
@@ -30,9 +31,14 @@ use tokio::sync::mpsc;
 #[derive(Parser)]
 #[command(name = "fa", version)]
 struct Cli {
-  /// API flavour to speak
-  #[arg(long, env = "FA_PROVIDER", value_enum, default_value_t = agent::Provider::OpenAi)]
-  provider: agent::Provider,
+  /// Settings to start from, instead of the config.toml in $XDG_CONFIG_HOME/fa.
+  /// A flag given here, or its variable, beats what the file says
+  #[arg(long, env = "FA_CONFIG")]
+  config: Option<PathBuf>,
+
+  /// API flavour to speak [default: openai]
+  #[arg(long, env = "FA_PROVIDER", value_enum)]
+  provider: Option<agent::Provider>,
 
   /// Endpoint root, e.g. http://localhost:8080/v1 for an OpenAI-compatible
   /// server. Defaults to the provider's public API.
@@ -46,9 +52,9 @@ struct Cli {
   api_key: Option<String>,
 
   /// Model name to request. /model changes it later, and lists what the
-  /// provider has to change it to
+  /// provider has to change it to. Required, here or in config.toml
   #[arg(short, long, env = "FA_MODEL")]
-  model: String,
+  model: Option<String>,
 
   /// Replace the built-in system prompt
   #[arg(long, env = "FA_SYSTEM_PROMPT")]
@@ -68,12 +74,14 @@ struct Cli {
   context_window: Option<u64>,
 
   /// Compact once fewer than this many tokens remain in the context window
-  #[arg(long, default_value_t = 16_384)]
-  reserve_tokens: u64,
+  /// [default: 16384]
+  #[arg(long)]
+  reserve_tokens: Option<u64>,
 
   /// Approximate number of recent tokens kept verbatim when compacting
-  #[arg(long, default_value_t = 20_000)]
-  keep_recent_tokens: u64,
+  /// [default: 20000]
+  #[arg(long)]
+  keep_recent_tokens: Option<u64>,
 
   /// Disable automatic compaction (/compact still works)
   #[arg(long)]
@@ -110,8 +118,9 @@ struct Cli {
   sessions_dir: Option<PathBuf>,
 
   /// Transcript scrollbar: shown briefly while scrolling, always, or never
-  #[arg(long, env = "FA_SCROLLBAR", value_enum, default_value_t = ui::ScrollbarMode::Auto)]
-  scrollbar: ui::ScrollbarMode,
+  /// [default: auto]
+  #[arg(long, env = "FA_SCROLLBAR", value_enum)]
+  scrollbar: Option<ui::ScrollbarMode>,
 
   /// Do not ring the terminal when the model asks a question
   #[arg(long, env = "FA_NO_BELL")]
@@ -136,35 +145,67 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-  let cli = Cli::parse();
-  let api_key = cli
-    .api_key
-    .or_else(|| std::env::var(cli.provider.key_env()).ok().filter(|k| !k.is_empty()))
-    .unwrap_or_else(|| cli.provider.no_key().to_string());
+  let mut cli = Cli::parse();
+  // What the file says fills in whatever the flags and their variables left
+  // out, and nothing more: a flag is how one session differs from the rest.
+  let file = config::load(
+    &config::files(config::FILE, cli.config.as_deref()),
+    cli.config.is_some(),
+  )?;
+  let provider = cli.provider.or(file.provider).unwrap_or(agent::Provider::OpenAi);
+  let Some(model) = cli.model.take().or(file.model) else {
+    bail!(
+      "no model: give one with --model, FA_MODEL, or `model` in {}",
+      config::FILE
+    );
+  };
+  // The provider's own variable is a variable like any other, so it beats the
+  // file too; the file's command only runs when nothing else gave a key.
+  let env_key = std::env::var(provider.key_env()).ok().filter(|k| !k.is_empty());
+  let api_key = match cli.api_key.take().or(env_key).or(file.api_key) {
+    Some(key) => key,
+    None => match &file.api_key_command {
+      Some(command) => config::value(command).await.context("api-key-command")?,
+      None => provider.no_key().to_string(),
+    },
+  };
+  let context_window = cli.context_window.or(file.context_window);
+  let sessions_dir = cli.sessions_dir.take().or(file.sessions_dir);
+  // A file named on the command line beats a file that says to start none.
+  let no_mcp = cli.no_mcp || (file.no_mcp && cli.mcp_config.is_none());
+  let mcp_config = cli.mcp_config.take().or(file.mcp_config);
+  let tools = match cli.tools.is_empty() {
+    true => file.tools.unwrap_or_default(),
+    false => std::mem::take(&mut cli.tools),
+  };
+  let no_tools = match cli.no_tools.is_empty() {
+    true => file.no_tools.unwrap_or_default(),
+    false => std::mem::take(&mut cli.no_tools),
+  };
   let mut cfg = agent::Config {
-    provider: cli.provider,
-    base_url: cli.base_url,
+    provider,
+    base_url: cli.base_url.take().or(file.base_url),
     api_key,
-    model: cli.model,
-    system_prompt: cli.system_prompt,
-    max_tokens: cli.max_tokens,
-    vision: !cli.no_vision,
+    model,
+    system_prompt: cli.system_prompt.take().or(file.system_prompt),
+    max_tokens: cli.max_tokens.or(file.max_tokens),
+    vision: !(cli.no_vision || file.no_vision),
     // Worked out below, once the MCP servers have said what they brought.
     tools: None,
     compaction: compaction::Settings {
-      enabled: !cli.no_compaction,
+      enabled: !(cli.no_compaction || file.no_compaction),
       // What the flag says, or the fallback until the provider is asked what
       // the chosen model holds.
-      context_window: cli.context_window.unwrap_or(compaction::DEFAULT_CONTEXT_WINDOW),
-      reserve_tokens: cli.reserve_tokens,
-      keep_recent_tokens: cli.keep_recent_tokens,
-      turn_summary: !cli.no_turn_summary,
+      context_window: context_window.unwrap_or(compaction::DEFAULT_CONTEXT_WINDOW),
+      reserve_tokens: cli.reserve_tokens.or(file.reserve_tokens).unwrap_or(16_384),
+      keep_recent_tokens: cli.keep_recent_tokens.or(file.keep_recent_tokens).unwrap_or(20_000),
+      turn_summary: !(cli.no_turn_summary || file.no_turn_summary),
     },
   };
   let cwd = std::env::current_dir()?;
 
-  let store = (!cli.no_session)
-    .then(|| session::Store::new(cli.sessions_dir.clone().unwrap_or_else(session::Store::default_dir)));
+  let store = (!(cli.no_session || file.no_session))
+    .then(|| session::Store::new(sessions_dir.unwrap_or_else(session::Store::default_dir)));
   let start = if let Some(wanted) = &cli.session {
     let found = store
       .as_ref()
@@ -184,11 +225,11 @@ async fn main() -> Result<()> {
   // The servers come up before the terminal does, and stay up as long as this
   // binding: a stdio server is a child process of ours, and closing the
   // connection is what stops it.
-  let (servers, notes) = match cli.no_mcp {
+  let (servers, notes) = match no_mcp {
     true => (mcp::Servers::default(), Vec::new()),
     false => {
-      let files = mcp::files(cli.mcp_config.as_deref());
-      let (config, mut notes) = mcp::load(&files, cli.mcp_config.is_some());
+      let files = mcp::files(mcp_config.as_deref());
+      let (config, mut notes) = mcp::load(&files, mcp_config.is_some());
       let servers = mcp::connect(config).await;
       notes.extend(servers.notes().iter().cloned());
       (servers, notes)
@@ -202,7 +243,7 @@ async fn main() -> Result<()> {
     .map(|name| name.to_string())
     .chain(servers.tool_names())
     .collect();
-  let (allowed, unknown) = tools::choose(&available, &cli.tools, &cli.no_tools);
+  let (allowed, unknown) = tools::choose(&available, &tools, &no_tools);
   let mut notes = notes;
   if !unknown.is_empty() {
     notes.push(format!(
@@ -226,13 +267,13 @@ async fn main() -> Result<()> {
     tx,
     ui::Options {
       cwd,
-      context_window: cli.context_window,
-      scrollbar: cli.scrollbar,
+      context_window,
+      scrollbar: cli.scrollbar.or(file.scrollbar).unwrap_or(ui::ScrollbarMode::Auto),
       store,
       start,
       notes,
       mcp: servers.count(),
-      bell: !cli.no_bell,
+      bell: !(cli.no_bell || file.no_bell),
     },
   );
 

@@ -39,12 +39,6 @@ use serde::Deserialize;
 #[cfg(feature = "mcp")]
 const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// How long a command that produces a value has to produce it. Well under the
-/// budget the whole server has, so a keyring that stops to ask something is
-/// told about as the command it is rather than as a server that never came up.
-#[cfg(feature = "mcp")]
-const VALUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
 /// The name servers are declared under, in each configuration directory.
 const FILE: &str = "mcp.toml";
 
@@ -103,46 +97,8 @@ pub struct Server {
 
 /// Where servers are declared, in the order the files are read: the system's
 /// first, the user's last, so the nearer file wins the names they share.
-///
-/// The search is the XDG one — `$XDG_CONFIG_HOME` then `$XDG_CONFIG_DIRS`,
-/// each with their spec defaults — and nothing else. No dotfile in a home
-/// directory, and none beside the project either: a file in the working
-/// directory would be a file whose name depends on where fa was started.
 pub fn files(explicit: Option<&Path>) -> Vec<PathBuf> {
-  if let Some(path) = explicit {
-    return vec![path.to_path_buf()];
-  }
-  let mut files: Vec<PathBuf> = config_dirs()
-    .into_iter()
-    .rev()
-    .map(|dir| dir.join("fa").join(FILE))
-    .collect();
-  files.dedup();
-  files
-}
-
-/// The XDG configuration directories, nearest first.
-fn config_dirs() -> Vec<PathBuf> {
-  let var = |name| std::env::var_os(name).map(|value| value.to_string_lossy().into_owned());
-  search(var("XDG_CONFIG_HOME"), var("HOME"), var("XDG_CONFIG_DIRS"))
-}
-
-/// The XDG search path, from the three variables that decide it, so what it
-/// works out can be said without an environment to say it in.
-///
-/// Relative entries are dropped, which the specification asks for, and each
-/// variable falls back to the default the specification gives it.
-fn search(config_home: Option<String>, home: Option<String>, config_dirs: Option<String>) -> Vec<PathBuf> {
-  let absolute = |dir: PathBuf| dir.is_absolute().then_some(dir);
-  let first = config_home
-    .map(PathBuf::from)
-    .and_then(absolute)
-    .or_else(|| home.map(|home| PathBuf::from(home).join(".config")));
-  let rest = config_dirs.filter(|dirs| !dirs.is_empty()).unwrap_or("/etc/xdg".into());
-  first
-    .into_iter()
-    .chain(rest.split(':').map(PathBuf::from).filter_map(absolute))
-    .collect()
+  crate::config::files(FILE, explicit)
 }
 
 /// Read every file that is there. A file that cannot be read or makes no sense
@@ -376,43 +332,14 @@ async fn values(
   // separate things, and they are waited on inside the budget the server has
   // to come up at all.
   let run = commands.iter().map(async |(name, command)| {
-    let value = value(command).await.with_context(|| format!("{what} {name}"))?;
+    let value = crate::config::value(command)
+      .await
+      .with_context(|| format!("{what} {name}"))?;
     anyhow::Ok((name.clone(), value))
   });
   let mut values = literal.clone();
   values.extend(futures::future::try_join_all(run).await?);
   Ok(values)
-}
-
-/// What one line of shell prints, for a value a file should not hold.
-#[cfg(feature = "mcp")]
-async fn value(command: &str) -> anyhow::Result<String> {
-  use anyhow::{Context, bail};
-
-  let run = tokio::process::Command::new("bash")
-    .arg("-c")
-    .arg(command)
-    // The terminal belongs to the transcript, so nothing here may ask it
-    // anything: a pinentry that wanted this one would draw over the session
-    // and wait for an answer no one can give it.
-    .stdin(std::process::Stdio::null())
-    .kill_on_drop(true)
-    .output();
-  let output = tokio::time::timeout(VALUE_TIMEOUT, run)
-    .await
-    .map_err(|_| anyhow::anyhow!("{command}: no answer in {}s", VALUE_TIMEOUT.as_secs()))?
-    .with_context(|| format!("could not run {command}"))?;
-  if !output.status.success() {
-    // What it said for itself, never what it printed: the one is the reason
-    // and the other is the secret it failed to produce.
-    let said = String::from_utf8_lossy(&output.stderr);
-    bail!("{command}: {}", said.lines().next().unwrap_or("said nothing"));
-  }
-  let value = String::from_utf8(output.stdout).with_context(|| format!("{command}: printed no text"))?;
-  // A command prints a value with the newline it was printed with; the value
-  // is the rest. Only the end, since a space at the front is a value that is
-  // wrong rather than one that needs tidying.
-  Ok(value.trim_end().to_string())
 }
 
 #[cfg(feature = "mcp")]
@@ -614,64 +541,5 @@ mod tests {
     assert_eq!(notes.len(), 1, "{notes:?}");
     assert!(notes[0].contains("line 2"), "where it went wrong: {notes:?}");
     let _ = std::fs::remove_dir_all(&dir);
-  }
-
-  #[test]
-  fn the_search_path_is_the_xdg_one_and_only_that() {
-    let path = |config_home: Option<&str>, home: Option<&str>, dirs: Option<&str>| {
-      search(
-        config_home.map(str::to_string),
-        home.map(str::to_string),
-        dirs.map(str::to_string),
-      )
-    };
-    // Nearest first here; a relative entry is no entry at all.
-    assert_eq!(
-      path(
-        Some("/home/someone/.config"),
-        None,
-        Some("/etc/xdg:relative/ignored:/opt/xdg")
-      ),
-      [
-        PathBuf::from("/home/someone/.config"),
-        PathBuf::from("/etc/xdg"),
-        PathBuf::from("/opt/xdg"),
-      ]
-    );
-    // Each variable falls back to what the specification says it means.
-    assert_eq!(
-      path(None, Some("/home/someone"), None),
-      [PathBuf::from("/home/someone/.config"), PathBuf::from("/etc/xdg")]
-    );
-    assert_eq!(
-      path(Some("relative"), Some("/home/someone"), None)[0],
-      PathBuf::from("/home/someone/.config")
-    );
-    // Nowhere to look is not somewhere to look.
-    assert_eq!(path(None, None, Some("")), [PathBuf::from("/etc/xdg")]);
-  }
-
-  #[test]
-  fn the_files_are_read_system_first_and_never_from_the_working_directory() {
-    let found = files(None);
-    assert!(
-      found.iter().all(|path| path.ends_with(Path::new("fa").join(FILE))),
-      "only ever that one name under the search path: {found:?}"
-    );
-    assert!(
-      !found.iter().any(|path| path.is_relative()),
-      "nothing beside the project: {found:?}"
-    );
-    // The nearest directory is read last, so its names win.
-    let dirs = config_dirs();
-    assert_eq!(found.len(), dirs.len(), "one file per directory: {found:?} {dirs:?}");
-    if let (Some(nearest), Some(last)) = (dirs.first(), found.last()) {
-      assert_eq!(last, &nearest.join("fa").join(FILE));
-    }
-    // Asked for by name, that is the only one.
-    assert_eq!(
-      files(Some(Path::new("/tmp/one.json"))),
-      [PathBuf::from("/tmp/one.json")]
-    );
   }
 }
