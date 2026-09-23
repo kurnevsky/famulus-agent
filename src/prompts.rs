@@ -113,39 +113,107 @@ impl Asking {
 /// in quotes may have spaces in it, and so may the rest, which is taken as
 /// it is — quotes kept, unless they are around the whole of it.
 fn arguments(declared: &[rmcp::model::PromptArgument], rest: &str) -> Result<Map<String, Value>, String> {
-  let mut given = Map::new();
-  let mut rest = rest.trim();
-  if declared.is_empty() {
-    return match rest.is_empty() {
-      true => Ok(given),
-      false => Err("takes no arguments".to_string()),
-    };
+  if declared.is_empty() && !rest.trim().is_empty() {
+    return Err("takes no arguments".to_string());
   }
-  for (at, argument) in declared.iter().enumerate() {
-    if rest.is_empty() {
-      break;
-    }
-    let (value, after) = match at + 1 == declared.len() {
-      true => (unquoted(rest), ""),
-      false => word(rest),
-    };
-    given.insert(argument.name.clone(), Value::String(value.to_string()));
-    rest = after.trim_start();
-  }
-  Ok(given)
+  Ok(
+    split(declared.len(), rest)
+      .into_iter()
+      .zip(declared)
+      .map(|(typed, argument)| (argument.name.clone(), Value::String(typed.value.to_string())))
+      .collect(),
+  )
 }
 
-/// The first word of `text`, quotes off, and what comes after it.
-fn word(text: &str) -> (&str, &str) {
+/// One argument as it stands in the line.
+struct Typed<'a> {
+  /// Byte range in the line, quotes included.
+  range: (usize, usize),
+  /// What it says, quotes off.
+  value: &'a str,
+  /// A quote opened and not yet closed, which a space does not end.
+  open: bool,
+}
+
+/// `rest` read as `count` arguments, the way `arguments` reads it.
+fn split(count: usize, rest: &str) -> Vec<Typed<'_>> {
+  let mut out = Vec::new();
+  let mut at = 0;
+  while out.len() < count {
+    at += rest[at..].len() - rest[at..].trim_start().len();
+    if at >= rest.len() {
+      break;
+    }
+    let text = &rest[at..];
+    if out.len() + 1 == count {
+      let text = text.trim_end();
+      out.push(Typed {
+        range: (at, at + text.len()),
+        value: unquoted(text),
+        open: false,
+      });
+      break;
+    }
+    let (value, len, open) = word(text);
+    out.push(Typed {
+      range: (at, at + len),
+      value,
+      open,
+    });
+    at += len;
+  }
+  out
+}
+
+/// The first word of `text`, quotes off, how many bytes of `text` it takes,
+/// and whether its quote is still open.
+fn word(text: &str) -> (&str, usize, bool) {
   if let Some(inner) = text.strip_prefix('"') {
     return match inner.find('"') {
-      Some(end) => (&inner[..end], &inner[end + 1..]),
+      Some(end) => (&inner[..end], end + 2, false),
       // An unclosed quote runs to the end.
-      None => (inner, ""),
+      None => (inner, text.len(), true),
     };
   }
   let end = text.find(char::is_whitespace).unwrap_or(text.len());
-  (&text[..end], &text[end..])
+  (&text[..end], end, false)
+}
+
+/// The argument being typed at the end of `before` — what was typed after
+/// a prompt's name, up to the cursor — of the `count` the prompt takes.
+pub struct Typing {
+  /// Which of them it is.
+  pub index: usize,
+  /// Where it is in `before`: what a value taken for it goes in place of.
+  pub range: (usize, usize),
+  pub value: String,
+  /// Those before it, as they were typed.
+  pub earlier: Vec<String>,
+}
+
+/// Which argument `before` ends in, when it ends in one: the last one typed
+/// while it is still being typed, and the next when a space has ended it.
+pub fn typing(count: usize, before: &str) -> Option<Typing> {
+  // Right after the name is still the name.
+  if count == 0 || !before.starts_with(char::is_whitespace) {
+    return None;
+  }
+  let typed = split(count, before);
+  let fresh = match typed.last() {
+    None => true,
+    Some(last) => typed.len() < count && !last.open && last.range.1 < before.len(),
+  };
+  let index = typed.len() - usize::from(!fresh);
+  let (range, value) = match fresh {
+    true => ((before.len(), before.len()), ""),
+    false => (typed[index].range, typed[index].value),
+  };
+  Some(Typing {
+    index,
+    range,
+    value: value.to_string(),
+    earlier: typed[..index].iter().map(|t| t.value.to_string()).collect(),
+  })
 }
 
 /// `text` without the quotes around it, when they are around the whole of
@@ -316,6 +384,32 @@ mod tests {
     let none = declared(&[]);
     assert_eq!(given(&none, "  "), pairs(&[]));
     assert!(arguments(&none, "stray").is_err());
+  }
+
+  /// Which argument the line ends in, where, what it says, and the ones
+  /// before it.
+  type At = (usize, (usize, usize), String, Vec<String>);
+
+  fn at(count: usize, before: &str) -> Option<At> {
+    typing(count, before).map(|t| (t.index, t.range, t.value, t.earlier))
+  }
+
+  #[test]
+  fn the_argument_being_typed_is_the_one_the_line_ends_in() {
+    let strings = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    // Still the name.
+    assert_eq!(at(2, ""), None);
+    assert_eq!(at(0, " x"), None);
+    assert_eq!(at(2, " "), Some((0, (1, 1), String::new(), vec![])));
+    assert_eq!(at(2, " ab"), Some((0, (1, 3), "ab".into(), vec![])));
+    // A space ends one and starts the next.
+    assert_eq!(at(2, " ab "), Some((1, (4, 4), String::new(), strings(&["ab"]))));
+    assert_eq!(at(2, " ab c"), Some((1, (4, 5), "c".into(), strings(&["ab"]))));
+    // Unless it is in a quote still open.
+    assert_eq!(at(2, " \"a b"), Some((0, (1, 5), "a b".into(), vec![])));
+    assert_eq!(at(3, " \"a b\" c"), Some((1, (7, 8), "c".into(), strings(&["a b"]))));
+    // The last takes the rest, spaces and all.
+    assert_eq!(at(2, " ab c d"), Some((1, (4, 7), "c d".into(), strings(&["ab"]))));
   }
 
   #[test]

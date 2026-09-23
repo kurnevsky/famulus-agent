@@ -66,6 +66,99 @@ pub async fn inventory(peer: &ServerSink, timeout: Option<Duration>) -> Result<S
   .await
 }
 
+// ---------------------------------------------------------------- templates
+
+/// Where typing a URI has got to in a template: the `{…}` being filled in.
+#[derive(Debug, PartialEq)]
+pub struct Filling {
+  /// The hole's name, which is what the server is asked to complete.
+  pub name: String,
+  /// What is in it so far.
+  pub value: String,
+  /// Where it starts in what was typed.
+  pub start: usize,
+  /// The holes before it, as they were filled in.
+  pub earlier: Vec<(String, String)>,
+  /// The template's own text after it, up to the next hole.
+  pub after: String,
+  /// Whether there is another hole after that.
+  pub more: bool,
+}
+
+/// A template in pieces: text as it is, and holes by name. `None` for one
+/// that makes a URI any other way than by putting a value in place — `{?q}`,
+/// `{/a,b}` — which what is typed cannot be read back against.
+fn pieces(template: &str) -> Option<Vec<(bool, &str)>> {
+  let mut out = Vec::new();
+  let mut rest = template;
+  while let Some(open) = rest.find('{') {
+    let close = open + rest[open..].find('}')?;
+    out.push((false, &rest[..open]));
+    let name = &rest[open + 1..close];
+    let name = name.strip_prefix('+').unwrap_or(name);
+    let name = name.split(':').next().unwrap_or(name).trim_end_matches('*');
+    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+      return None;
+    }
+    out.push((true, name));
+    rest = &rest[close + 1..];
+  }
+  out.push((false, rest));
+  Some(
+    out
+      .into_iter()
+      .filter(|(hole, text)| *hole || !text.is_empty())
+      .collect(),
+  )
+}
+
+/// Which hole of `template` typing `uri` has reached, when it has reached
+/// one and is still in it: each hole before it runs to the template's text
+/// after it, and the one being typed runs to the end.
+pub fn filling(template: &str, uri: &str) -> Option<Filling> {
+  let pieces = pieces(template)?;
+  let mut at = 0;
+  let mut earlier = Vec::new();
+  for (index, (hole, text)) in pieces.iter().enumerate() {
+    let left = &uri[at..];
+    if !hole {
+      // Typed up to here and no further, or into the middle of it: not in a
+      // hole either way.
+      at += text.len();
+      if !left.starts_with(text) {
+        return None;
+      }
+      continue;
+    }
+    let next = pieces.get(index + 1).map(|(_, text)| *text).unwrap_or_default();
+    match left.find(next).filter(|_| !next.is_empty()) {
+      Some(end) => {
+        earlier.push((text.to_string(), left[..end].to_string()));
+        at += end;
+      }
+      None => {
+        // The template itself, taken as it is, is not a value to complete;
+        // and one that ends in the start of the text after the hole has
+        // gone on into that text.
+        let into_next =
+          (1..next.len().min(left.len()) + 1).any(|len| next.is_char_boundary(len) && left.ends_with(&next[..len]));
+        if left.contains(['{', '}']) || into_next {
+          return None;
+        }
+        return Some(Filling {
+          name: text.to_string(),
+          value: left.to_string(),
+          start: at,
+          earlier,
+          after: next.to_string(),
+          more: pieces.get(index + 2).is_some_and(|(hole, _)| *hole),
+        });
+      }
+    }
+  }
+  None
+}
+
 /// The names the two answer to, which no server's tool may take.
 pub const NAMES: [&str; 2] = [ListResources::NAME, ReadResource::NAME];
 
@@ -276,6 +369,46 @@ mod tests {
       })
       .collect::<Vec<_>>()
       .join("|")
+  }
+
+  #[test]
+  fn typing_a_uri_fills_in_a_template_a_hole_at_a_time() {
+    let filled = |template: &str, uri: &str| filling(template, uri);
+    assert_eq!(
+      filled("note://{day}", "note://2026-0"),
+      Some(Filling {
+        name: "day".into(),
+        value: "2026-0".into(),
+        start: 7,
+        earlier: vec![],
+        after: String::new(),
+        more: false,
+      })
+    );
+    // Not there yet, or somewhere else altogether.
+    assert_eq!(filled("note://{day}", "note:/"), None);
+    assert_eq!(filled("note://{day}", "file://x"), None);
+    // Each hole before runs to the text after it.
+    let second = filled("repo://{owner}/{name}/issues", "repo://me/fa").expect("the second hole");
+    assert_eq!(second.name, "name");
+    assert_eq!(second.value, "fa");
+    assert_eq!(second.earlier, vec![("owner".to_string(), "me".to_string())]);
+    assert_eq!((second.after.as_str(), second.more), ("/issues", false));
+    let first = filled("repo://{owner}/{name}", "repo://m").expect("the first hole");
+    assert_eq!(
+      (first.name.as_str(), first.after.as_str(), first.more),
+      ("owner", "/", true)
+    );
+    // Past the last hole, there is nothing left to fill in.
+    assert_eq!(filled("repo://{owner}/{name}/issues", "repo://me/fa/is"), None);
+    // `{+path}` is a value put in place; `{?q}` is not.
+    assert_eq!(
+      filled("file:///{+path}", "file:///src/m").map(|f| f.value),
+      Some("src/m".into())
+    );
+    assert_eq!(filled("search://x{?q}", "search://x"), None);
+    // The template as it was taken, braces and all.
+    assert_eq!(filled("note://{day}", "note://{day}"), None);
   }
 
   #[test]

@@ -471,7 +471,10 @@ gives files: every `server:uri` the servers list, resources and then
 templates — all of them at a bare `&`, as a bare `@` lists the working
 directory and `/` every command — fuzzy-matched on what is typed: `&nday` finds
 `notes:note://today` — with the matched letters picked out. A template is
-taken as it is, for the `{…}` in it to be written over, and a URI with a
+taken as it is, for the `{…}` in it to be written over — unless its server
+completes values, when it is taken as far as its first hole and what the
+server offers for that hole is listed, the next hole after it once one is
+taken: `&notes:note://2026-09` lists the days the server has. A URI with a
 space in it goes in quotes, `&"notes:note://a b"`. An `&` word whose first
 letter begins no server's name — `&mut self`, `&str` — offers nothing.
 
@@ -499,6 +502,17 @@ the rest of the line as it is typed: `/notes:review 12 the error handling`
 gives `pr` 12 and `focus` "the error handling". A required one left out is
 asked for in a form — the one [a server asking you](#a-server-asking-you)
 gets — with the ones given filled in; `Esc` puts it away and sends nothing.
+
+A server that says it completes values
+([completion](https://modelcontextprotocol.io/specification/2025-11-25/server/utilities/completion))
+is asked what an argument could be as it is typed, told the ones before it,
+and what it offers is the popup: taking the prompt with `Tab` lists what its
+first argument could be, and taking a value for one before the last goes on
+to the next. While it is asked again for a letter more, what it said for one
+fewer stays up, narrowed to what still begins with what is typed. What it
+offers is its own: most servers complete nothing, and a free-text argument
+has nothing to offer anyway. The form does not complete; only what is typed
+on the line does.
 
 What the server writes out is what is sent, in place of what was typed, and
 what the transcript shows: text as text, an image as an image (or said not to

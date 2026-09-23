@@ -137,6 +137,12 @@ pub enum AgentEvent {
     text: String,
     result: Result<Option<Vec<Message>>, String>,
   },
+  /// What a server offered for a value being typed, asked for by the popup.
+  #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+  Suggested {
+    asking: crate::mcp::Completing,
+    result: Result<crate::mcp::Suggestions, String>,
+  },
   /// Something about an MCP server while the session ran — its tools
   /// changed, or what it holds could not be listed: what to say about it.
   #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
@@ -1547,6 +1553,7 @@ mod tests {
         AgentEvent::Show(_) | AgentEvent::Ask(_) => "asking".into(),
         AgentEvent::Mcp(_) => "mcp".into(),
         AgentEvent::Expanded { .. } => "expanded".into(),
+        AgentEvent::Suggested { .. } => "suggested".into(),
       })
       .collect();
     assert!(names.contains(&"call:bash".to_string()), "{names:?}");

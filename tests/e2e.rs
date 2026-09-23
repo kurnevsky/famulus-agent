@@ -370,7 +370,8 @@ fn answer_to(body: &str) -> String {
 /// requests a client makes of one, answered by hand — and one it makes of the
 /// client, when `book` needs the user to say something. `grow` changes what it
 /// offers, and says so the way the protocol has it. Started with `resources`,
-/// it has a note to read as well; with `prompts`, two prompts to send.
+/// it has a note to read as well; with `prompts`, two prompts to send; with
+/// `completes`, it says what their arguments and its template's hole could be.
 #[cfg(feature = "mcp")]
 const MCP_SERVER: &str = r#"
 import json, sys
@@ -450,6 +451,16 @@ REVIEW = {
     "arguments": [{"name": "pr", "required": True}, {"name": "focus"}],
 }
 RECAP = {"name": "recap", "description": "Say where things stand."}
+COMPLETES = "completes" in sys.argv[1:]
+
+def completed(ref, argument, context):
+    if ref.get("type") == "ref/resource":
+        choices = ["2026-09-22", "2026-09-23"]
+    elif argument["name"] == "pr":
+        choices = ["12", "123", "7"]
+    else:
+        choices = ["tests of %s" % context.get("pr"), "docs"]
+    return [c for c in choices if c.startswith(argument["value"])]
 
 def written(name, arguments):
     if name == "review":
@@ -476,6 +487,8 @@ while True:
             capabilities["resources"] = {}
         if PROMPTS:
             capabilities["prompts"] = {}
+        if COMPLETES:
+            capabilities["completions"] = {}
         result = {
             "protocolVersion": params.get("protocolVersion", "2025-06-18"),
             "capabilities": capabilities,
@@ -485,6 +498,10 @@ while True:
         result = {"tools": TOOLS}
     elif method == "prompts/list":
         result = {"prompts": [REVIEW, RECAP]}
+    elif method == "completion/complete":
+        context = (params.get("context") or {}).get("arguments") or {}
+        values = completed(params["ref"], params["argument"], context)
+        result = {"completion": {"values": values, "hasMore": False}}
     elif method == "prompts/get":
         result = {"messages": written(params.get("name"), params.get("arguments") or {})}
     elif method == "resources/list":
@@ -3031,6 +3048,66 @@ fn a_servers_prompt_is_a_command_sent_as_what_the_server_writes_out() {
       .contains("[Resource &notes:note://today — text/plain]\\nBuy milk."),
     "{said:?}"
   );
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A server that completes values is asked for them as they are typed: an
+/// argument of its prompt, told the ones before it, and a hole in one of its
+/// resource templates. Taking one before the last goes on to the next.
+#[test]
+#[cfg(feature = "mcp")]
+fn a_server_completes_its_prompts_arguments_and_its_templates_holes() {
+  if !have_tmux() || !have_python() {
+    return;
+  }
+  let dir = scratch("mcp-completes");
+  let server = dir.join("server.py");
+  std::fs::write(&server, MCP_SERVER).expect("a server to run");
+  let config = dir.join("mcp.toml");
+  std::fs::write(
+    &config,
+    format!(
+      "[notes]\ncommand = \"python3 '{}' resources prompts completes\"\ntimeout = 10\ntools = [\"weather\"]\n",
+      server.display()
+    ),
+  )
+  .expect("a config to read");
+
+  let provider = Provider::start(vec![Turn::Say("Noted.")]);
+  let term = Term::start(
+    "mcp-completes",
+    &provider,
+    &["--no-session", "--mcp-config", &shell(&config)],
+  );
+  term.wait_for("MCP notes: 2 prompts");
+  let typed = |want: &str| poll(|| (term.typed() == want).then(String::new));
+
+  // The command taken, what its first argument could be is offered at once.
+  term.type_in("/notes:review");
+  term.wait_for("Review a change.");
+  term.type_in("Tab");
+  term.wait_for("123");
+  term.type_in("12");
+  typed("/notes:review 12");
+  // Taken, it goes on to the next, which the server is told the first for.
+  term.type_in("Tab");
+  typed("/notes:review 12");
+  term.wait_for("tests of 12");
+  term.type_in("Tab");
+  typed("/notes:review 12 tests of 12");
+  term.type_in("Enter");
+  poll(|| (term.screen().matches("Noted.").count() >= 1).then(String::new));
+  assert!(
+    provider.sent("Review PR 12, looking at tests of 12."),
+    "sent as completed"
+  );
+
+  // A template's hole, completed in its token.
+  term.type_in("&notes:note://2026-09-2");
+  term.wait_for("2026-09-23");
+  term.type_in("Down");
+  term.type_in("Tab");
+  typed("&notes:note://2026-09-23");
   let _ = std::fs::remove_dir_all(&dir);
 }
 

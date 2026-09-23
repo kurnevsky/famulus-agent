@@ -363,17 +363,7 @@ impl Catalog {
     {
       let typed = text.strip_prefix('/')?;
       let (named, rest) = typed.split_once(char::is_whitespace).unwrap_or((typed, ""));
-      let asking = self.offers().iter().find_map(|offer| {
-        let (server, name) = named.split_at_checked(offer.server.len())?;
-        let name = name.strip_prefix(':').filter(|_| server == offer.server)?;
-        let prompt = offer.prompts.iter().find(|prompt| prompt.name == name)?;
-        Some(crate::prompts::Asking {
-          server: offer.server.clone(),
-          prompt: prompt.clone(),
-          peer: offer.peer.clone(),
-          timeout: call_timeout(offer.timeout),
-        })
-      })?;
+      let asking = self.prompt(named)?;
       let rest = rest.to_string();
       let host = host.clone();
       Some(Box::pin(async move { asking.expand(&rest, &host, vision).await }))
@@ -381,6 +371,165 @@ impl Catalog {
     #[cfg(not(feature = "mcp"))]
     {
       let _ = (text, host, vision);
+      None
+    }
+  }
+
+  /// The prompt `named`, as `server:name`, and what asking it takes.
+  #[cfg(feature = "mcp")]
+  fn prompt(&self, named: &str) -> Option<crate::prompts::Asking> {
+    self.offers().iter().find_map(|offer| {
+      let (server, name) = named.split_at_checked(offer.server.len())?;
+      let name = name.strip_prefix(':').filter(|_| server == offer.server)?;
+      let prompt = offer.prompts.iter().find(|prompt| prompt.name == name)?;
+      Some(crate::prompts::Asking {
+        server: offer.server.clone(),
+        prompt: prompt.clone(),
+        peer: offer.peer.clone(),
+        timeout: call_timeout(offer.timeout),
+      })
+    })
+  }
+
+  /// The argument of a server's prompt being typed in `text` — a line that
+  /// starts `/server:name` — at `cursor`, when that server completes them.
+  pub fn argument_completion(&self, text: &str, cursor: usize) -> Option<Completion> {
+    #[cfg(feature = "mcp")]
+    {
+      let typed = text.strip_prefix('/')?;
+      let named = typed.split(char::is_whitespace).next().unwrap_or(typed);
+      let asking = self.prompt(named).filter(|asking| completes(&asking.peer))?;
+      // At the end of what is being typed, as a token's popup is.
+      let start = 1 + named.len();
+      if cursor <= start || !text[cursor..].chars().next().is_none_or(char::is_whitespace) {
+        return None;
+      }
+      let declared = asking.prompt.arguments.as_deref().unwrap_or_default();
+      let typing = crate::prompts::typing(declared.len(), &text[start..cursor])?;
+      let context = declared
+        .iter()
+        .map(|argument| argument.name.clone())
+        .zip(typing.earlier)
+        .collect();
+      Some(Completion {
+        asking: Completing {
+          server: asking.server,
+          of: Of::Prompt(asking.prompt.name),
+          argument: declared[typing.index].name.clone(),
+          value: typing.value,
+          context,
+        },
+        range: (start + typing.range.0, start + typing.range.1),
+        shape: Shape::Argument {
+          last: typing.index + 1 == declared.len(),
+        },
+      })
+    }
+    #[cfg(not(feature = "mcp"))]
+    {
+      let _ = (text, cursor);
+      None
+    }
+  }
+
+  /// The hole of a server's template being filled in by an `&` token, at
+  /// `range` in the input and saying `typed` — `server:uri`, sigil and
+  /// quotes off — when that server completes them.
+  pub fn template_completion(&self, range: (usize, usize), typed: &str) -> Option<Completion> {
+    #[cfg(feature = "mcp")]
+    return self.offers().iter().find_map(|offer| {
+      let uri = typed.strip_prefix(offer.server.as_str())?.strip_prefix(':')?;
+      if !completes(&offer.peer) {
+        return None;
+      }
+      offer.resources.as_ref()?.templates.iter().find_map(|template| {
+        let filling = crate::resources::filling(&template.uri_template, uri)?;
+        Some(Completion {
+          asking: Completing {
+            server: offer.server.clone(),
+            of: Of::Template(template.uri_template.clone()),
+            argument: filling.name,
+            value: filling.value,
+            context: filling.earlier,
+          },
+          range,
+          shape: Shape::Hole {
+            before: format!("{}:{}", offer.server, &uri[..filling.start]),
+            after: filling.after,
+            more: filling.more,
+          },
+        })
+      })
+    });
+    #[cfg(not(feature = "mcp"))]
+    {
+      let _ = (range, typed);
+      None
+    }
+  }
+
+  /// Where taking the template `named` — `server:template` — leaves the
+  /// token when its server completes it: at its first hole, for the server
+  /// to be asked what goes there. `None` takes the template as it is.
+  pub fn template_opening(&self, named: &str) -> Option<String> {
+    #[cfg(feature = "mcp")]
+    return self.offers().iter().find_map(|offer| {
+      let template = named.strip_prefix(offer.server.as_str())?.strip_prefix(':')?;
+      let listed = offer.resources.as_ref()?.templates.iter();
+      if !completes(&offer.peer) || !listed.into_iter().any(|t| t.uri_template == template) {
+        return None;
+      }
+      let opening = &template[..template.find('{')?];
+      crate::resources::filling(template, opening)?;
+      Some(format!("{}:{opening}", offer.server))
+    });
+    #[cfg(not(feature = "mcp"))]
+    {
+      let _ = named;
+      None
+    }
+  }
+
+  /// Ask the server what `asking` could be.
+  pub fn suggest(&self, asking: &Completing) -> Option<Suggesting> {
+    #[cfg(feature = "mcp")]
+    {
+      let (peer, timeout) = self
+        .offers()
+        .iter()
+        .find(|offer| offer.server == asking.server && completes(&offer.peer))
+        .map(|offer| (offer.peer.clone(), call_timeout(offer.timeout)))?;
+      let asking = asking.clone();
+      Some(Box::pin(async move {
+        let context = (!asking.context.is_empty())
+          .then(|| rmcp::model::CompletionContext::with_arguments(asking.context.into_iter().collect()));
+        let asked = async {
+          match asking.of {
+            Of::Prompt(name) => {
+              peer
+                .complete_prompt_argument(name, asking.argument, asking.value, context)
+                .await
+            }
+            Of::Template(template) => {
+              peer
+                .complete_resource_argument(template, asking.argument, asking.value, context)
+                .await
+            }
+          }
+        };
+        let offered = crate::resources::bounded(timeout, asked)
+          .await
+          .map_err(|err| err.to_string())?;
+        Ok(Suggestions {
+          values: offered.values,
+          more: offered.has_more == Some(true),
+          total: offered.total,
+        })
+      }))
+    }
+    #[cfg(not(feature = "mcp"))]
+    {
+      let _ = asking;
       None
     }
   }
@@ -510,6 +659,79 @@ impl Catalog {
   }
 }
 
+/// What a server is asked to complete: an argument of one of its prompts, or
+/// a hole in one of its resource templates — its name, what is in it so far,
+/// and what the ones before it were given.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Completing {
+  pub server: String,
+  pub of: Of,
+  pub argument: String,
+  pub value: String,
+  pub context: Vec<(String, String)>,
+}
+
+/// What is being completed: a prompt, by name, or a template.
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+pub enum Of {
+  Prompt(String),
+  Template(String),
+}
+
+/// A value being typed that its server can complete: what to ask it, the
+/// bytes of the input a value taken goes in place of, and how it is written.
+pub struct Completion {
+  pub asking: Completing,
+  pub range: (usize, usize),
+  #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+  shape: Shape,
+}
+
+#[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+enum Shape {
+  /// A prompt's argument: the last one takes the rest of the line, and one
+  /// before it is a word, quoted when it has a space in it.
+  Argument { last: bool },
+  /// A hole in a template, written into the `&` token around it.
+  Hole {
+    /// The token's `server:uri` up to the hole.
+    before: String,
+    /// The template's text after it, up to the next hole.
+    after: String,
+    /// Whether there is a next hole.
+    more: bool,
+  },
+}
+
+impl Completion {
+  /// What taking `value` puts in place of `range`, and whether there is
+  /// something after it to complete next: the next argument, or the next
+  /// hole.
+  pub fn insert(&self, value: &str) -> (String, bool) {
+    match &self.shape {
+      Shape::Argument { last: true } => (value.to_string(), false),
+      Shape::Argument { last: false } => match value.contains(char::is_whitespace) {
+        true => (format!("\"{value}\" "), true),
+        false => (format!("{value} "), true),
+      },
+      Shape::Hole { before, after, more } => (crate::attach::written('&', &format!("{before}{value}{after}")), *more),
+    }
+  }
+}
+
+/// What a server offers for a value: at most a hundred of them, and whether
+/// it has more, and how many in all when it says.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Suggestions {
+  pub values: Vec<String>,
+  pub more: bool,
+  pub total: Option<u32>,
+}
+
+/// Asking a server what a value could be.
+pub type Suggesting = std::pin::Pin<Box<dyn Future<Output = Result<Suggestions, String>> + Send>>;
+
 /// What sending an MCP prompt comes to: the messages the server wrote out,
 /// or `None` when the user put away the form that asked for its arguments.
 pub type Expansion =
@@ -603,6 +825,14 @@ fn has_resources(peer: &rmcp::service::ServerSink) -> bool {
   peer
     .peer_info()
     .is_some_and(|info| info.capabilities.resources.is_some())
+}
+
+/// Whether a server said, when it came up, that it completes values.
+#[cfg(feature = "mcp")]
+fn completes(peer: &rmcp::service::ServerSink) -> bool {
+  peer
+    .peer_info()
+    .is_some_and(|info| info.capabilities.completions.is_some())
 }
 
 /// Whether a server said, when it came up, that it has prompts.
@@ -970,6 +1200,45 @@ pub async fn connect(_config: Config, _host: &crate::modal::Host) -> Servers {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  fn completion(shape: Shape) -> Completion {
+    Completion {
+      asking: Completing {
+        server: "notes".into(),
+        of: Of::Prompt("review".into()),
+        argument: "pr".into(),
+        value: String::new(),
+        context: Vec::new(),
+      },
+      range: (0, 0),
+      shape,
+    }
+  }
+
+  #[test]
+  fn a_value_taken_is_written_the_way_it_is_read_back() {
+    // An argument before the last is a word, and the next one starts after it.
+    let word = completion(Shape::Argument { last: false });
+    assert_eq!(word.insert("12"), ("12 ".to_string(), true));
+    assert_eq!(word.insert("a b"), ("\"a b\" ".to_string(), true));
+    // The last takes the rest of the line, spaces and all.
+    let rest = completion(Shape::Argument { last: true });
+    assert_eq!(rest.insert("a b"), ("a b".to_string(), false));
+    // A hole is filled in inside its token, with the template's text after
+    // it, and the next hole is completed next.
+    let hole = |more| {
+      completion(Shape::Hole {
+        before: "gh:repo://".into(),
+        after: "/".into(),
+        more,
+      })
+    };
+    assert_eq!(hole(true).insert("me"), ("&gh:repo://me/".to_string(), true));
+    assert_eq!(
+      hole(false).insert("my fa"),
+      ("&\"gh:repo://my fa/\"".to_string(), false)
+    );
+  }
 
   #[cfg(feature = "mcp")]
   fn config(text: &str) -> Config {

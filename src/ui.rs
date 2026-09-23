@@ -239,8 +239,11 @@ enum Match {
     /// Dimensions for an image, a resource's type, and nothing for a
     /// directory.
     meta: String,
-    /// A directory, which is carried on into rather than attached.
+    /// A directory, drawn as one.
     dir: bool,
+    /// Taken, it leaves the popup up for what comes after it: what is in a
+    /// directory, the next argument, the next hole in a template.
+    open: bool,
   },
 }
 
@@ -614,6 +617,13 @@ pub struct App {
   completion: Option<Completion>,
   /// Esc closed the popup; stay closed until the input changes.
   completion_dismissed: bool,
+  /// Where the argument of a server's prompt being completed starts: going
+  /// on to the next one opens a popup Esc closed on this one.
+  completing_from: Option<usize>,
+  /// What a server is being asked to complete, while it is being asked.
+  suggesting: Option<(crate::mcp::Completing, JoinHandle<()>)>,
+  /// What a server last offered, and for what.
+  suggested: Option<(crate::mcp::Completing, crate::mcp::Suggestions)>,
   /// The last bare `Esc`, for spotting the second of a double press.
   last_escape: Option<Instant>,
   entries: Vec<Entry>,
@@ -725,6 +735,9 @@ impl App {
       matcher: Matcher::new(Config::DEFAULT),
       completion: None,
       completion_dismissed: false,
+      completing_from: None,
+      suggesting: None,
+      suggested: None,
       last_escape: None,
       entries: Vec::new(),
       input,
@@ -993,18 +1006,20 @@ impl App {
         };
         match item {
           Match::Command { name, takes_arg, .. } => {
-            self.set_input(&format!("/{name}{}", if *takes_arg { " " } else { "" }));
             // The completed command is exact; keep the popup closed until
-            // the user edits the text again.
+            // the user edits the text again — or, for a server's prompt, for
+            // what its server offers for the first argument.
             self.completion_dismissed = true;
+            self.set_input(&format!("/{name}{}", if *takes_arg { " " } else { "" }));
+            self.refresh_completion();
           }
-          Match::Path { insert, dir, .. } => {
+          Match::Path { insert, open, .. } => {
             let Some((from, to)) = c.replacing else {
               return false;
             };
             // A directory is a step on the way rather than an answer, so the
             // popup stays up and lists what is inside it.
-            self.completion_dismissed = !dir;
+            self.completion_dismissed = !open;
             self.replace_token(from, to, insert.clone());
           }
         }
@@ -1045,8 +1060,20 @@ impl App {
       [line] if line.starts_with('/') && !line.contains(char::is_whitespace) => Some(line[1..].to_string()),
       _ => None,
     };
+    let text = self.input_text();
+    // An argument of a server's prompt, which the server may complete.
+    let argument = match commands {
+      Some(_) => None,
+      None => self.catalog.argument_completion(&text, self.cursor_offset()),
+    };
+    let from = argument.as_ref().map(|argument| argument.range.0);
+    if from.is_some() && from != self.completing_from {
+      self.completion_dismissed = false;
+    }
+    self.completing_from = from;
+    let token = self.completing_token();
     if self.completion_dismissed {
-      if commands.is_none() && self.completing_token().is_none() {
+      if commands.is_none() && token.is_none() && argument.is_none() {
         // Whatever was dismissed is no longer being typed, so the next one
         // starts fresh.
         self.completion_dismissed = false;
@@ -1054,17 +1081,29 @@ impl App {
       self.completion = None;
       return;
     }
-    let (items, replacing) = match commands {
-      Some(query) => {
+    let (items, replacing) = match (commands, argument) {
+      (Some(query), _) => {
         let prompts = self.catalog.prompt_commands();
         (filter_commands(&mut self.matcher, &query, &prompts), None)
       }
-      None => match self.completing_token() {
+      (None, Some(argument)) => (self.suggestions(&argument), Some(argument.range)),
+      (None, None) => match token {
         Some(range) => {
-          let text = self.input_text();
           let token = &text[range.0..range.1];
           let items = match token.strip_prefix('&') {
-            Some(typed) => self.filter_resources(typed.trim_matches('"')),
+            // What the server offers for a template's hole, once it has
+            // said; what the servers list until then.
+            Some(typed) => {
+              let typed = typed.trim_matches('"');
+              let offered = match self.catalog.template_completion(range, typed) {
+                Some(hole) => self.suggestions(&hole),
+                None => Vec::new(),
+              };
+              match offered.is_empty() {
+                true => self.filter_resources(typed),
+                false => offered,
+              }
+            }
             None => self.filter_paths(token),
           };
           (items, Some(range))
@@ -1174,6 +1213,7 @@ impl App {
           highlights,
           meta,
           dir: is_dir,
+          open: is_dir,
         }
       })
       .collect()
@@ -1198,15 +1238,108 @@ impl App {
       .take(PATH_ROWS)
       .map(|(at, highlights)| {
         let (name, meta) = rows[at].clone();
+        // A template whose server completes it is taken as far as its first
+        // hole, for the server to say what goes there.
+        let opening = self.catalog.template_opening(&name);
         Match::Path {
-          insert: attach::written('&', &name),
+          insert: attach::written('&', opening.as_deref().unwrap_or(&name)),
           name,
           highlights,
           meta,
           dir: false,
+          open: opening.is_some(),
         }
       })
       .collect()
+  }
+
+  /// What the server offers for `completion`, when it has said: nothing
+  /// until then, while it is asked — once, however often the popup is
+  /// drawn again, and never for something no longer being typed.
+  fn suggestions(&mut self, completion: &crate::mcp::Completion) -> Vec<Match> {
+    let asking = &completion.asking;
+    let answered = self
+      .suggested
+      .as_ref()
+      .filter(|(asked, _)| asked == asking)
+      .map(|(_, offered)| offered.clone());
+    if answered.is_none() && self.suggesting.as_ref().is_none_or(|(asked, _)| asked != asking) {
+      self.suggest(asking);
+    }
+    let offered = match answered {
+      Some(offered) => offered,
+      // Until it says, what it said for less of the same value, narrowed to
+      // what still begins with it: a letter typed does not blank the list.
+      None => match &self.suggested {
+        Some((asked, offered)) if asked.value.len() < asking.value.len() && same_hole(asked, asking) => {
+          let typed = asking.value.to_lowercase();
+          crate::mcp::Suggestions {
+            values: (offered.values.iter())
+              .filter(|value| value.to_lowercase().starts_with(&typed))
+              .cloned()
+              .collect(),
+            ..Default::default()
+          }
+        }
+        _ => return Vec::new(),
+      },
+    };
+    let values = &offered.values;
+    // Said on the last row, which is where the eye goes looking for more.
+    let more = match (offered.total, offered.more) {
+      (Some(total), _) if total as usize > values.len() => format!("+{} more", total as usize - values.len()),
+      (_, true) => "more on the server".to_string(),
+      _ => String::new(),
+    };
+    values
+      .iter()
+      .enumerate()
+      .map(|(at, value)| {
+        let (insert, open) = completion.insert(value);
+        Match::Path {
+          insert,
+          name: value.clone(),
+          highlights: Vec::new(),
+          meta: if at + 1 == values.len() {
+            more.clone()
+          } else {
+            String::new()
+          },
+          dir: false,
+          open,
+        }
+      })
+      .collect()
+  }
+
+  /// Ask the server about `asking`, in place of whatever it was asked
+  /// before: that is no longer being typed.
+  fn suggest(&mut self, asking: &crate::mcp::Completing) {
+    if let Some((_, before)) = self.suggesting.take() {
+      before.abort();
+    }
+    let Some(offering) = self.catalog.suggest(asking) else {
+      return;
+    };
+    let tx = self.tx.clone();
+    let asked = asking.clone();
+    let task = tokio::spawn(async move {
+      let result = offering.await;
+      let _ = tx.send(AgentEvent::Suggested { asking: asked, result });
+    });
+    self.suggesting = Some((asking.clone(), task));
+  }
+
+  /// What a server offered for `asking`: kept, and shown if it is still what
+  /// is being typed. One that could not say offers nothing, and is not asked
+  /// again for the same thing.
+  fn suggested(&mut self, asking: crate::mcp::Completing, result: Result<crate::mcp::Suggestions, String>) {
+    if self.suggesting.as_ref().is_none_or(|(asked, _)| *asked != asking) {
+      return;
+    }
+    self.suggesting = None;
+    self.suggested = Some((asking, result.unwrap_or_default()));
+    self.refresh_completion();
   }
 
   /// Resolve the `@path` tokens in the input box, so the border can say what
@@ -2270,6 +2403,7 @@ impl App {
       // where the servers were first said; the footer counts them afresh.
       AgentEvent::Mcp(note) => self.entries.push(Entry::Info(note)),
       AgentEvent::Expanded { text, result } => self.expanded(text, result),
+      AgentEvent::Suggested { asking, result } => self.suggested(asking, result),
       // Asked for by what was just typed, so nobody has to be called back
       // to the terminal for it.
       AgentEvent::Ask(modal) => self.modals.push_back(modal),
@@ -3418,6 +3552,11 @@ fn as_token(text: &str, cwd: &Path) -> Option<String> {
   attach::dimensions(&path)?;
   let shown = path.strip_prefix(cwd).unwrap_or(&path).to_string_lossy().into_owned();
   Some(format!("{} ", attach::written('@', &shown)))
+}
+
+/// Whether two askings are for the same value, whatever is in it so far.
+fn same_hole(a: &crate::mcp::Completing, b: &crate::mcp::Completing) -> bool {
+  (&a.server, &a.of, &a.argument, &a.context) == (&b.server, &b.of, &b.argument, &b.context)
 }
 
 /// What a popup row is, for keeping the selection on the same row as the
