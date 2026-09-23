@@ -6,6 +6,9 @@
 //! the state a half-answered questionnaire is in, and how it draws — so all of
 //! it can be tested without one.
 //!
+//! The dialog is not only the model's: an MCP server asking the user for
+//! something is shown the same one, built from the form it sent.
+//!
 //! The behaviour is `rpiv-ask-user-question`'s, the pi extension of the same
 //! name: up to four questions in one dialog, two to four written-out options
 //! each, a free-text row appended to every one of them, and a submit tab that
@@ -23,6 +26,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::markdown::{wrap_line, wrap_text};
+use crate::modal::Component;
 
 /// Questions one call may ask. Four is an interruption; more is an interview.
 pub const MAX_QUESTIONS: usize = 4;
@@ -97,6 +101,11 @@ pub struct Question {
   /// one. Use when choices are not mutually exclusive.
   #[serde(default, rename = "multiSelect")]
   pub multi_select: bool,
+  /// No free-text row under the options. Never, for a question the model
+  /// wrote; a form that wants one of a fixed set of values has nowhere to put
+  /// anything else.
+  #[serde(skip)]
+  pub options_only: bool,
 }
 
 impl Question {
@@ -142,6 +151,7 @@ pub fn prepare(questions: Vec<Question>) -> Vec<Question> {
         })
         .collect(),
       multi_select: q.multi_select,
+      options_only: q.options_only,
     })
     .collect()
 }
@@ -217,14 +227,33 @@ impl Answer {
 
 /// What the dialog came back with: the questions that were answered, in the
 /// order they were asked. Empty when the user walked away — the questionnaire
-/// was dismissed, or there was no terminal to show it in — however much of it
-/// they had answered by then.
+/// was dismissed, or put away before it was answered — however much of it they
+/// had answered by then.
 #[derive(Clone, Debug, Default)]
 pub struct Outcome {
   pub answers: Vec<(usize, Answer)>,
+  /// How the user left without submitting, which is only told apart from a
+  /// submission with nothing in it where an empty answer means something.
+  pub refused: Option<Refusal>,
+}
+
+/// A questionnaire left without submitting it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+  /// Cancel on the submit tab: saying no.
+  Declined,
+  /// Esc: walking away.
+  Cancelled,
 }
 
 impl Outcome {
+  fn refused(how: Refusal) -> Self {
+    Self {
+      refused: Some(how),
+      ..Self::default()
+    }
+  }
+
   /// What the model reads.
   ///
   /// A cancelled questionnaire and an empty one say the same sentence: the
@@ -232,7 +261,7 @@ impl Outcome {
   /// apart. Answering some of the questions and not the rest is allowed, and
   /// the ones left blank simply say nothing here.
   pub fn response(&self, questions: &[Question]) -> String {
-    if self.answers.is_empty() {
+    if self.refused.is_some() || self.answers.is_empty() {
       return DECLINED.to_string();
     }
     let segments: Vec<String> = self
@@ -327,7 +356,7 @@ pub struct Dialog {
 
 impl Dialog {
   pub fn new(questions: Vec<Question>) -> Self {
-    Self {
+    let mut dialog = Self {
       questions,
       tab: 0,
       row: 0,
@@ -335,7 +364,9 @@ impl Dialog {
       answers: BTreeMap::new(),
       drafts: HashMap::new(),
       submit: 0,
-    }
+    };
+    dialog.go_to(0);
+    dialog
   }
 
   /// More than one question, which is what brings the tab strip and the submit
@@ -353,7 +384,9 @@ impl Dialog {
       return Vec::new();
     };
     let mut rows: Vec<Row> = (0..question.options.len()).map(Row::Choice).collect();
-    rows.push(Row::Other);
+    if !question.options_only {
+      rows.push(Row::Other);
+    }
     if question.multi_select {
       rows.push(Row::Next);
     }
@@ -381,7 +414,9 @@ impl Dialog {
   fn go_to(&mut self, tab: usize) {
     self.tab = tab;
     self.row = 0;
-    self.typing = false;
+    // A question with nothing to choose from is answered by typing, so its
+    // only row has the keyboard from the start.
+    self.typing = self.row_at(0) == Some(Row::Other);
     self.submit = 0;
   }
 
@@ -406,6 +441,7 @@ impl Dialog {
   fn answered(&self) -> Outcome {
     Outcome {
       answers: self.answers.clone().into_iter().collect(),
+      ..Outcome::default()
     }
   }
 
@@ -441,50 +477,6 @@ impl Dialog {
         self.answers.insert(self.tab, Answer::Ticked(labels));
       }
     }
-  }
-
-  /// Text the user pasted. It is only ever text, so it goes to the free-text
-  /// row and nowhere else — on a list of choices there is nothing for it to
-  /// mean, and the Enter inside it never picks one.
-  pub fn paste(&mut self, text: &str) {
-    if self.typing {
-      _ = self.draft().insert_str(text);
-    }
-  }
-
-  /// A key the user pressed. `Some` is the questionnaire's answer, and the end
-  /// of the dialog.
-  pub fn key(&mut self, key: KeyEvent) -> Option<Outcome> {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    // Esc leaves from everywhere, including mid-word in the free-text row:
-    // the row is a way of answering the question, not a place to be stuck in.
-    if key.code == KeyCode::Esc {
-      return Some(Outcome::default());
-    }
-    if self.typing {
-      return self.typing_key(key, ctrl);
-    }
-    if self.on_submit_tab() {
-      return self.submit_key(key);
-    }
-    if let Some(action) = self.tab_key(key) {
-      self.go_to(action);
-      return None;
-    }
-    match key.code {
-      KeyCode::Up => self.move_by(-1),
-      KeyCode::Down => self.move_by(1),
-      KeyCode::Char(' ') if self.multi() => {
-        // Not on `Next`, which is a command and not a choice, and not on the
-        // free-text row, where a space is the space the user typed.
-        if let Some(Row::Choice(index)) = self.row_at(self.row) {
-          self.toggle(index);
-        }
-      }
-      KeyCode::Enter => return self.enter(),
-      _ => {}
-    }
-    None
   }
 
   fn multi(&self) -> bool {
@@ -582,7 +574,7 @@ impl Dialog {
       // Submitting is allowed with questions left blank: the warning above the
       // picker says which, and a partial answer beats a dismissed dialog.
       KeyCode::Enter => match self.submit {
-        1 => Some(Outcome::default()),
+        1 => Some(Outcome::refused(Refusal::Declined)),
         _ => Some(self.answered()),
       },
       _ => None,
@@ -590,28 +582,6 @@ impl Dialog {
   }
 
   // -------------------------------------------------------------- drawing
-
-  /// The dialog at `width` columns, and which of its lines the cursor is on —
-  /// which is the line that has to stay on screen when there are more of them
-  /// than there is room for.
-  pub fn lines(&self, width: u16) -> (Vec<Line<'static>>, usize) {
-    let mut out: Vec<Line<'static>> = Vec::new();
-    let mut focus = 0;
-    if self.tabbed() {
-      out.push(self.tab_bar());
-      out.push(Line::raw(""));
-    }
-    match self.questions.get(self.tab) {
-      Some(question) => self.draw_question(question, width, &mut out, &mut focus),
-      None => self.draw_submit(width, &mut out, &mut focus),
-    }
-    out.push(Line::raw(""));
-    out.push(Line::styled(
-      clip(&self.hint(), width),
-      Style::default().add_modifier(Modifier::DIM),
-    ));
-    (out, focus)
-  }
 
   /// The strip of tabs: a box per question, filled once it has an answer, and
   /// the submit tab at the end.
@@ -890,6 +860,80 @@ fn lead(lead: String, line: Line<'static>) -> Line<'static> {
   Line::from(spans)
 }
 
+impl Component for Dialog {
+  type Output = Outcome;
+
+  fn title(&self) -> String {
+    "The model is asking".into()
+  }
+
+  /// Text the user pasted. It is only ever text, so it goes to the free-text
+  /// row and nowhere else — on a list of choices there is nothing for it to
+  /// mean, and the Enter inside it never picks one.
+  fn paste(&mut self, text: &str) {
+    if self.typing {
+      _ = self.draft().insert_str(text);
+    }
+  }
+
+  /// A key the user pressed. `Some` is the questionnaire's answer, and the end
+  /// of the dialog.
+  fn key(&mut self, key: KeyEvent) -> Option<Outcome> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // Esc leaves from everywhere, including mid-word in the free-text row:
+    // the row is a way of answering the question, not a place to be stuck in.
+    if key.code == KeyCode::Esc {
+      return Some(Outcome::refused(Refusal::Cancelled));
+    }
+    if self.typing {
+      return self.typing_key(key, ctrl);
+    }
+    if self.on_submit_tab() {
+      return self.submit_key(key);
+    }
+    if let Some(action) = self.tab_key(key) {
+      self.go_to(action);
+      return None;
+    }
+    match key.code {
+      KeyCode::Up => self.move_by(-1),
+      KeyCode::Down => self.move_by(1),
+      KeyCode::Char(' ') if self.multi() => {
+        // Not on `Next`, which is a command and not a choice, and not on the
+        // free-text row, where a space is the space the user typed.
+        if let Some(Row::Choice(index)) = self.row_at(self.row) {
+          self.toggle(index);
+        }
+      }
+      KeyCode::Enter => return self.enter(),
+      _ => {}
+    }
+    None
+  }
+
+  /// The dialog at `width` columns, and which of its lines the cursor is on —
+  /// which is the line that has to stay on screen when there are more of them
+  /// than there is room for.
+  fn lines(&self, width: u16) -> (Vec<Line<'static>>, usize) {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut focus = 0;
+    if self.tabbed() {
+      out.push(self.tab_bar());
+      out.push(Line::raw(""));
+    }
+    match self.questions.get(self.tab) {
+      Some(question) => self.draw_question(question, width, &mut out, &mut focus),
+      None => self.draw_submit(width, &mut out, &mut focus),
+    }
+    out.push(Line::raw(""));
+    out.push(Line::styled(
+      clip(&self.hint(), width),
+      Style::default().add_modifier(Modifier::DIM),
+    ));
+    (out, focus)
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -907,6 +951,7 @@ mod tests {
       header: text.split(' ').next().unwrap_or_default().into(),
       options: labels.iter().map(|l| choice(l)).collect(),
       multi_select: multi,
+      options_only: false,
     }
   }
 
@@ -1224,6 +1269,7 @@ mod tests {
         choice("Disk"),
       ],
       multi_select: false,
+      options_only: false,
     }]);
     assert_eq!(prepared[0].question, "Which\ncache?");
     assert_eq!(prepared[0].header, "Cache");

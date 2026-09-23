@@ -367,7 +367,8 @@ fn answer_to(body: &str) -> String {
 // ------------------------------------------------------------ mcp server
 
 /// An MCP server over stdin and stdout, in as little as it takes: the three
-/// requests a client makes of one, answered by hand.
+/// requests a client makes of one, answered by hand — and one it makes of the
+/// client, when `book` needs the user to say something.
 #[cfg(feature = "mcp")]
 const MCP_SERVER: &str = r#"
 import json, sys
@@ -384,17 +385,45 @@ TOOLS = [{
   "name": "flood",
   "description": "More than anyone asked for.",
   "inputSchema": {"type": "object", "properties": {"lines": {"type": "integer"}}, "required": ["lines"]},
+}, {
+  "name": "book",
+  "description": "Book seats, asking the user how many.",
+  "inputSchema": {"type": "object", "properties": {}},
 }]
 
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    message = json.loads(line)
+FORM = {
+    "mode": "form",
+    "message": "How many seats, and where?",
+    "requestedSchema": {
+        "type": "object",
+        "properties": {
+            "seats": {"type": "integer", "title": "Seats", "minimum": 1},
+            "window": {"type": "boolean", "title": "Window seat"},
+        },
+        "required": ["seats"],
+    },
+}
+
+def send(message):
+    sys.stdout.write(json.dumps(dict(message, jsonrpc="2.0")) + "\n")
+    sys.stdout.flush()
+
+def read():
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            sys.exit(0)
+        if line.strip():
+            return json.loads(line)
+
+asks = False
+while True:
+    message = read()
     if "id" not in message:
         continue  # a notification: nothing to answer
     method, params = message.get("method"), message.get("params") or {}
     if method == "initialize":
+        asks = "form" in (params.get("capabilities") or {}).get("elicitation", {})
         result = {
             "protocolVersion": params.get("protocolVersion", "2025-06-18"),
             "capabilities": {"tools": {"listChanged": False}},
@@ -404,7 +433,16 @@ for line in sys.stdin:
         result = {"tools": TOOLS}
     elif method == "tools/call":
         arguments = params.get("arguments") or {}
-        if params.get("name") == "flood":
+        if params.get("name") == "book":
+            if not asks:
+                answer = "this client cannot be asked anything"
+            else:
+                send({"id": "form", "method": "elicitation/create", "params": FORM})
+                reply = read()
+                while reply.get("id") != "form":
+                    reply = read()
+                answer = json.dumps(reply.get("result"))
+        elif params.get("name") == "flood":
             # A server under no obligation to be brief.
             answer = "\n".join("line %d" % i for i in range(1, arguments["lines"] + 1))
         else:
@@ -414,8 +452,7 @@ for line in sys.stdin:
         result = {"content": [{"type": "text", "text": answer}], "isError": False}
     else:
         result = {}
-    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": message["id"], "result": result}) + "\n")
-    sys.stdout.flush()
+    send({"id": message["id"], "result": result})
 "#;
 
 /// A directory of this test's own, emptied first.
@@ -2435,7 +2472,7 @@ fn a_tool_from_an_mcp_server_is_offered_called_and_drawn_like_any_other() {
     // command that starts it in a terminal. It offers two tools; this session
     // wants one of them.
     format!(
-      "[weather]\ncommand = \"python3 '{}'\"\ntimeout = 10\nexcept = [\"forecast\", \"flood\"]\n",
+      "[weather]\ncommand = \"python3 '{}'\"\ntimeout = 10\nexcept = [\"forecast\", \"flood\", \"book\"]\n",
       server.display()
     ),
   )
@@ -2501,6 +2538,78 @@ fn a_tool_from_an_mcp_server_is_offered_called_and_drawn_like_any_other() {
       .expect("the field on screen");
     assert!(field.contains("\u{1b}[38;5;"), "highlighted: {field:?}");
   }
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A server may stop in the middle of a tool call to ask the user something.
+/// It is shown the same dialog the model's own questions are, one tab per
+/// field, and what the user typed is checked against what the server asked for
+/// before it is sent.
+#[test]
+#[cfg(feature = "mcp")]
+fn a_server_asks_the_user_in_a_form_and_gets_what_they_answered() {
+  if !have_tmux() || !have_python() {
+    return;
+  }
+  let dir = scratch("mcp-elicit");
+  let server = dir.join("server.py");
+  std::fs::write(&server, MCP_SERVER).expect("a server to run");
+  let config = dir.join("mcp.toml");
+  std::fs::write(
+    &config,
+    format!(
+      "[booking]\ncommand = \"python3 '{}'\"\ntimeout = 60\ntools = [\"book\"]\n",
+      server.display()
+    ),
+  )
+  .expect("a config to read");
+
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "Booking. ",
+      tool: "book",
+      args: serde_json::json!({}),
+    },
+    Turn::Say("Booked."),
+  ]);
+  let term = Term::start(
+    "mcp-elicit",
+    &provider,
+    &["--no-session", "--mcp-config", &shell(&config)],
+  );
+  term.wait_for("MCP booking: 1 tool");
+  term.submit("book me in");
+
+  // Who is asking, what they want, and the first field ready to type in.
+  let screen = term.wait_for("booking is asking");
+  assert!(screen.contains("How many seats, and where?"), "{screen}");
+  assert!(screen.contains("Seats (required)"), "{screen}");
+
+  // Something that is not a number goes as far as the submit tab, and no
+  // further: it is said above the form, and nothing is sent.
+  term.type_in("many");
+  term.type_in("Enter");
+  term.wait_for("1. Yes");
+  term.type_in("Enter");
+  term.wait_for("Review your answers");
+  term.type_in("Enter");
+  term.wait_for("Seats must be a whole number");
+
+  // Put right where it was typed, it goes.
+  term.type_in("Tab");
+  term.type_in("C-u");
+  term.type_in("3");
+  term.type_in("Enter");
+  term.type_in("Enter");
+  term.wait_for("Review your answers");
+  term.type_in("Enter");
+  term.wait_for("Booked.");
+
+  // The server was given the answer as the schema has it — a number and a
+  // boolean, not the text they were typed and chosen as.
+  assert!(provider.sent(r#"\"action\": \"accept\""#), "accepted");
+  assert!(provider.sent(r#"\"seats\": 3"#), "a number");
+  assert!(provider.sent(r#"\"window\": true"#), "a boolean");
   let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -29,11 +29,12 @@ use rig_core::providers::{
   openrouter, perplexity, together, venice, xai,
 };
 use rig_core::streaming::{StreamedAssistantContent, StreamingCompletionResponse, ToolCallDeltaContent};
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::attach::Prompt;
 use crate::compaction::{self, Compacted, Settings};
+use crate::modal::{Host, Modal};
 use crate::tools::{AskTool, BUILT_IN, BashTool, EditDiff, EditTool, Output, ReadTool, WriteTool};
 
 /// What a tool result says when the run was stopped before it could be run.
@@ -107,13 +108,10 @@ pub enum AgentEvent {
   Done {
     messages: Vec<Message>,
   },
-  /// The `ask` tool wants the user to answer something. The dialog the UI
-  /// opens sends what they said back down `reply`; dropping it instead is a
-  /// decline, which is what an aborted run leaves behind.
-  AskUser {
-    questions: Vec<crate::ask::Question>,
-    reply: oneshot::Sender<crate::ask::Outcome>,
-  },
+  /// Something wants the user to answer it — the `ask` tool, or an MCP
+  /// server. The modal already knows where its answer goes; dropping it
+  /// unfinished is no answer, which is what an aborted run leaves behind.
+  Show(Box<dyn Modal>),
   /// The run stopped short of an answer — cancelled, out of room, or after
   /// an `Error`. `messages` holds the same thing `Done` carries: everything
   /// it got through, as it was sent.
@@ -573,12 +571,7 @@ pub async fn list_models(cfg: &Config) -> Result<Vec<ModelInfo>> {
   Ok(models)
 }
 
-pub fn build_agents(
-  cfg: &Config,
-  cwd: &Path,
-  tx: mpsc::UnboundedSender<AgentEvent>,
-  servers: &crate::mcp::Servers,
-) -> Result<Agents> {
+pub fn build_agents(cfg: &Config, cwd: &Path, host: &Host, servers: &crate::mcp::Servers) -> Result<Agents> {
   let preamble = match &cfg.system_prompt {
     Some(p) => p.clone(),
     None => default_system_prompt(cwd, cfg.tools.as_deref()),
@@ -592,11 +585,7 @@ pub fn build_agents(
     .tool(WriteTool { cwd: cwd.to_path_buf() })
     .tool(EditTool { cwd: cwd.to_path_buf() })
     .tool(BashTool { cwd: cwd.to_path_buf() })
-    .tool(AskTool {
-      ask: Some(Arc::new(move |questions, reply| {
-        let _ = tx.send(AgentEvent::AskUser { questions, reply });
-      })),
-    });
+    .tool(AskTool { host: host.clone() });
   // Whatever the session's MCP servers offer, alongside the five the agent
   // brought: a tool is a tool, and the transcript draws them all the same.
   let tools = crate::mcp::attach(tools, servers).run();
@@ -1466,7 +1455,7 @@ mod tests {
       tools: None,
     };
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let agent = build_agents(&cfg, Path::new("/tmp"), tx.clone(), &Default::default())
+    let agent = build_agents(&cfg, Path::new("/tmp"), &Host::new(tx.clone()), &Default::default())
       .unwrap()
       .runtime;
 
@@ -1516,7 +1505,7 @@ mod tests {
         AgentEvent::Ended { .. } => "ended".into(),
         AgentEvent::Compacted(_) => "compacted".into(),
         AgentEvent::Models(_) => "models".into(),
-        AgentEvent::AskUser { .. } => "asking".into(),
+        AgentEvent::Show(_) => "asking".into(),
       })
       .collect();
     assert!(names.contains(&"call:bash".to_string()), "{names:?}");
@@ -1612,7 +1601,7 @@ mod tests {
       tools: None,
     };
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let agents = build_agents(&cfg, Path::new("/tmp"), tx.clone(), &Default::default()).unwrap();
+    let agents = build_agents(&cfg, Path::new("/tmp"), &Host::new(tx.clone()), &Default::default()).unwrap();
     let history = vec![
       Message::user("first question"),
       Message::assistant("first answer"),
@@ -1922,7 +1911,7 @@ mod tests {
           tools: None,
         };
         let (tx, _rx) = mpsc::unbounded_channel();
-        let agents = build_agents(&cfg, Path::new("/tmp"), tx, &Default::default())
+        let agents = build_agents(&cfg, Path::new("/tmp"), &Host::new(tx), &Default::default())
           .unwrap_or_else(|e| panic!("{provider:?} with key {key:?}: {e}"));
         assert_eq!(agents.runtime.relay_images, relay, "{provider:?}");
       }
@@ -1975,7 +1964,7 @@ mod tests {
       tools: None,
     };
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let agent = build_agents(&cfg, Path::new("/tmp"), tx.clone(), &Default::default())
+    let agent = build_agents(&cfg, Path::new("/tmp"), &Host::new(tx.clone()), &Default::default())
       .unwrap()
       .runtime;
     // The mock turns "image <path>" into a `read` tool call for that path,
@@ -2022,7 +2011,7 @@ mod tests {
       tools: None,
     };
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let agent = build_agents(&cfg, Path::new("/tmp"), tx.clone(), &Default::default())
+    let agent = build_agents(&cfg, Path::new("/tmp"), &Host::new(tx.clone()), &Default::default())
       .unwrap()
       .runtime;
     let events = collect(&agent, vec![], &format!("image {}", path.display()), &mut rx, &tx).await;

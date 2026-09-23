@@ -4,7 +4,8 @@
 //! starting: which servers a session should have, how to reach each one, and
 //! handing what they offer to the agent as tools like any other. A server is
 //! either a program that talks over its own stdin and stdout, or an endpoint
-//! that speaks streamable HTTP.
+//! that speaks streamable HTTP. A server that asks the user something while
+//! one of its tools runs is answered through `elicit`.
 //!
 //! The file is this program's own, so it reads the way the rest of it does: a
 //! table per server, named by the name its tools will be called under, and a
@@ -163,10 +164,14 @@ pub struct Servers {
   notes: Vec<String>,
 }
 
+/// A connection to one server, answering what it asks through `elicit`.
+#[cfg(feature = "mcp")]
+type Service = rmcp::service::RunningService<rmcp::service::RoleClient, crate::elicit::Client>;
+
 /// One server that came up.
 #[cfg(feature = "mcp")]
 struct Running {
-  service: rmcp::service::RunningService<rmcp::service::RoleClient, ()>,
+  service: Service,
   /// What it offers, narrowed to what was asked of it.
   tools: Vec<rmcp::model::Tool>,
   /// How long one of its calls may take.
@@ -206,11 +211,15 @@ impl Servers {
 }
 
 #[cfg(feature = "mcp")]
-pub async fn connect(config: Config) -> Servers {
+pub async fn connect(config: Config, host: &crate::modal::Host) -> Servers {
   let mut servers = Servers::default();
   let mut taken: Vec<String> = crate::tools::BUILT_IN.map(str::to_string).to_vec();
   for (name, server) in config {
-    let started = tokio::time::timeout(START_TIMEOUT, start(&server));
+    let client = crate::elicit::Client {
+      server: name.clone(),
+      host: host.clone(),
+    };
+    let started = tokio::time::timeout(START_TIMEOUT, start(&server, client));
     let running = match started.await {
       Ok(Ok(running)) => running,
       Ok(Err(err)) => {
@@ -280,7 +289,7 @@ pub async fn connect(config: Config) -> Servers {
 
 /// Reach one server, however it is reached.
 #[cfg(feature = "mcp")]
-async fn start(server: &Server) -> anyhow::Result<rmcp::service::RunningService<rmcp::service::RoleClient, ()>> {
+async fn start(server: &Server, client: crate::elicit::Client) -> anyhow::Result<Service> {
   use anyhow::{Context, bail};
   use rmcp::ServiceExt;
 
@@ -298,7 +307,7 @@ async fn start(server: &Server) -> anyhow::Result<rmcp::service::RunningService<
       process.stderr(std::process::Stdio::null());
       let transport =
         rmcp::transport::TokioChildProcess::new(process).with_context(|| format!("could not run {command}"))?;
-      Ok(().serve(transport).await?)
+      Ok(client.serve(transport).await?)
     }
     (None, Some(url)) => {
       let sent = values(&server.headers, &server.headers_command, "header").await?;
@@ -306,7 +315,7 @@ async fn start(server: &Server) -> anyhow::Result<rmcp::service::RunningService<
         rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(url.as_str());
       config.custom_headers = headers(&sent)?;
       let transport = rmcp::transport::StreamableHttpClientTransport::from_config(config);
-      Ok(().serve(transport).await?)
+      Ok(client.serve(transport).await?)
     }
     (None, None) => bail!("declared with neither a command to run nor a URL to call"),
   }
@@ -380,7 +389,7 @@ pub fn attach(server: rig_agent::tool::server::ToolServer, servers: &Servers) ->
 }
 
 #[cfg(not(feature = "mcp"))]
-pub async fn connect(_config: Config) -> Servers {
+pub async fn connect(_config: Config, _host: &crate::modal::Host) -> Servers {
   Servers::default()
 }
 

@@ -12,12 +12,12 @@ use rig_agent::tool::{Tool, ToolContext, ToolExecutionError};
 use rig_core::message::{MimeType, ToolResultContent};
 use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 
-use crate::ask::{self, Outcome, Question};
+use crate::ask::{self, Dialog, Question};
+use crate::modal::Host;
 use crate::{edit, images};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
-use tokio::sync::oneshot;
 
 const MAX_LINES: usize = 2000;
 const MAX_BYTES: usize = 50 * 1024;
@@ -1496,13 +1496,10 @@ mod bash_tests {
 
 // ---------------------------------------------------------------- ask
 
-/// Puts a questionnaire to the user and hands back the channel its answer
-/// comes down. `None` is a session with no terminal to ask in.
-pub type QuestionSink = Arc<dyn Fn(Vec<Question>, oneshot::Sender<Outcome>) + Send + Sync>;
-
+/// Puts a questionnaire to the user through `host`.
 #[derive(Clone)]
 pub struct AskTool {
-  pub ask: Option<QuestionSink>,
+  pub host: Host,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1541,26 +1538,22 @@ impl Tool for AskTool {
   /// Ask, and wait for however long the user takes.
   ///
   /// A dialog that goes away without answering — the run was aborted, the
-  /// terminal is gone — drops the channel, which reads the same as a decline:
-  /// the model is told nobody answered rather than left waiting.
+  /// terminal is gone — reads the same as a decline: the model is told nobody
+  /// answered rather than left waiting.
   async fn call(&self, _ctx: &mut ToolContext, args: AskArgs) -> Result<String, ToolError> {
-    let Some(sink) = &self.ask else {
-      return Err(ToolError(
-        "Error: UI not available (running in non-interactive mode)".into(),
-      ));
-    };
     let questions = ask::prepare(args.questions);
     ask::validate(&questions).map_err(ToolError)?;
-    let (tx, rx) = oneshot::channel();
-    sink(questions.clone(), tx);
-    let outcome = rx.await.unwrap_or_default();
+    let outcome = self.host.show(Dialog::new(questions.clone())).await.unwrap_or_default();
     Ok(outcome.response(&questions))
   }
 }
 
 #[cfg(test)]
 mod ask_tests {
+  use ratatui::crossterm::event::KeyCode;
+
   use super::*;
+  use crate::modal::answered_by;
 
   fn questions() -> Vec<Question> {
     vec![
@@ -1585,12 +1578,11 @@ mod ask_tests {
   #[tokio::test]
   async fn the_answer_the_dialog_gave_is_what_the_model_reads() {
     let tool = AskTool {
-      ask: Some(Arc::new(|questions: Vec<Question>, reply| {
-        assert_eq!(questions.len(), 1);
-        let _ = reply.send(Outcome {
-          answers: vec![(0, crate::ask::Answer::Chose("Disk".into()))],
-        });
-      })),
+      host: answered_by(|mut modal| {
+        assert_eq!(modal.title(), "The model is asking");
+        assert!(!modal.key(KeyCode::Down.into()));
+        assert!(modal.key(KeyCode::Enter.into()), "one question, answered");
+      }),
     };
     assert_eq!(
       ask(&tool).await.unwrap(),
@@ -1601,20 +1593,11 @@ mod ask_tests {
 
   #[tokio::test]
   async fn a_dialog_that_never_answers_reads_as_a_decline() {
-    // Dropping the channel is what an aborted run leaves behind.
+    // Dropping it unanswered is what an aborted run leaves behind.
     let tool = AskTool {
-      ask: Some(Arc::new(|_questions, _reply| {})),
+      host: answered_by(drop),
     };
     assert_eq!(ask(&tool).await.unwrap(), "User declined to answer questions");
-  }
-
-  #[tokio::test]
-  async fn a_session_with_no_terminal_says_so_instead_of_waiting() {
-    let tool = AskTool { ask: None };
-    assert_eq!(
-      ask(&tool).await.unwrap_err().0,
-      "Error: UI not available (running in non-interactive mode)"
-    );
   }
 
   #[test]
@@ -1634,13 +1617,13 @@ mod ask_tests {
 
   #[tokio::test]
   async fn a_questionnaire_the_user_cannot_be_shown_is_refused_before_it_is() {
-    let tool = AskTool {
-      ask: Some(Arc::new(|_questions, _reply| panic!("nothing to show"))),
-    };
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let tool = AskTool { host: Host::new(tx) };
     let err = tool
       .call(&mut ToolContext::new(), AskArgs { questions: Vec::new() })
       .await
       .unwrap_err();
     assert_eq!(err.0, "Error: At least one question is required");
+    assert!(rx.try_recv().is_err(), "nothing was shown");
   }
 }

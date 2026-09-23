@@ -1,7 +1,7 @@
 //! Ratatui front-end: a scrolling transcript, a multi-line input box and a
 //! one-line footer.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -13,20 +13,22 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{
+  Block, BorderType, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 use ratatui::{DefaultTerminal, Frame};
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 use rig_core::completion::{Message, Usage};
 #[cfg(test)]
 use rig_core::message::ToolResultContent;
 use rig_core::message::{AssistantContent, ToolCall, ToolResult, UserContent};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::agent::{self, AgentEvent, Agents, ModelInfo, start_compaction, start_run};
-use crate::ask::{self, Dialog};
 use crate::attach::{self, Prompt, Token};
 use crate::compaction::{DEFAULT_CONTEXT_WINDOW, SUMMARY_PREFIX, SUMMARY_SUFFIX, estimate_tokens};
+use crate::modal::Modal;
 use crate::session::{Node, NodeKind, Outcome, Session, SessionInfo, Store};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
@@ -319,15 +321,6 @@ struct Mark {
   label: String,
 }
 
-/// What the `ask` tool put to the user, and the channel the answer goes back
-/// down. Drawn over whatever else is on screen, a list included: it takes the
-/// keyboard whole until it is answered.
-struct Question {
-  dialog: Dialog,
-  /// Dropping it unanswered is what tells the tool the user walked away.
-  reply: oneshot::Sender<ask::Outcome>,
-}
-
 /// A point the conversation can be moved to.
 struct Point {
   /// The entry the row stands for, which is what deleting it removes.
@@ -598,7 +591,11 @@ pub struct App {
   /// The conversation: history plus its on-disk file.
   session: Session,
   overlay: Option<Overlay>,
-  question: Option<Question>,
+  /// What tools and servers are asking the user, first come first shown.
+  /// The one in front is drawn over whatever else is on screen, a list
+  /// included, and takes the keyboard whole until it is answered; dropping
+  /// one unanswered is what tells whoever asked that the user walked away.
+  modals: VecDeque<Box<dyn Modal>>,
   matcher: Matcher,
   completion: Option<Completion>,
   /// Esc closed the popup; stay closed until the input changes.
@@ -710,7 +707,7 @@ impl App {
       store,
       session,
       overlay: None,
-      question: None,
+      modals: VecDeque::new(),
       matcher: Matcher::new(Config::DEFAULT),
       completion: None,
       completion_dismissed: false,
@@ -834,8 +831,8 @@ impl App {
       return;
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    if self.question.is_some() {
-      self.handle_question_key(key, ctrl);
+    if !self.modals.is_empty() {
+      self.handle_modal_key(key, ctrl);
       return;
     }
     if self.overlay.is_some() {
@@ -937,8 +934,8 @@ impl App {
     if text.is_empty() {
       return;
     }
-    if let Some(question) = &mut self.question {
-      question.dialog.paste(&text);
+    if let Some(modal) = self.modals.front_mut() {
+      modal.paste(&text);
       return;
     }
     // The other overlays are lists, and text pasted at one narrows it: the
@@ -1179,25 +1176,20 @@ impl App {
     };
   }
 
-  /// A key while the model's questionnaire is open. It is the dialog's to
-  /// answer — the whole keyboard belongs to it while it is up, which is what
-  /// makes typing an answer of one's own possible at all.
+  /// A key while a question is open. It is the question's to answer — the
+  /// whole keyboard belongs to it while it is up, which is what makes typing
+  /// an answer of one's own possible at all.
   ///
   /// Ctrl+C is the exception: the run the question came from is still in
   /// flight, and stopping it is what that key means everywhere else in fa.
-  fn handle_question_key(&mut self, key: KeyEvent, ctrl: bool) {
+  fn handle_modal_key(&mut self, key: KeyEvent, ctrl: bool) {
     if ctrl && key.code == KeyCode::Char('c') {
       self.abort();
       return;
     }
-    let Some(question) = &mut self.question else {
-      return;
-    };
-    let Some(outcome) = question.dialog.key(key) else {
-      return;
-    };
-    if let Some(question) = self.question.take() {
-      let _ = question.reply.send(outcome);
+    // Answered, it has already sent its answer; the next one comes up.
+    if self.modals.front_mut().is_some_and(|modal| modal.key(key)) {
+      self.modals.pop_front();
     }
   }
 
@@ -1437,7 +1429,7 @@ impl App {
     self.grab_thumb(column, row);
     // An overlay is a window over the transcript, not a view of it: what is
     // under it is not what is on screen at that cell.
-    if self.dragging.is_some() || self.overlay.is_some() || self.question.is_some() {
+    if self.dragging.is_some() || self.overlay.is_some() || !self.modals.is_empty() {
       return;
     }
     if !self.content.contains(Position::new(column, row)) {
@@ -2143,7 +2135,7 @@ impl App {
   fn abort(&mut self) {
     // A question the run was waiting on has nobody left to answer to;
     // closing it drops the channel, which is how the tool hears that.
-    self.close_question();
+    self.modals.clear();
     if self.run.is_none() {
       return;
     }
@@ -2175,12 +2167,6 @@ impl App {
         .entries
         .push(Entry::Info(format!("Not sent: {}", first_line(&text.text))));
     }
-  }
-
-  /// Take down the model's questionnaire, if one is up. What it had been
-  /// asked is left unanswered, which the tool reads as a decline.
-  fn close_question(&mut self) {
-    self.question = None;
   }
 
   /// Record what a run added to the conversation.
@@ -2287,14 +2273,11 @@ impl App {
       // The question takes the screen until it is answered: the run that
       // asked it is waiting on the answer, so there is nothing else to be
       // doing here anyway.
-      AgentEvent::AskUser { questions, reply } => {
+      AgentEvent::Show(modal) => {
         if self.bell {
           bell();
         }
-        self.question = Some(Question {
-          dialog: Dialog::new(questions),
-          reply,
-        });
+        self.modals.push_back(modal);
       }
       AgentEvent::Error(err) => {
         self.entries.push(Entry::Error(err));
@@ -2311,7 +2294,7 @@ impl App {
       AgentEvent::Done { messages } => {
         self.run = None;
         self.writing.clear();
-        self.close_question();
+        self.modals.clear();
         self.stopped(messages);
         // The run ended with its answer, so there is nothing to pick back
         // up; a context that outgrew the window is still made room in,
@@ -2326,7 +2309,7 @@ impl App {
       AgentEvent::Ended { messages } => {
         self.run = None;
         self.writing.clear();
-        self.close_question();
+        self.modals.clear();
         let full = self.overflowed();
         if self.compacting {
           // A compaction that did not finish is not worth starting again on
@@ -2401,7 +2384,7 @@ impl App {
     // moment came to.
     // A questionnaire takes the keyboard whole, so a list under it is not
     // being narrowed while it is up.
-    let filtering = self.overlay.is_some() && self.question.is_none();
+    let filtering = self.overlay.is_some() && self.modals.is_empty();
     let lines = match filtering {
       true => 1,
       false => self.input.lines().len(),
@@ -2423,8 +2406,8 @@ impl App {
     }
 
     self.thumb = None;
-    if self.question.is_some() {
-      self.draw_question(f, transcript_area);
+    if !self.modals.is_empty() {
+      self.draw_modal(f, transcript_area);
     } else if self.overlay.is_some() {
       self.draw_overlay(f, transcript_area);
     } else {
@@ -2471,7 +2454,7 @@ impl App {
     let Some((text, _)) = &self.toast else { return };
     // A list or a question is framed, and its top border says which keys do
     // what, so the toast goes inside the frame rather than over the hints.
-    let area = match self.overlay.is_some() || self.question.is_some() {
+    let area = match self.overlay.is_some() || !self.modals.is_empty() {
       true => area.inner(Margin::new(1, 1)),
       false => area,
     };
@@ -2637,19 +2620,19 @@ impl App {
     f.render_widget(Paragraph::new(lines), area);
   }
 
-  fn draw_question(&self, f: &mut Frame, area: Rect) {
-    let Some(question) = &self.question else { return };
+  fn draw_modal(&self, f: &mut Frame, area: Rect) {
+    let Some(modal) = self.modals.front() else { return };
     // The dialog says which keys do what along its own bottom, where the
     // answer to that changes with the question.
     let block = Block::default()
       .borders(Borders::ALL)
       .border_type(BorderType::Rounded)
       .border_style(Style::default().fg(Color::Gray))
-      .title(" The model is asking ");
+      .title(format!(" {} ", modal.title()));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let height = inner.height as usize;
-    let (lines, focus) = question.dialog.lines(inner.width);
+    let (lines, focus) = modal.lines(inner.width);
     // More dialog than screen: scroll it just far enough to keep the row the
     // cursor is on in view, which is the row being answered.
     let first = focus.saturating_sub(height.saturating_sub(1)).min(focus);

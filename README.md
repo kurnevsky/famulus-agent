@@ -362,6 +362,22 @@ beats refusing to start. A tool named like one of those five is
 left alone: the model is told about `read`, `write`, `edit`, `bash` and `ask`
 in the system prompt, and cannot say which of two it meant.
 
+### A server asking you
+
+A server may stop in the middle of one of its tool calls to ask you something
+([elicitation](https://modelcontextprotocol.io/specification/2025-06-18/client/elicitation)).
+The form it sends is put up as the same dialog `ask` draws, under the server's
+name — `╭ weather is asking ─╮` — with its message on top and one tab per field:
+text and numbers are typed, a boolean is `Yes` or `No`, and an enum is a list
+to pick from, or tick boxes in when it takes several. Nothing is sent until it
+fits what the server asked for — a number that is not one, or a required field
+left blank, is said above the form, which stays where it was to be put right.
+
+`Esc` is a cancel and the submit tab's `Cancel` a decline, which the protocol
+tells apart; a run aborted while the form is up cancels it too. A server that
+wants you sent to a URL is declined. The wait counts against the tool's
+`timeout`, so a server that asks is one worth giving a longer one.
+
 MCP is a feature, on by default:
 
 ```sh

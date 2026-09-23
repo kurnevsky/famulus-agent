@@ -5,10 +5,13 @@ mod clipboard;
 mod compaction;
 mod config;
 mod edit;
+#[cfg(feature = "mcp")]
+mod elicit;
 mod highlight;
 mod images;
 mod markdown;
 mod mcp;
+mod modal;
 mod session;
 mod tools;
 mod ui;
@@ -222,6 +225,11 @@ async fn main() -> Result<()> {
   } else {
     ui::SessionStart::New
   };
+  // Everything that wants the user's attention reaches the UI down this
+  // channel: the run's events, and the questions its tools and servers ask.
+  let (tx, rx) = mpsc::unbounded_channel();
+  let host = modal::Host::new(tx.clone());
+
   // The servers come up before the terminal does, and stay up as long as this
   // binding: a stdio server is a child process of ours, and closing the
   // connection is what stops it.
@@ -230,7 +238,7 @@ async fn main() -> Result<()> {
     false => {
       let files = mcp::files(mcp_config.as_deref());
       let (config, mut notes) = mcp::load(&files, mcp_config.is_some());
-      let servers = mcp::connect(config).await;
+      let servers = mcp::connect(config, &host).await;
       notes.extend(servers.notes().iter().cloned());
       (servers, notes)
     }
@@ -259,8 +267,7 @@ async fn main() -> Result<()> {
   }
   cfg.tools = allowed;
 
-  let (tx, rx) = mpsc::unbounded_channel();
-  let agents = agent::build_agents(&cfg, &cwd, tx.clone(), &servers)?;
+  let agents = agent::build_agents(&cfg, &cwd, &host, &servers)?;
   let app = ui::App::new(
     agents,
     cfg,
