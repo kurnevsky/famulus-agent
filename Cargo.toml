@@ -115,7 +115,6 @@ futures = "0.3.34"
 # Only to name the headers an MCP endpoint is called with; already in the tree.
 http = { version = "1", optional = true }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
-libc = "0.2.189"
 markdown = "1"
 mdstitch = "0.1"
 nucleo-matcher = "0.3.1"
@@ -128,6 +127,7 @@ rmcp = { version = "2", features = [
   "transport-child-process",
   "transport-streamable-http-client-reqwest",
 ], optional = true }
+rustix = { version = "1", features = ["process"] }
 # `preserve_order` keeps a tool's arguments in the order its struct
 # declares them, rather than sorting them: the model tends to write them
 # in the order it is offered them, and the path wants to come first.

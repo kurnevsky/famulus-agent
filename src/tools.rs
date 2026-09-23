@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use rig_agent::tool::{Tool, ToolContext, ToolExecutionError};
 use rig_core::message::{MimeType, ToolResultContent};
+use rustix::process::{Pid, Signal, kill_process, kill_process_group};
 
 use crate::ask::{self, Outcome, Question};
 use crate::{edit, images};
@@ -1107,23 +1108,21 @@ fn append_status(text: &str, status: &str) -> String {
 /// Kills the command's process group when dropped, unless disarmed after a
 /// normal exit. Dropping happens on timeout and when the run is aborted.
 struct ProcessGroupGuard {
-  pgid: Option<i32>,
+  pgid: Option<Pid>,
 }
 
 impl ProcessGroupGuard {
   fn new(pid: Option<u32>) -> Self {
     Self {
-      pgid: pid.and_then(|p| i32::try_from(p).ok()),
+      pgid: pid.and_then(|p| i32::try_from(p).ok()).and_then(Pid::from_raw),
     }
   }
 
   fn kill(&self) {
     if let Some(pgid) = self.pgid {
-      // SAFETY: plain libc calls with a pid we spawned; failures are ignored.
-      unsafe {
-        if libc::kill(-pgid, libc::SIGKILL) != 0 {
-          libc::kill(pgid, libc::SIGKILL);
-        }
+      // Failures are ignored: the process may already be gone.
+      if kill_process_group(pgid, Signal::KILL).is_err() {
+        let _ = kill_process(pgid, Signal::KILL);
       }
     }
   }
