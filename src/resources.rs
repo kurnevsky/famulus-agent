@@ -32,12 +32,15 @@ pub struct ServerResources {
   pub resources: Vec<Resource>,
   /// URI templates, with `{…}` for the parts to fill in.
   pub templates: Vec<ResourceTemplate>,
+  /// Why the last asking for the lists failed, if it did: what is above is
+  /// then what an earlier one said, or nothing.
+  pub failed: Option<String>,
 }
 
 // ---------------------------------------------------------------- asking
 
 /// `ask`, given up on after `timeout` when there is one.
-async fn bounded<T>(
+pub async fn bounded<T>(
   timeout: Option<Duration>,
   ask: impl Future<Output = Result<T, ServiceError>>,
 ) -> Result<T, ServiceError> {
@@ -57,6 +60,7 @@ pub async fn inventory(peer: &ServerSink, timeout: Option<Duration>) -> Result<S
     Ok(ServerResources {
       resources: peer.list_all_resources().await?,
       templates: peer.list_all_resource_templates().await.unwrap_or_default(),
+      failed: None,
     })
   })
   .await
@@ -92,8 +96,9 @@ impl Tool for ListResources {
   tool_args!(ListArgs);
 
   fn description(&self) -> String {
-    "List the resources MCP servers offer for reading — documents, records, files — with the URI to \
-     read each by, and the URI templates a server can fill in. Read one with read_resource."
+    "List the resources MCP servers offer for reading — documents, records, files — grouped by \
+     server, each with the URI to read it by, and the URI templates a server accepts, whose {…} \
+     parts you fill in to make a URI. Read one with read_resource, giving the server and the URI."
       .to_string()
   }
 
@@ -111,16 +116,27 @@ fn listing(held: &BTreeMap<String, ServerResources>, named: Option<&str>) -> Res
   let mut out = Vec::new();
   for (server, listed) in servers {
     out.push(format!("{server}:"));
-    match listed.resources.is_empty() {
-      true => out.push("  (no resources)".to_string()),
-      false => out.extend(listed.resources.iter().map(|r| {
-        line(
-          &r.uri,
-          r.title.as_deref().unwrap_or(&r.name),
-          r.mime_type.as_deref(),
-          r.description.as_deref(),
-        )
-      })),
+    // A listing that failed is not an empty one: what is there may still be
+    // read by a URI known some other way.
+    if let Some(err) = &listed.failed {
+      out.push(format!("  (could not list: {err})"));
+    }
+    match (listed.resources.is_empty(), listed.failed.is_some()) {
+      (true, true) => {}
+      (true, false) => out.push("  (no resources)".to_string()),
+      (false, failed) => {
+        if failed {
+          out.push("  as listed before:".to_string());
+        }
+        out.extend(listed.resources.iter().map(|r| {
+          line(
+            &r.uri,
+            r.title.as_deref().unwrap_or(&r.name),
+            r.mime_type.as_deref(),
+            r.description.as_deref(),
+          )
+        }))
+      }
     }
     if !listed.templates.is_empty() {
       out.push("  templates (fill in the {…} parts to make a URI):".to_string());
@@ -162,7 +178,7 @@ pub struct ReadResource {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct ReadArgs {
-  /// The server that has the resource
+  /// The server that has the resource, as list_resources names it
   server: String,
   /// The resource's URI, as list_resources gives it or a template makes it
   uri: String,
@@ -176,7 +192,9 @@ impl Tool for ReadResource {
   fn description(&self) -> String {
     "Read a resource from an MCP server by its URI: one from list_resources, one a template was \
      filled in to make, one a tool's answer pointed at, or one the user named in a message as \
-     &server:uri. Text comes back as text and images as images."
+     &server:uri — the server's name, a colon, then the URI, maybe all in quotes: \
+     &notes:note://today is server notes, URI note://today. Text comes back as text and images as \
+     images; other binary contents are only described, by type and size."
       .to_string()
   }
 
@@ -277,6 +295,7 @@ mod tests {
       ServerResources {
         resources: vec![Resource::new("note://today", "today")],
         templates: vec![ResourceTemplate::new("note://{day}", "day")],
+        failed: None,
       },
     );
     held.insert("empty".to_string(), ServerResources::default());
@@ -289,6 +308,24 @@ mod tests {
       all.contains("empty:\n  (no resources)") && all.contains("notes:"),
       "{all}"
     );
+    // A listing that failed says so, and keeps what an earlier one said.
+    held.insert(
+      "down".to_string(),
+      ServerResources {
+        failed: Some("timed out".to_string()),
+        ..ServerResources::default()
+      },
+    );
+    assert_eq!(
+      listing(&held, Some("down")).expect("a server it has"),
+      "down:\n  (could not list: timed out)"
+    );
+    held.get_mut("notes").expect("notes").failed = Some("timed out".to_string());
+    assert_eq!(
+      listing(&held, Some("notes")).expect("a server it has"),
+      "notes:\n  (could not list: timed out)\n  as listed before:\n  note://today — today\n  templates (fill in the {…} parts to make a URI):\n  note://{day} — day"
+    );
+    held.remove("down");
     let err = listing(&held, Some("other")).expect_err("no such server").to_string();
     assert!(err.contains("Servers with resources: empty, notes"), "{err}");
   }

@@ -19,7 +19,7 @@ use ratatui::text::Line;
 use rmcp::model::{
   ClientCapabilities, ClientInfo, ConstTitle, ElicitRequestParams, ElicitResult, ElicitationAction,
   ElicitationCapability, ElicitationSchema, EnumSchema, ErrorData, FormElicitationCapability, Implementation,
-  MultiSelectEnumSchema, PrimitiveSchemaDefinition, SingleSelectEnumSchema,
+  MultiSelectEnumSchema, PrimitiveSchemaDefinition, ProgressNotificationParam, SingleSelectEnumSchema,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleClient};
 use serde_json::{Map, Value};
@@ -62,6 +62,10 @@ impl rmcp::ClientHandler for crate::mcp::Watch {
 
   async fn on_resource_list_changed(&self, context: NotificationContext<RoleClient>) {
     self.resources_changed(&context.peer).await;
+  }
+
+  async fn on_progress(&self, note: ProgressNotificationParam, _context: NotificationContext<RoleClient>) {
+    self.progress.heard(note);
   }
 
   /// Forms and nothing else, under this program's own name rather than the

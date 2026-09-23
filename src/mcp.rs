@@ -1,11 +1,12 @@
 //! Tools from MCP servers.
 //!
-//! Rig speaks the protocol, through `rmcp`. What is here is the finding and the
-//! starting: which servers a session should have, how to reach each one, and
-//! handing what they offer to the agent as tools like any other. A server is
-//! either a program that talks over its own stdin and stdout, or an endpoint
-//! that speaks streamable HTTP. A server that asks the user something while
-//! one of its tools runs is answered through `elicit`.
+//! `rmcp` speaks the protocol. What is here is the finding and the starting:
+//! which servers a session should have, how to reach each one, and handing
+//! what they offer to the agent as tools like any other. A server is either a
+//! program that talks over its own stdin and stdout, or an endpoint that
+//! speaks streamable HTTP. A server that asks the user something while one of
+//! its tools runs is answered through `elicit`; what it says of how far along
+//! the tool is, is shown through `call`.
 //!
 //! The file is this program's own, so it reads the way the rest of it does: a
 //! table per server, named by the name its tools will be called under, and a
@@ -92,7 +93,9 @@ pub struct Server {
   pub headers_command: BTreeMap<String, String>,
   /// Seconds one of this server's tools — or a listing or reading of its
   /// resources — may take before the call comes back as an error the model
-  /// can recover from. `0` waits forever.
+  /// can recover from. `0` waits forever. For a tool, the seconds are
+  /// counted from the last word from the server, so one that keeps saying
+  /// how far along it is may take as long as it needs.
   pub timeout: Option<u64>,
   /// Take only these of the tools it offers. Everything it offers, when empty
   /// — which is not the same as naming them all, since a server that grows a
@@ -224,14 +227,16 @@ struct Offer {
   peer: rmcp::service::ServerSink,
   /// How long one of its calls may take.
   timeout: Option<u64>,
+  /// What its calls hear of how far along they are.
+  progress: crate::call::Progress,
   /// What it has to read, for a server that said it has resources as it came
   /// up — whether or not it could list them then.
   resources: Option<crate::resources::ServerResources>,
 }
 
-/// How long a call to a server may take, from the seconds its table says.
-/// Rig bounds a call at five minutes unless told otherwise, and zero lets a
-/// call take as long as it takes.
+/// How long a call to a server may take, from the seconds its table says:
+/// five minutes, as rig has it, unless told otherwise, and zero lets a call
+/// take as long as it takes.
 #[cfg(feature = "mcp")]
 fn call_timeout(seconds: Option<u64>) -> Option<std::time::Duration> {
   match seconds {
@@ -329,7 +334,20 @@ impl Catalog {
   pub fn attach(&self, server: rig_agent::tool::server::ToolServer) -> rig_agent::tool::server::ToolServer {
     #[cfg(feature = "mcp")]
     return self.offers().iter().fold(server, |server, offer| {
-      server.rmcp_tools_with_timeout(offer.tools.clone(), offer.peer.clone(), call_timeout(offer.timeout))
+      server.dynamic_tools(
+        offer
+          .tools
+          .iter()
+          .map(|tool| {
+            crate::call::tool(
+              tool,
+              offer.peer.clone(),
+              call_timeout(offer.timeout),
+              offer.progress.clone(),
+            )
+          })
+          .collect(),
+      )
     });
     #[cfg(not(feature = "mcp"))]
     server
@@ -379,6 +397,7 @@ impl Catalog {
     tools: Vec<rmcp::model::Tool>,
     peer: rmcp::service::ServerSink,
     timeout: Option<u64>,
+    progress: crate::call::Progress,
   ) -> Option<Vec<String>> {
     let before = {
       let mut offers = self.offers();
@@ -386,6 +405,7 @@ impl Catalog {
         Some(old) => {
           old.peer = peer;
           old.timeout = timeout;
+          old.progress = progress;
           Some(std::mem::replace(&mut old.tools, tools))
         }
         None => {
@@ -394,6 +414,7 @@ impl Catalog {
             tools,
             peer,
             timeout,
+            progress,
             resources: None,
           });
           None
@@ -409,13 +430,13 @@ impl Catalog {
 
   /// Put what `server` has to read in place of what it had. A list that
   /// could not be had leaves what was there, or nothing, since the server can
-  /// still be read from.
+  /// still be read from — marked with why, so it is not taken for all there is.
   #[cfg(feature = "mcp")]
-  fn stock(&self, server: &str, listed: Option<crate::resources::ServerResources>) {
+  fn stock(&self, server: &str, listed: Result<crate::resources::ServerResources, String>) {
     if let Some(offer) = self.offers().iter_mut().find(|offer| offer.server == server) {
       match listed {
-        Some(held) => offer.resources = Some(held),
-        None => _ = offer.resources.get_or_insert_default(),
+        Ok(held) => offer.resources = Some(held),
+        Err(err) => offer.resources.get_or_insert_default().failed = Some(err),
       }
     }
   }
@@ -482,6 +503,9 @@ pub struct Watch {
   /// One refresh at a time: two lists fetched at once could land in either
   /// order, and the older one would win.
   busy: std::sync::Arc<tokio::sync::Mutex<()>>,
+  /// What the server says of how far along its calls are, for the calls to
+  /// hear. Its own, since a token is only one server's.
+  pub(crate) progress: crate::call::Progress,
 }
 
 /// Whether a server said, when it came up, that it has resources.
@@ -524,7 +548,14 @@ impl Watch {
     let picked = pick(&self.table, tools, &self.catalog.taken(name));
     let now: Vec<String> = picked.tools.iter().map(|tool| tool.name.to_string()).collect();
     let mut note = format!("MCP {name}: ");
-    match self.catalog.offer(name, picked.tools, peer.clone(), self.table.timeout) {
+    let offered = self.catalog.offer(
+      name,
+      picked.tools,
+      peer.clone(),
+      self.table.timeout,
+      self.progress.clone(),
+    );
+    match offered {
       None => {
         note.push_str(&tools_count(now.len()));
         // Said once, as it comes up: a typo in the file is not news again
@@ -562,11 +593,12 @@ impl Watch {
     }
     let _one = self.busy.lock().await;
     let listed = crate::resources::inventory(peer, call_timeout(self.table.timeout)).await;
+    let listed = listed.map_err(|err| err.to_string());
     let note = listed
       .as_ref()
       .err()
       .map(|err| format!("MCP {}: could not list resources: {err}", self.server));
-    self.catalog.stock(&self.server, listed.ok());
+    self.catalog.stock(&self.server, listed);
     note
   }
 }
@@ -581,6 +613,7 @@ pub async fn connect(config: Config, host: &crate::modal::Host) -> Servers {
       catalog: servers.catalog.clone(),
       host: host.clone(),
       busy: Default::default(),
+      progress: Default::default(),
     };
     let running = match start(&name, &watch.table, watch.clone(), &mut servers.notes).await {
       Ok(running) => running,

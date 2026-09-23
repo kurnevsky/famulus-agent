@@ -1,6 +1,8 @@
 mod agent;
 mod ask;
 mod attach;
+#[cfg(feature = "mcp")]
+mod call;
 mod clipboard;
 mod compaction;
 mod config;
