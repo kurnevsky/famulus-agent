@@ -123,6 +123,14 @@ pub enum AgentEvent {
   /// What the provider says it offers, or why it would not say. Sent by the
   /// fetch `/model` starts, which is the only thing that asks.
   Models(Result<Vec<ModelInfo>, String>),
+  /// An MCP server's tools changed while the session ran: what to say about
+  /// it, and how many servers and tools there are now.
+  #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+  Mcp {
+    note: String,
+    servers: usize,
+    tools: usize,
+  },
   Error(String),
 }
 
@@ -304,14 +312,38 @@ impl<M: CompletionModel + Send + Sync + 'static> Model for M {
   }
 }
 
+/// The tools a session offers, as they are now: the five it was built with,
+/// and whatever its MCP servers offer at the moment.
+///
+/// A server that changes what it offers has the whole set built again and
+/// put in place of this one. A run takes the set as it is when it asks, so a
+/// call already under way finishes on the set it started with — which calls
+/// the same servers.
+#[derive(Clone)]
+pub struct Tools(Arc<std::sync::RwLock<ToolServerHandle>>);
+
+impl Tools {
+  pub fn new(handle: ToolServerHandle) -> Self {
+    Self(Arc::new(std::sync::RwLock::new(handle)))
+  }
+
+  fn now(&self) -> ToolServerHandle {
+    self.0.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+  }
+
+  fn replace(&self, handle: ToolServerHandle) {
+    *self.0.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = handle;
+  }
+}
+
 /// Everything a run needs that does not change between runs.
 pub struct Runtime {
   model: Arc<dyn Model>,
-  tools: ToolServerHandle,
+  tools: Tools,
   preamble: String,
   compaction: Settings,
-  /// The tool names this session was held to, or all of them.
-  allowed: Option<Vec<String>>,
+  /// Which tools this session was held to.
+  rules: crate::tools::Rules,
   /// Chat completions will not carry an image inside a tool message, so a
   /// `read` that answers with a screenshot has it relayed after the result.
   relay_images: bool,
@@ -320,13 +352,13 @@ pub struct Runtime {
 }
 
 impl Runtime {
-  fn new(cfg: &Config, tools: ToolServerHandle, preamble: String, relay_images: bool) -> Result<Self> {
+  fn new(cfg: &Config, tools: Tools, preamble: String, relay_images: bool) -> Result<Self> {
     Ok(Self {
       model: build_model(cfg)?,
       tools,
       preamble,
       compaction: cfg.compaction,
-      allowed: cfg.tools.clone(),
+      rules: cfg.tools.clone(),
       relay_images,
       max_tokens: cfg.max_tokens,
     })
@@ -453,8 +485,8 @@ pub struct Config {
   pub compaction: Settings,
   /// Whether the model accepts image input.
   pub vision: bool,
-  /// Tool names this session offers, or `None` for all of them.
-  pub tools: Option<Vec<String>>,
+  /// Which tools this session offers.
+  pub tools: crate::tools::Rules,
 }
 
 /// Whether this provider takes an image inside a tool result.
@@ -574,21 +606,28 @@ pub async fn list_models(cfg: &Config) -> Result<Vec<ModelInfo>> {
 pub fn build_agents(cfg: &Config, cwd: &Path, host: &Host, servers: &crate::mcp::Servers) -> Result<Agents> {
   let preamble = match &cfg.system_prompt {
     Some(p) => p.clone(),
-    None => default_system_prompt(cwd, cfg.tools.as_deref()),
+    None => default_system_prompt(cwd, &cfg.tools),
   };
 
-  let tools = ToolServer::new()
-    .tool(ReadTool {
-      cwd: cwd.to_path_buf(),
-      vision: cfg.vision,
-    })
-    .tool(WriteTool { cwd: cwd.to_path_buf() })
-    .tool(EditTool { cwd: cwd.to_path_buf() })
-    .tool(BashTool { cwd: cwd.to_path_buf() })
-    .tool(AskTool { host: host.clone() });
+  let (cwd, vision, host) = (cwd.to_path_buf(), cfg.vision, host.clone());
+  let built_in = move || {
+    ToolServer::new()
+      .tool(ReadTool {
+        cwd: cwd.clone(),
+        vision,
+      })
+      .tool(WriteTool { cwd: cwd.clone() })
+      .tool(EditTool { cwd: cwd.clone() })
+      .tool(BashTool { cwd: cwd.clone() })
+      .tool(AskTool { host: host.clone() })
+  };
   // Whatever the session's MCP servers offer, alongside the five the agent
   // brought: a tool is a tool, and the transcript draws them all the same.
-  let tools = crate::mcp::attach(tools, servers).run();
+  let catalog = servers.catalog();
+  let tools = Tools::new(catalog.attach(built_in()).run());
+  // And whatever they offer later, in place of what they offered before.
+  let again = tools.clone();
+  catalog.on_change(move |catalog| again.replace(catalog.attach(built_in()).run()));
 
   Ok(Agents {
     runtime: Arc::new(Runtime::new(cfg, tools, preamble, relays_images(cfg.provider))?),
@@ -703,10 +742,6 @@ async fn run(
   made: &mut Vec<Message>,
   tx: &mpsc::UnboundedSender<AgentEvent>,
 ) -> Option<Stop> {
-  let definitions = match rt.definitions().await {
-    Ok(definitions) => definitions,
-    Err(err) => return Some(Stop::Failed(err)),
-  };
   let mut weigh = Weigh::default();
 
   let mut first = true;
@@ -746,8 +781,14 @@ async fn run(
     }
     first = false;
 
+    // Asked again every turn, since an MCP server can change what it offers
+    // in the middle of a run — as the answer to one of its own tools, even.
+    let definitions = match rt.definitions().await {
+      Ok(definitions) => definitions,
+      Err(err) => return Some(Stop::Failed(err)),
+    };
     let sent = chat.len();
-    let request = request(&rt.preamble, chat, definitions.clone(), rt.max_tokens);
+    let request = request(&rt.preamble, chat, definitions, rt.max_tokens);
     let mut stream = match rt.model.stream(request).await {
       Ok(stream) => stream,
       Err(err) => return Some(Stop::Failed(err.to_string())),
@@ -951,10 +992,13 @@ impl Runtime {
   /// What this session offers the model, in a stable order — a tool set that
   /// shuffled between requests would be a different prompt every time.
   async fn definitions(&self) -> Result<Vec<ToolDefinition>, String> {
-    let mut definitions = self.tools.get_tool_defs(None).await.map_err(|err| err.to_string())?;
-    if let Some(allowed) = &self.allowed {
-      definitions.retain(|definition| allowed.iter().any(|name| name == &definition.name));
-    }
+    let mut definitions = self
+      .tools
+      .now()
+      .get_tool_defs(None)
+      .await
+      .map_err(|err| err.to_string())?;
+    definitions.retain(|definition| self.rules.permits(&definition.name));
     Ok(definitions)
   }
 
@@ -988,6 +1032,7 @@ impl Runtime {
     })));
     let result = self
       .tools
+      .now()
       .execute(&name, &call.function.arguments.to_string(), &mut context)
       .await;
 
@@ -1076,14 +1121,11 @@ fn mentions(line: &str, tool: &str) -> bool {
 ///
 /// A model told about `bash` and then refused it does not quietly do without:
 /// it tries, is refused, and says so instead of using what it does have.
-fn for_tools(prompt: &str, tools: Option<&[String]>) -> String {
-  let Some(tools) = tools else {
-    return prompt.to_string();
-  };
+fn for_tools(prompt: &str, tools: &crate::tools::Rules) -> String {
   let gone: Vec<&str> = crate::tools::BUILT_IN
     .iter()
     .copied()
-    .filter(|name| !tools.iter().any(|tool| tool == name))
+    .filter(|name| !tools.permits(name))
     .collect();
   if gone.is_empty() {
     return prompt.to_string();
@@ -1095,7 +1137,7 @@ fn for_tools(prompt: &str, tools: Option<&[String]>) -> String {
     .join("\n")
 }
 
-fn default_system_prompt(cwd: &Path, tools: Option<&[String]>) -> String {
+fn default_system_prompt(cwd: &Path, tools: &crate::tools::Rules) -> String {
   let mut prompt = for_tools(
     "You are an expert coding assistant operating inside a minimal terminal coding agent. \
          You help users by reading files, executing commands, editing code, and writing new files.\n\n\
@@ -1249,6 +1291,7 @@ mod tests {
         cwd: std::env::temp_dir(),
       })
       .run();
+    let tools = Tools::new(tools);
     Arc::new(Runtime {
       model: Arc::new(Scripted {
         turns: Mutex::new(turns.into()),
@@ -1257,7 +1300,7 @@ mod tests {
       tools,
       preamble: String::new(),
       compaction: TEST_SETTINGS,
-      allowed: None,
+      rules: Default::default(),
       relay_images: false,
       max_tokens: None,
     })
@@ -1452,7 +1495,7 @@ mod tests {
       max_tokens: None,
       compaction: TEST_SETTINGS,
       vision: true,
-      tools: None,
+      tools: Default::default(),
     };
     let (tx, mut rx) = mpsc::unbounded_channel();
     let agent = build_agents(&cfg, Path::new("/tmp"), &Host::new(tx.clone()), &Default::default())
@@ -1506,6 +1549,7 @@ mod tests {
         AgentEvent::Compacted(_) => "compacted".into(),
         AgentEvent::Models(_) => "models".into(),
         AgentEvent::Show(_) => "asking".into(),
+        AgentEvent::Mcp { .. } => "mcp".into(),
       })
       .collect();
     assert!(names.contains(&"call:bash".to_string()), "{names:?}");
@@ -1598,7 +1642,7 @@ mod tests {
       max_tokens: None,
       compaction: TEST_SETTINGS,
       vision: true,
-      tools: None,
+      tools: Default::default(),
     };
     let (tx, mut rx) = mpsc::unbounded_channel();
     let agents = build_agents(&cfg, Path::new("/tmp"), &Host::new(tx.clone()), &Default::default()).unwrap();
@@ -1737,14 +1781,18 @@ mod tests {
 
   #[test]
   fn the_prompt_stops_speaking_for_a_tool_the_session_does_not_have() {
-    let all = default_system_prompt(Path::new("/work"), None);
+    let rules = |allow: &[&str], deny: &[&str]| crate::tools::Rules {
+      allow: allow.iter().map(|s| s.to_string()).collect(),
+      deny: deny.iter().map(|s| s.to_string()).collect(),
+    };
+    let all = default_system_prompt(Path::new("/work"), &rules(&[], &[]));
     for tool in crate::tools::BUILT_IN {
       assert!(all.contains(&format!("- {tool}:")), "{tool} is introduced by default");
     }
 
     // A model told about `bash` and then refused it tries anyway and reports
     // being refused, instead of using what it does have.
-    let reading = default_system_prompt(Path::new("/work"), Some(&["read".to_string()]));
+    let reading = default_system_prompt(Path::new("/work"), &rules(&["read"], &[]));
     assert!(reading.contains("- read: Read file contents"));
     for gone in [
       "- bash:",
@@ -1766,11 +1814,14 @@ mod tests {
 
     // A list that leaves the built-in five alone changes nothing, however
     // many other tools it names.
-    let with_mcp = default_system_prompt(
-      Path::new("/work"),
-      Some(crate::tools::BUILT_IN.map(str::to_string).as_ref()),
-    );
-    assert_eq!(with_mcp, all);
+    let mut five = crate::tools::BUILT_IN.to_vec();
+    five.push("fetch");
+    assert_eq!(default_system_prompt(Path::new("/work"), &rules(&five, &[])), all);
+    assert_eq!(default_system_prompt(Path::new("/work"), &rules(&[], &["fetch"])), all);
+    // And refusing one is the same as allowing the rest.
+    let no_bash = default_system_prompt(Path::new("/work"), &rules(&[], &["bash"]));
+    assert!(!no_bash.contains("- bash:"), "{no_bash}");
+    assert!(no_bash.contains("- read:"), "{no_bash}");
   }
 
   #[test]
@@ -1856,10 +1907,10 @@ mod tests {
     let recording = Arc::new(Recording::default());
     let runtime = Arc::new(Runtime {
       model: recording.clone(),
-      tools: ToolServer::new().run(),
+      tools: Tools::new(ToolServer::new().run()),
       preamble: String::new(),
       compaction: TEST_SETTINGS,
-      allowed: None,
+      rules: Default::default(),
       relay_images: false,
       max_tokens: Some(99),
     });
@@ -1908,7 +1959,7 @@ mod tests {
           max_tokens: None,
           compaction: TEST_SETTINGS,
           vision: true,
-          tools: None,
+          tools: Default::default(),
         };
         let (tx, _rx) = mpsc::unbounded_channel();
         let agents = build_agents(&cfg, Path::new("/tmp"), &Host::new(tx), &Default::default())
@@ -1935,7 +1986,7 @@ mod tests {
         max_tokens: None,
         compaction: TEST_SETTINGS,
         vision: true,
-        tools: None,
+        tools: Default::default(),
       };
       let err = list_models(&cfg).await.expect_err("nothing is listening");
       assert!(!format!("{err:#}").is_empty(), "{provider:?} said nothing");
@@ -1961,7 +2012,7 @@ mod tests {
       max_tokens: None,
       compaction: TEST_SETTINGS,
       vision: true,
-      tools: None,
+      tools: Default::default(),
     };
     let (tx, mut rx) = mpsc::unbounded_channel();
     let agent = build_agents(&cfg, Path::new("/tmp"), &Host::new(tx.clone()), &Default::default())
@@ -2008,7 +2059,7 @@ mod tests {
       max_tokens: None,
       compaction: TEST_SETTINGS,
       vision: true,
-      tools: None,
+      tools: Default::default(),
     };
     let (tx, mut rx) = mpsc::unbounded_channel();
     let agent = build_agents(&cfg, Path::new("/tmp"), &Host::new(tx.clone()), &Default::default())

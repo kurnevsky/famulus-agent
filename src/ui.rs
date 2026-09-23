@@ -2282,6 +2282,12 @@ impl App {
       AgentEvent::Error(err) => {
         self.entries.push(Entry::Error(err));
       }
+      // A server's tools changed under the session: said where the servers
+      // were first said, and counted where they are counted.
+      AgentEvent::Mcp { note, servers, tools } => {
+        self.entries.push(Entry::Info(note));
+        self.mcp = (servers, tools);
+      }
       // One model call, counted as it happens: a run that takes twenty of
       // them moves the footer twenty times rather than sitting still until
       // it is over.

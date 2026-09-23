@@ -368,7 +368,8 @@ fn answer_to(body: &str) -> String {
 
 /// An MCP server over stdin and stdout, in as little as it takes: the three
 /// requests a client makes of one, answered by hand — and one it makes of the
-/// client, when `book` needs the user to say something.
+/// client, when `book` needs the user to say something. `grow` changes what it
+/// offers, and says so the way the protocol has it.
 #[cfg(feature = "mcp")]
 const MCP_SERVER: &str = r#"
 import json, sys
@@ -388,6 +389,21 @@ TOOLS = [{
 }, {
   "name": "book",
   "description": "Book seats, asking the user how many.",
+  "inputSchema": {"type": "object", "properties": {}},
+}, {
+  "name": "grow",
+  "description": "Offer other tools than these.",
+  "inputSchema": {"type": "object", "properties": {}},
+}]
+
+# What `grow` leaves it offering: itself gone, and two it did not have.
+GROWN = [tool for tool in TOOLS if tool["name"] != "grow"] + [{
+  "name": "radar",
+  "description": "Where the rain is now.",
+  "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+}, {
+  "name": "tide",
+  "description": "When the sea comes in.",
   "inputSchema": {"type": "object", "properties": {}},
 }]
 
@@ -426,7 +442,7 @@ while True:
         asks = "form" in (params.get("capabilities") or {}).get("elicitation", {})
         result = {
             "protocolVersion": params.get("protocolVersion", "2025-06-18"),
-            "capabilities": {"tools": {"listChanged": False}},
+            "capabilities": {"tools": {"listChanged": True}},
             "serverInfo": {"name": "mock-weather", "version": "1"},
         }
     elif method == "tools/list":
@@ -442,6 +458,16 @@ while True:
                 while reply.get("id") != "form":
                     reply = read()
                 answer = json.dumps(reply.get("result"))
+        elif params.get("name") == "grow":
+            TOOLS = GROWN
+            send({"method": "notifications/tools/list_changed"})
+            # The client asks for the new list, and has it before this call
+            # comes back: what the model is asked next knows of the change.
+            ask = read()
+            while ask.get("method") != "tools/list":
+                ask = read()
+            send({"id": ask["id"], "result": {"tools": TOOLS}})
+            answer = "grown"
         elif params.get("name") == "flood":
             # A server under no obligation to be brief.
             answer = "\n".join("line %d" % i for i in range(1, arguments["lines"] + 1))
@@ -2472,7 +2498,7 @@ fn a_tool_from_an_mcp_server_is_offered_called_and_drawn_like_any_other() {
     // command that starts it in a terminal. It offers two tools; this session
     // wants one of them.
     format!(
-      "[weather]\ncommand = \"python3 '{}'\"\ntimeout = 10\nexcept = [\"forecast\", \"flood\", \"book\"]\n",
+      "[weather]\ncommand = \"python3 '{}'\"\ntimeout = 10\nexcept = [\"forecast\", \"flood\", \"book\", \"grow\"]\n",
       server.display()
     ),
   )
@@ -2538,6 +2564,84 @@ fn a_tool_from_an_mcp_server_is_offered_called_and_drawn_like_any_other() {
       .expect("the field on screen");
     assert!(field.contains("\u{1b}[38;5;"), "highlighted: {field:?}");
   }
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A server that says its tools have changed has them fetched again and put
+/// in place of the ones it had: the next request offers the new ones and not
+/// the old, the transcript says what changed, and the footer counts them.
+/// What the session was told about tools holds for the new ones too.
+#[test]
+#[cfg(feature = "mcp")]
+fn a_server_that_changes_its_tools_has_the_new_ones_offered() {
+  if !have_tmux() || !have_python() {
+    return;
+  }
+  let dir = scratch("mcp-changed");
+  let server = dir.join("server.py");
+  std::fs::write(&server, MCP_SERVER).expect("a server to run");
+  let config = dir.join("mcp.toml");
+  std::fs::write(
+    &config,
+    format!(
+      "[weather]\ncommand = \"python3 '{}'\"\ntimeout = 10\ntools = [\"weather\", \"grow\", \"radar\", \"tide\"]\n",
+      server.display()
+    ),
+  )
+  .expect("a config to read");
+
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "Growing. ",
+      tool: "grow",
+      args: serde_json::json!({}),
+    },
+    Turn::Call {
+      say: "Looking. ",
+      tool: "radar",
+      args: serde_json::json!({ "city": "Oslo" }),
+    },
+    Turn::Say("Rain in Oslo."),
+  ]);
+  // `radar` and `tide` are not there yet when the session starts, and the
+  // rule against `tide` is still a rule when they are.
+  let term = Term::start(
+    "mcp-changed",
+    &provider,
+    &["--no-session", "--mcp-config", &shell(&config), "--no-tools", "tide"],
+  );
+  term.wait_for("MCP weather: 2 tools");
+  term.wait_for("1 mcp, 2 tools");
+  term.submit("grow, then look for rain");
+  term.wait_for("Rain in Oslo.");
+  term.wait_for("MCP weather: now 3 tools, new: radar, tide, gone: grow");
+  term.wait_for("1 mcp, 3 tools");
+  // What the last request offered, apart from the calls its history holds.
+  let body = provider.bodies().last().cloned().expect("a request");
+  let request: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+  let offered: Vec<&str> = request["tools"]
+    .as_array()
+    .expect("tools")
+    .iter()
+    .filter_map(|tool| tool["function"]["name"].as_str())
+    .collect();
+  let last = offered
+    .iter()
+    .map(|name| format!(r#""name":"{name}""#))
+    .collect::<String>();
+  assert!(last.contains(r#""name":"radar""#), "the new tool is offered: {last}");
+  assert!(
+    !last.contains(r#""name":"grow""#),
+    "the one it took back is not: {last}"
+  );
+  assert!(
+    !last.contains(r#""name":"tide""#),
+    "nor one the session refused: {last}"
+  );
+  assert!(last.contains(r#""name":"weather""#), "and the rest stay: {last}");
+  let screen = term.screen();
+  let call = screen.find("⚙ radar").expect("called like any other");
+  assert!(screen[call..].contains("Oslo"), "and answered: {screen}");
   let _ = std::fs::remove_dir_all(&dir);
 }
 

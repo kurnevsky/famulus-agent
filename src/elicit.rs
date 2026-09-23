@@ -21,7 +21,7 @@ use rmcp::model::{
   ElicitationCapability, ElicitationSchema, EnumSchema, ErrorData, FormElicitationCapability, MultiSelectEnumSchema,
   PrimitiveSchemaDefinition, SingleSelectEnumSchema,
 };
-use rmcp::service::{RequestContext, RoleClient};
+use rmcp::service::{NotificationContext, RequestContext, RoleClient};
 use serde_json::{Map, Value};
 
 use crate::ask::{Answer, Choice, Dialog, Question, Refusal};
@@ -35,6 +35,8 @@ pub struct Client {
   /// The server's name in the file, which is who the form says is asking.
   pub server: String,
   pub host: Host,
+  /// Where what it offers is kept, for when it says that has changed.
+  pub watch: crate::mcp::Watch,
 }
 
 impl rmcp::ClientHandler for Client {
@@ -61,6 +63,10 @@ impl rmcp::ClientHandler for Client {
         .await
         .unwrap_or_else(|| ElicitResult::new(ElicitationAction::Cancel)),
     )
+  }
+
+  async fn on_tool_list_changed(&self, context: NotificationContext<RoleClient>) {
+    self.watch.changed(&context.peer).await;
   }
 
   fn get_info(&self) -> ClientInfo {

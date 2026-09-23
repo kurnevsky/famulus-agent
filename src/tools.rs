@@ -32,6 +32,24 @@ pub const BUILT_IN: [&str; 5] = [
   AskTool::NAME,
 ];
 
+/// What a session was told about which tools to offer: `--tools` and
+/// `--no-tools`, kept as they were said rather than as the names they came
+/// to when the session started, so a tool an MCP server offers later is held
+/// to them too.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Rules {
+  pub allow: Vec<String>,
+  pub deny: Vec<String>,
+}
+
+impl Rules {
+  /// Whether `name` is offered: allowed, if there is an allow-list, and not
+  /// refused — the same way round as `choose`.
+  pub fn permits(&self, name: &str) -> bool {
+    (self.allow.is_empty() || self.allow.iter().any(|n| n == name)) && !self.deny.iter().any(|n| n == name)
+  }
+}
+
 /// Which of `available` to offer the model, given what was allowed and what
 /// was refused, with the names asked for that nothing answers to.
 ///

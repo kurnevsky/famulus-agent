@@ -387,6 +387,15 @@ beats refusing to start. A tool named like one of those five is
 left alone: the model is told about `read`, `write`, `edit`, `bash` and `ask`
 in the system prompt, and cannot say which of two it meant.
 
+A server can say its tools have changed while the session runs
+(`notifications/tools/list_changed`), and they are asked for again and put in
+place of the ones it had — held to its `tools` and `except`, and to
+`--tools` and `--no-tools`, the way the first list was. The transcript says
+what changed — `MCP weather: now 3 tools, new: radar, tide, gone: grow` — and
+the footer counts them. The model is offered the new set from its next request
+on, even in the middle of a run. A new tool named like one already taken is
+refused, as at the start: the name stays with the tool that had it.
+
 ### Signing in
 
 An endpoint that wants a login answers with a 401, and fa signs in to it with

@@ -115,6 +115,15 @@ impl Host {
   }
 }
 
+impl Host {
+  /// Tell the UI something that is not a question: a server whose tools
+  /// changed, say. Nothing waits on it.
+  #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+  pub fn tell(&self, event: AgentEvent) {
+    let _ = self.tx.send(event);
+  }
+}
+
 /// A host whose first modal is handed to `answer`, standing in for the UI.
 #[cfg(test)]
 pub fn answered_by(answer: impl FnOnce(Box<dyn Modal>) + Send + 'static) -> Host {

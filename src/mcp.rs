@@ -181,23 +181,14 @@ pub fn load(paths: &[PathBuf], strict: bool) -> (Config, Vec<String>) {
 #[derive(Default)]
 pub struct Servers {
   #[cfg(feature = "mcp")]
-  running: Vec<Running>,
+  running: Vec<Service>,
+  catalog: Catalog,
   notes: Vec<String>,
 }
 
 /// A connection to one server, answering what it asks through `elicit`.
 #[cfg(feature = "mcp")]
 type Service = rmcp::service::RunningService<rmcp::service::RoleClient, crate::elicit::Client>;
-
-/// One server that came up.
-#[cfg(feature = "mcp")]
-struct Running {
-  service: Service,
-  /// What it offers, narrowed to what was asked of it.
-  tools: Vec<rmcp::model::Tool>,
-  /// How long one of its calls may take.
-  timeout: Option<u64>,
-}
 
 impl Servers {
   /// What to say in the transcript about the servers this session has: which
@@ -206,41 +197,268 @@ impl Servers {
     &self.notes
   }
 
-  /// How many servers came up, and how many tools they brought between them.
+  /// What the servers offer, now and as it changes.
+  pub fn catalog(&self) -> &Catalog {
+    &self.catalog
+  }
+}
+
+// ---------------------------------------------------------------- the catalog
+
+/// What every server of the session offers at the moment, in the order the
+/// file names them — which is the order a name two of them offer goes to.
+///
+/// A server can say its tools have changed while the session runs, and this
+/// is where the new ones are put. Whoever built the agent's tools from it is
+/// told, and builds them again.
+#[derive(Clone, Default)]
+pub struct Catalog(#[cfg_attr(not(feature = "mcp"), allow(dead_code))] std::sync::Arc<Shelves>);
+
+/// Building the agent's tools again, from what is on offer now.
+#[cfg(feature = "mcp")]
+type Rebuild = Box<dyn Fn(&Catalog) + Send + Sync>;
+
+#[derive(Default)]
+struct Shelves {
+  #[cfg(feature = "mcp")]
+  offers: std::sync::Mutex<Vec<Offer>>,
+  /// What to do when an offer changes, once there are agents to tell.
+  #[cfg(feature = "mcp")]
+  changed: std::sync::OnceLock<Rebuild>,
+}
+
+/// What one server offers, and what calling it takes.
+#[cfg(feature = "mcp")]
+struct Offer {
+  server: String,
+  /// What it offers, narrowed to what was asked of it.
+  tools: Vec<rmcp::model::Tool>,
+  peer: rmcp::service::ServerSink,
+  /// How long one of its calls may take.
+  timeout: Option<u64>,
+}
+
+impl Catalog {
+  /// How many servers came up, and how many tools they offer between them.
   pub fn count(&self) -> (usize, usize) {
     #[cfg(feature = "mcp")]
-    return (
-      self.running.len(),
-      self.running.iter().map(|server| server.tools.len()).sum(),
-    );
+    {
+      let offers = self.offers();
+      (offers.len(), offers.iter().map(|offer| offer.tools.len()).sum())
+    }
     #[cfg(not(feature = "mcp"))]
     (0, 0)
   }
 
-  /// Every tool the session's servers brought, for a list that names tools
-  /// without knowing where each came from.
+  /// Every tool the servers offer, for a list that names tools without
+  /// knowing where each came from.
   pub fn tool_names(&self) -> Vec<String> {
     #[cfg(feature = "mcp")]
     return self
-      .running
+      .offers()
       .iter()
-      .flat_map(|server| server.tools.iter().map(|tool| tool.name.to_string()))
+      .flat_map(|offer| offer.tools.iter().map(|tool| tool.name.to_string()))
       .collect();
     #[cfg(not(feature = "mcp"))]
     Vec::new()
+  }
+
+  /// Hand every tool on offer to the tools being built.
+  pub fn attach(&self, server: rig_agent::tool::server::ToolServer) -> rig_agent::tool::server::ToolServer {
+    #[cfg(feature = "mcp")]
+    return self.offers().iter().fold(server, |server, offer| {
+      // Rig bounds a call at five minutes unless told otherwise. A server can
+      // say its own number, and zero lets a call take as long as it takes.
+      let timeout = match offer.timeout {
+        Some(0) => None,
+        Some(seconds) => Some(std::time::Duration::from_secs(seconds)),
+        None => Some(rig_agent::tool::rmcp::DEFAULT_MCP_TOOL_TIMEOUT),
+      };
+      server.rmcp_tools_with_timeout(offer.tools.clone(), offer.peer.clone(), timeout)
+    });
+    #[cfg(not(feature = "mcp"))]
+    server
+  }
+
+  /// Have `rebuild` run whenever what is on offer changes. Only the first
+  /// caller is heard: there is one set of agents to build tools for.
+  pub fn on_change(&self, rebuild: impl Fn(&Catalog) + Send + Sync + 'static) {
+    #[cfg(feature = "mcp")]
+    let _ = self.0.changed.set(Box::new(rebuild));
+    #[cfg(not(feature = "mcp"))]
+    drop(rebuild);
+  }
+
+  #[cfg(feature = "mcp")]
+  fn offers(&self) -> std::sync::MutexGuard<'_, Vec<Offer>> {
+    // Nothing holding it panics; a poisoned lock is still the list it was.
+    self.0.offers.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+  }
+
+  /// The names a server may not take: the built-in tools', and every other
+  /// server's.
+  #[cfg(feature = "mcp")]
+  fn taken(&self, besides: &str) -> Vec<String> {
+    let offers = self.offers();
+    let others = offers
+      .iter()
+      .filter(|offer| offer.server != besides)
+      .flat_map(|offer| offer.tools.iter().map(|tool| tool.name.to_string()));
+    crate::tools::BUILT_IN
+      .map(str::to_string)
+      .into_iter()
+      .chain(others)
+      .collect()
+  }
+
+  /// The tools `server` offers now, in place of what it offered before, and
+  /// the names of those it offered before.
+  #[cfg(feature = "mcp")]
+  fn offer(
+    &self,
+    server: &str,
+    tools: Vec<rmcp::model::Tool>,
+    peer: rmcp::service::ServerSink,
+    timeout: Option<u64>,
+  ) -> Vec<String> {
+    let before = {
+      let mut offers = self.offers();
+      let offer = Offer {
+        server: server.to_string(),
+        tools,
+        peer,
+        timeout,
+      };
+      match offers.iter_mut().find(|offer| offer.server == server) {
+        Some(old) => std::mem::replace(old, offer).tools,
+        None => {
+          offers.push(offer);
+          Vec::new()
+        }
+      }
+    };
+    // Outside the lock, since building tools reads what is on offer.
+    if let Some(rebuild) = self.0.changed.get() {
+      rebuild(self);
+    }
+    before.iter().map(|tool| tool.name.to_string()).collect()
+  }
+}
+
+/// What a server offers, narrowed to what its table asks of it and to the
+/// names nothing else has taken.
+#[cfg(feature = "mcp")]
+struct Picked {
+  tools: Vec<rmcp::model::Tool>,
+  /// Named in `tools` or `except` and offered by no tool.
+  unknown: Vec<String>,
+  /// Offered, but under a name already in use.
+  clashed: Vec<String>,
+}
+
+#[cfg(feature = "mcp")]
+fn pick(server: &Server, tools: Vec<rmcp::model::Tool>, taken: &[String]) -> Picked {
+  // A name in neither list is a name nothing answers to — usually a typo,
+  // and a typo in a list like this is a tool quietly left in or out.
+  let offered: Vec<String> = tools.iter().map(|tool| tool.name.to_string()).collect();
+  let (wanted, unknown) = crate::tools::choose(&offered, &server.tools, &server.except);
+  let tools: Vec<_> = match &wanted {
+    Some(wanted) => tools
+      .into_iter()
+      .filter(|tool| wanted.iter().any(|name| *name == tool.name))
+      .collect(),
+    None => tools,
+  };
+  // A tool cannot be had twice under one name: the model would have no way
+  // to say which it meant, and the five the system prompt describes are the
+  // ones it was told about.
+  let (tools, clashed): (Vec<_>, Vec<_>) = tools
+    .into_iter()
+    .partition(|tool| !taken.iter().any(|name| *name == tool.name));
+  Picked {
+    tools,
+    unknown,
+    clashed: clashed.iter().map(|tool| tool.name.to_string()).collect(),
+  }
+}
+
+/// "1 tool", "3 tools".
+#[cfg(feature = "mcp")]
+fn tools_count(n: usize) -> String {
+  match n {
+    1 => "1 tool".to_string(),
+    n => format!("{n} tools"),
+  }
+}
+
+/// What one server's connection needs to put what it offers on the shelf
+/// again, when it says that has changed.
+#[cfg(feature = "mcp")]
+#[derive(Clone)]
+pub struct Watch {
+  server: String,
+  /// Its table, for the `tools` and `except` it narrows what it offers by.
+  table: std::sync::Arc<Server>,
+  catalog: Catalog,
+  host: crate::modal::Host,
+  /// One refresh at a time: two lists fetched at once could land in either
+  /// order, and the older one would win.
+  busy: std::sync::Arc<tokio::sync::Mutex<()>>,
+}
+
+#[cfg(feature = "mcp")]
+impl Watch {
+  /// The server says its tools have changed: ask it for them, and put them
+  /// in place of the ones it had.
+  pub async fn changed(&self, peer: &rmcp::service::ServerSink) {
+    let _one = self.busy.lock().await;
+    let name = &self.server;
+    let note = match peer.list_all_tools().await {
+      Err(err) => format!("MCP {name}: said its tools changed, but could not list them: {err}"),
+      Ok(tools) => {
+        let picked = pick(&self.table, tools, &self.catalog.taken(name));
+        let now: Vec<String> = picked.tools.iter().map(|tool| tool.name.to_string()).collect();
+        let before = self.catalog.offer(name, picked.tools, peer.clone(), self.table.timeout);
+        let gained: Vec<&str> = now.iter().filter(|n| !before.contains(n)).map(String::as_str).collect();
+        let lost: Vec<&str> = before.iter().filter(|n| !now.contains(n)).map(String::as_str).collect();
+        let mut note = format!("MCP {name}: now {}", tools_count(now.len()));
+        if !gained.is_empty() {
+          note.push_str(&format!(", new: {}", gained.join(", ")));
+        }
+        if !lost.is_empty() {
+          note.push_str(&format!(", gone: {}", lost.join(", ")));
+        }
+        if !picked.clashed.is_empty() {
+          note.push_str(&format!(
+            "; not taking {} (name already used)",
+            picked.clashed.join(", ")
+          ));
+        }
+        note
+      }
+    };
+    let (servers, tools) = self.catalog.count();
+    self.host.tell(crate::agent::AgentEvent::Mcp { note, servers, tools });
   }
 }
 
 #[cfg(feature = "mcp")]
 pub async fn connect(config: Config, host: &crate::modal::Host) -> Servers {
   let mut servers = Servers::default();
-  let mut taken: Vec<String> = crate::tools::BUILT_IN.map(str::to_string).to_vec();
   for (name, server) in config {
+    let table = std::sync::Arc::new(server);
     let client = crate::elicit::Client {
       server: name.clone(),
       host: host.clone(),
+      watch: Watch {
+        server: name.clone(),
+        table: table.clone(),
+        catalog: servers.catalog.clone(),
+        host: host.clone(),
+        busy: Default::default(),
+      },
     };
-    let running = match start(&name, &server, client, &mut servers.notes).await {
+    let running = match start(&name, &table, client, &mut servers.notes).await {
       Ok(running) => running,
       Err(err) => {
         servers.notes.push(format!("MCP {name}: {err:#}"));
@@ -254,49 +472,25 @@ pub async fn connect(config: Config, host: &crate::modal::Host) -> Servers {
         continue;
       }
     };
-    // What the server offers, narrowed to what was asked of it. A name in
-    // neither list is a name nothing answers to — usually a typo, and a typo
-    // in a list like this is a tool quietly left in or out.
-    let offered: Vec<String> = tools.iter().map(|tool| tool.name.to_string()).collect();
-    let (wanted, unknown) = crate::tools::choose(&offered, &server.tools, &server.except);
-    if !unknown.is_empty() {
+    let picked = pick(&table, tools, &servers.catalog.taken(&name));
+    if !picked.unknown.is_empty() {
       servers
         .notes
-        .push(format!("MCP {name}: offers no {}", unknown.join(", ")));
+        .push(format!("MCP {name}: offers no {}", picked.unknown.join(", ")));
     }
-    let tools: Vec<_> = match &wanted {
-      Some(wanted) => tools
-        .into_iter()
-        .filter(|tool| wanted.iter().any(|name| *name == tool.name))
-        .collect(),
-      None => tools,
-    };
-    // A tool cannot be had twice under one name: the model would have no way
-    // to say which it meant, and the five the system prompt describes are the
-    // ones it was told about.
-    let (tools, clashed): (Vec<_>, Vec<_>) = tools
-      .into_iter()
-      .partition(|tool| !taken.iter().any(|name| *name == tool.name));
-    taken.extend(tools.iter().map(|tool| tool.name.to_string()));
-    if !clashed.is_empty() {
-      let names: Vec<String> = clashed.iter().map(|tool| tool.name.to_string()).collect();
+    if !picked.clashed.is_empty() {
       servers.notes.push(format!(
         "MCP {name}: not taking {} (name already used)",
-        names.join(", ")
+        picked.clashed.join(", ")
       ));
     }
-    servers.notes.push(format!(
-      "MCP {name}: {}",
-      match tools.len() {
-        1 => "1 tool".to_string(),
-        n => format!("{n} tools"),
-      }
-    ));
-    servers.running.push(Running {
-      service: running,
-      tools,
-      timeout: server.timeout,
-    });
+    servers
+      .notes
+      .push(format!("MCP {name}: {}", tools_count(picked.tools.len())));
+    servers
+      .catalog
+      .offer(&name, picked.tools, running.peer().clone(), table.timeout);
+    servers.running.push(running);
   }
   servers
 }
@@ -507,29 +701,9 @@ fn headers(
     .collect()
 }
 
-/// Hand every tool that came up to the agent being built.
-#[cfg(feature = "mcp")]
-pub fn attach(server: rig_agent::tool::server::ToolServer, servers: &Servers) -> rig_agent::tool::server::ToolServer {
-  servers.running.iter().fold(server, |server, running| {
-    // Rig bounds a call at five minutes unless told otherwise. A server can
-    // say its own number, and zero lets a call take as long as it takes.
-    let timeout = match running.timeout {
-      Some(0) => None,
-      Some(seconds) => Some(std::time::Duration::from_secs(seconds)),
-      None => Some(rig_agent::tool::rmcp::DEFAULT_MCP_TOOL_TIMEOUT),
-    };
-    server.rmcp_tools_with_timeout(running.tools.clone(), running.service.peer().clone(), timeout)
-  })
-}
-
 #[cfg(not(feature = "mcp"))]
 pub async fn connect(_config: Config, _host: &crate::modal::Host) -> Servers {
   Servers::default()
-}
-
-#[cfg(not(feature = "mcp"))]
-pub fn attach(server: rig_agent::tool::server::ToolServer, _servers: &Servers) -> rig_agent::tool::server::ToolServer {
-  server
 }
 
 #[cfg(test)]

@@ -198,7 +198,7 @@ async fn main() -> Result<()> {
     max_tokens: cli.max_tokens.or(file.max_tokens),
     vision: !(cli.no_vision || file.no_vision),
     // Worked out below, once the MCP servers have said what they brought.
-    tools: None,
+    tools: Default::default(),
     compaction: compaction::Settings {
       enabled: !(cli.no_compaction || file.no_compaction),
       // What the flag says, or the fallback until the provider is asked what
@@ -253,7 +253,7 @@ async fn main() -> Result<()> {
   let available: Vec<String> = tools::BUILT_IN
     .iter()
     .map(|name| name.to_string())
-    .chain(servers.tool_names())
+    .chain(servers.catalog().tool_names())
     .collect();
   let (allowed, unknown) = tools::choose(&available, &tools, &no_tools);
   let mut notes = notes;
@@ -269,7 +269,12 @@ async fn main() -> Result<()> {
       false => format!("Tools this session: {}.", allowed.join(", ")),
     });
   }
-  cfg.tools = allowed;
+  // Kept as it was said rather than as the names it comes to now, so a tool
+  // a server offers later is held to it too.
+  cfg.tools = tools::Rules {
+    allow: tools,
+    deny: no_tools,
+  };
 
   let agents = agent::build_agents(&cfg, &cwd, &host, &servers)?;
   let app = ui::App::new(
@@ -283,7 +288,7 @@ async fn main() -> Result<()> {
       store,
       start,
       notes,
-      mcp: servers.count(),
+      mcp: servers.catalog().count(),
       bell: !(cli.no_bell || file.no_bell),
     },
   );
