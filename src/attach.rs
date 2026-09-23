@@ -61,16 +61,31 @@ pub enum State {
   NotAnImage,
 }
 
-/// Every `@path` in `text`, in the order they are written.
+/// A word that starts with a sigil, `@` or `&`, as it stands in the input
+/// box: what the popup completes, whether or not it attaches anything.
+pub struct Word<'a> {
+  /// Byte range of the word in the text, sigil and quotes included.
+  pub range: (usize, usize),
+  pub sigil: char,
+  /// What follows the sigil, quotes off.
+  pub raw: &'a str,
+  pub quoted: bool,
+}
+
+/// Every word in `text` that starts with `@` or `&`, in the order they are
+/// written, the sigil on its own included.
 ///
-/// A token starts a word: an email address is not an attachment. A path with
-/// spaces goes in quotes, which is also how a dropped file is written down.
-pub fn tokens(text: &str, cwd: &Path) -> Vec<Token> {
+/// A sigil starts a word: an email address, or `a&b`, is not one. A word
+/// with spaces goes in quotes, which is also how a dropped file is written
+/// down.
+pub fn words(text: &str) -> Vec<Word<'_>> {
   let mut out = Vec::new();
   let mut at = 0;
-  while let Some(found) = text[at..].find('@') {
+  while let Some(found) = text[at..].find(['@', '&']) {
     let start = at + found;
-    at = start + '@'.len_utf8();
+    // Both sigils are a byte long.
+    let sigil = char::from(text.as_bytes()[start]);
+    at = start + 1;
     if start > 0 && !text[..start].ends_with(char::is_whitespace) {
       continue;
     }
@@ -86,19 +101,40 @@ pub fn tokens(text: &str, cwd: &Path) -> Vec<Token> {
         (&rest[..end], end, false)
       }
     };
-    if raw.is_empty() {
-      continue;
-    }
     at += len;
-    out.push(probe(text, start, at, raw, quoted, cwd));
+    out.push(Word {
+      range: (start, at),
+      sigil,
+      raw,
+      quoted,
+    });
   }
   out
 }
 
+/// Every `@path` in `text`, in the order they are written.
+pub fn tokens(text: &str, cwd: &Path) -> Vec<Token> {
+  words(text)
+    .iter()
+    .filter(|word| word.sigil == '@' && !word.raw.is_empty())
+    .map(|word| probe(text, word, cwd))
+    .collect()
+}
+
+/// `target` written as a token after `sigil`: quoted when a space would end
+/// it early.
+pub fn written(sigil: char, target: &str) -> String {
+  match target.contains(' ') {
+    true => format!("{sigil}\"{target}\""),
+    false => format!("{sigil}{target}"),
+  }
+}
+
 /// Resolve one token, trying it without a sentence's punctuation when the
 /// path as written is not there.
-fn probe(text: &str, start: usize, end: usize, raw: &str, quoted: bool, cwd: &Path) -> Token {
-  let trimmed = match quoted {
+fn probe(text: &str, word: &Word, cwd: &Path) -> Token {
+  let (start, end, raw) = (word.range.0, word.range.1, word.raw);
+  let trimmed = match word.quoted {
     true => raw,
     false => raw.trim_end_matches(TRAILING),
   };
@@ -349,6 +385,34 @@ mod tests {
       let found = tokens("@~", &dir);
       assert!(matches!(found[0].state, State::Directory));
     }
+  }
+
+  #[test]
+  fn an_ampersand_word_is_a_word_but_not_an_attachment() {
+    let dir = dir("references");
+    let text = "what is on &notes:note://today? and &mut self, a&b";
+    let found: Vec<&str> = words(text)
+      .iter()
+      .map(|word| &text[word.range.0..word.range.1])
+      .collect();
+    assert_eq!(found, ["&notes:note://today?", "&mut"]);
+    assert!(tokens(text, &dir).is_empty());
+    // Quoted, a space is part of it.
+    assert_eq!(words("&\"notes:note://a b\"")[0].raw, "notes:note://a b");
+  }
+
+  #[test]
+  fn a_sigil_on_its_own_is_a_word_but_not_an_attachment() {
+    let dir = dir("bare");
+    // Not the working directory: `a @ b` is a sentence, not a directory
+    // that cannot be attached.
+    let text = "a @ b & c @\"";
+    let found: Vec<&str> = words(text)
+      .iter()
+      .map(|word| &text[word.range.0..word.range.1])
+      .collect();
+    assert_eq!(found, ["@", "&", "@\""]);
+    assert!(tokens(text, &dir).is_empty());
   }
 
   #[test]

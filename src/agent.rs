@@ -123,14 +123,10 @@ pub enum AgentEvent {
   /// What the provider says it offers, or why it would not say. Sent by the
   /// fetch `/model` starts, which is the only thing that asks.
   Models(Result<Vec<ModelInfo>, String>),
-  /// An MCP server's tools changed while the session ran: what to say about
-  /// it, and how many servers and tools there are now.
+  /// Something about an MCP server while the session ran — its tools
+  /// changed, or what it holds could not be listed: what to say about it.
   #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
-  Mcp {
-    note: String,
-    servers: usize,
-    tools: usize,
-  },
+  Mcp(String),
   Error(String),
 }
 
@@ -609,9 +605,12 @@ pub fn build_agents(cfg: &Config, cwd: &Path, host: &Host, servers: &crate::mcp:
     None => default_system_prompt(cwd, &cfg.tools),
   };
 
+  let catalog = servers.catalog();
   let (cwd, vision, host) = (cwd.to_path_buf(), cfg.vision, host.clone());
+  #[cfg(feature = "mcp")]
+  let servers = catalog.clone();
   let built_in = move || {
-    ToolServer::new()
+    let tools = ToolServer::new()
       .tool(ReadTool {
         cwd: cwd.clone(),
         vision,
@@ -619,11 +618,26 @@ pub fn build_agents(cfg: &Config, cwd: &Path, host: &Host, servers: &crate::mcp:
       .tool(WriteTool { cwd: cwd.clone() })
       .tool(EditTool { cwd: cwd.clone() })
       .tool(BashTool { cwd: cwd.clone() })
-      .tool(AskTool { host: host.clone() })
+      .tool(AskTool { host: host.clone() });
+    // Reading what the servers hold, when one of them holds anything: a
+    // session with no such server is not offered tools with nothing behind
+    // them.
+    #[cfg(feature = "mcp")]
+    let tools = match servers.has_resources() {
+      true => tools
+        .tool(crate::resources::ListResources {
+          catalog: servers.clone(),
+        })
+        .tool(crate::resources::ReadResource {
+          catalog: servers.clone(),
+          vision,
+        }),
+      false => tools,
+    };
+    tools
   };
   // Whatever the session's MCP servers offer, alongside the five the agent
   // brought: a tool is a tool, and the transcript draws them all the same.
-  let catalog = servers.catalog();
   let tools = Tools::new(catalog.attach(built_in()).run());
   // And whatever they offer later, in place of what they offered before.
   let again = tools.clone();
@@ -1549,7 +1563,7 @@ mod tests {
         AgentEvent::Compacted(_) => "compacted".into(),
         AgentEvent::Models(_) => "models".into(),
         AgentEvent::Show(_) => "asking".into(),
-        AgentEvent::Mcp { .. } => "mcp".into(),
+        AgentEvent::Mcp(_) => "mcp".into(),
       })
       .collect();
     assert!(names.contains(&"call:bash".to_string()), "{names:?}");

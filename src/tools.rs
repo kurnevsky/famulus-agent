@@ -90,9 +90,14 @@ impl From<std::io::Error> for ToolError {
 }
 
 impl ToolError {
+  #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+  pub fn new(message: impl Into<String>) -> Self {
+    ToolError(message.into())
+  }
+
   /// Our error messages are written for the model (e.g. "oldText not found"),
   /// so forward them instead of rig's redacted default feedback.
-  fn into_execution_error(self) -> ToolExecutionError {
+  pub fn into_execution_error(self) -> ToolExecutionError {
     ToolExecutionError::other(self.0.clone()).with_model_feedback(self.0)
   }
 }
@@ -106,21 +111,23 @@ impl ToolError {
 macro_rules! tool_args {
   ($args:ty) => {
     type Args = $args;
-    type Error = ToolError;
+    type Error = $crate::tools::ToolError;
 
     fn parameters(&self) -> serde_json::Value {
-      schema::<$args>()
+      $crate::tools::schema::<$args>()
     }
 
-    fn map_error(&self, error: ToolError) -> ToolExecutionError {
+    fn map_error(&self, error: $crate::tools::ToolError) -> rig_agent::tool::ToolExecutionError {
       error.into_execution_error()
     }
   };
 }
+#[cfg_attr(not(feature = "mcp"), allow(unused_imports))]
+pub(crate) use tool_args;
 
 /// JSON schema for a tool's arguments, stripped of metadata that some
 /// OpenAI-compatible servers reject (`$schema`, `title`, integer `format`).
-fn schema<T: JsonSchema>() -> serde_json::Value {
+pub fn schema<T: JsonSchema>() -> serde_json::Value {
   let mut value = serde_json::to_value(schemars::schema_for!(T)).expect("schema serializes");
   fn strip(v: &mut serde_json::Value) {
     match v {
@@ -513,7 +520,7 @@ mod capping_tests {
 /// pipeline cannot deliver are replaced by the reason.
 const NON_VISION_NOTE: &str = "[Current model does not support images. The image will be omitted from this request.]";
 
-fn read_image(bytes: &[u8], format: image::ImageFormat, vision: bool) -> Vec<ToolResultContent> {
+pub fn read_image(bytes: &[u8], format: image::ImageFormat, vision: bool) -> Vec<ToolResultContent> {
   let mime = format.to_mime_type();
   match images::process(bytes, format) {
     Ok(image) => {

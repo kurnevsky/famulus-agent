@@ -369,7 +369,8 @@ fn answer_to(body: &str) -> String {
 /// An MCP server over stdin and stdout, in as little as it takes: the three
 /// requests a client makes of one, answered by hand — and one it makes of the
 /// client, when `book` needs the user to say something. `grow` changes what it
-/// offers, and says so the way the protocol has it.
+/// offers, and says so the way the protocol has it. Started with `resources`,
+/// it has a note to read as well.
 #[cfg(feature = "mcp")]
 const MCP_SERVER: &str = r#"
 import json, sys
@@ -393,6 +394,10 @@ TOOLS = [{
 }, {
   "name": "grow",
   "description": "Offer other tools than these.",
+  "inputSchema": {"type": "object", "properties": {}},
+}, {
+  "name": "jot",
+  "description": "Write tomorrow's note.",
   "inputSchema": {"type": "object", "properties": {}},
 }]
 
@@ -432,6 +437,12 @@ def read():
         if line.strip():
             return json.loads(line)
 
+RESOURCES = "resources" in sys.argv[1:]
+NOTE = {"uri": "note://today", "name": "today", "mimeType": "text/plain", "description": "What is\n  on today."}
+DAY = {"uriTemplate": "note://{day}", "name": "day", "description": "The note for a day."}
+LATER = {"uri": "note://tomorrow", "name": "tomorrow", "mimeType": "text/plain"}
+NOTES = [NOTE]
+
 asks = False
 while True:
     message = read()
@@ -440,13 +451,25 @@ while True:
     method, params = message.get("method"), message.get("params") or {}
     if method == "initialize":
         asks = "form" in (params.get("capabilities") or {}).get("elicitation", {})
+        capabilities = {"tools": {"listChanged": True}}
+        if RESOURCES:
+            capabilities["resources"] = {}
         result = {
             "protocolVersion": params.get("protocolVersion", "2025-06-18"),
-            "capabilities": {"tools": {"listChanged": True}},
+            "capabilities": capabilities,
             "serverInfo": {"name": "mock-weather", "version": "1"},
         }
     elif method == "tools/list":
         result = {"tools": TOOLS}
+    elif method == "resources/list":
+        result = {"resources": NOTES}
+    elif method == "resources/templates/list":
+        result = {"resourceTemplates": [DAY]}
+    elif method == "resources/read":
+        if params.get("uri") != NOTE["uri"]:
+            send({"id": message["id"], "error": {"code": -32002, "message": "no such note"}})
+            continue
+        result = {"contents": [{"uri": NOTE["uri"], "mimeType": "text/plain", "text": "Buy milk."}]}
     elif method == "tools/call":
         arguments = params.get("arguments") or {}
         if params.get("name") == "book":
@@ -468,6 +491,10 @@ while True:
                 ask = read()
             send({"id": ask["id"], "result": {"tools": TOOLS}})
             answer = "grown"
+        elif params.get("name") == "jot":
+            NOTES = [NOTE, LATER]
+            send({"method": "notifications/resources/list_changed"})
+            answer = "jotted"
         elif params.get("name") == "flood":
             # A server under no obligation to be brief.
             answer = "\n".join("line %d" % i for i in range(1, arguments["lines"] + 1))
@@ -2498,7 +2525,7 @@ fn a_tool_from_an_mcp_server_is_offered_called_and_drawn_like_any_other() {
     // command that starts it in a terminal. It offers two tools; this session
     // wants one of them.
     format!(
-      "[weather]\ncommand = \"python3 '{}'\"\ntimeout = 10\nexcept = [\"forecast\", \"flood\", \"book\", \"grow\"]\n",
+      "[weather]\ncommand = \"python3 '{}'\"\ntimeout = 10\nexcept = [\"forecast\", \"flood\", \"book\", \"grow\", \"jot\"]\n",
       server.display()
     ),
   )
@@ -2532,6 +2559,11 @@ fn a_tool_from_an_mcp_server_is_offered_called_and_drawn_like_any_other() {
     !provider.sent("forecast"),
     "a tool a server was asked to keep is never offered"
   );
+  // A server with no resources brings no tools for reading them.
+  assert!(
+    !provider.sent("read_resource"),
+    "nothing to read, so nothing to read it with"
+  );
   // And it reads in the transcript like any other tool: the call, then what
   // came back under it.
   let screen = term.screen();
@@ -2564,6 +2596,172 @@ fn a_tool_from_an_mcp_server_is_offered_called_and_drawn_like_any_other() {
       .expect("the field on screen");
     assert!(field.contains("\u{1b}[38;5;"), "highlighted: {field:?}");
   }
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A server with resources has the model offered two tools for them: one to
+/// list what there is, templates and all, and one to read it.
+#[test]
+#[cfg(feature = "mcp")]
+fn a_server_with_resources_has_them_listed_and_read() {
+  if !have_tmux() || !have_python() {
+    return;
+  }
+  let dir = scratch("mcp-resources");
+  let server = dir.join("server.py");
+  std::fs::write(&server, MCP_SERVER).expect("a server to run");
+  let config = dir.join("mcp.toml");
+  std::fs::write(
+    &config,
+    format!(
+      "[notes]\ncommand = \"python3 '{}' resources\"\ntimeout = 10\ntools = [\"weather\"]\n",
+      server.display()
+    ),
+  )
+  .expect("a config to read");
+
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "Looking. ",
+      tool: "list_resources",
+      args: serde_json::json!({}),
+    },
+    Turn::Call {
+      say: "Reading. ",
+      tool: "read_resource",
+      args: serde_json::json!({ "server": "notes", "uri": "note://today" }),
+    },
+    Turn::Call {
+      say: "And another. ",
+      tool: "read_resource",
+      args: serde_json::json!({ "server": "notes", "uri": "note://never" }),
+    },
+    Turn::Say("Milk it is."),
+  ]);
+  let term = Term::start(
+    "mcp-resources",
+    &provider,
+    &["--no-session", "--mcp-config", &shell(&config)],
+  );
+  term.wait_for("MCP notes: 1 tool");
+  term.submit("what is on today");
+  term.wait_for("Milk it is.");
+
+  let last = provider.bodies().last().cloned().expect("a request");
+  let request: serde_json::Value = serde_json::from_str(&last).expect("JSON");
+  let offered: Vec<&str> = request["tools"]
+    .as_array()
+    .expect("tools")
+    .iter()
+    .filter_map(|tool| tool["function"]["name"].as_str())
+    .collect();
+  assert!(offered.contains(&"list_resources"), "{offered:?}");
+  assert!(offered.contains(&"read_resource"), "{offered:?}");
+  // What the listing and the reads came back as, as the model was told.
+  let told: Vec<String> = request["messages"]
+    .as_array()
+    .expect("messages")
+    .iter()
+    .filter(|message| message["role"] == "tool")
+    .map(|message| message["content"].to_string())
+    .collect();
+  assert!(
+    told[0].contains("note://today — today (text/plain): What is on today."),
+    "a resource to a line: {told:?}"
+  );
+  assert!(
+    told[0].contains("note://{day} — day: The note for a day."),
+    "and its templates: {told:?}"
+  );
+  assert!(told[1].contains("Buy milk."), "what it read: {told:?}");
+  assert!(
+    told[2].contains("no such note"),
+    "and what the server said when it could not: {told:?}"
+  );
+  let screen = term.screen();
+  let call = screen.find("⚙ read_resource").expect("the call on screen");
+  assert!(screen[call..].contains("Buy milk."), "under it: {screen}");
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// What a server has to read can be named in a prompt as `&server:uri`,
+/// completed from what it lists by the same fuzzy match a path is, and sent
+/// as the reference it is written as, for the model to read. An `&` word
+/// whose first letter begins no server's name is left alone. A server whose list
+/// changes has the new one completed from.
+#[test]
+#[cfg(feature = "mcp")]
+fn a_resource_is_completed_after_an_ampersand_and_sent_as_a_reference() {
+  if !have_tmux() || !have_python() {
+    return;
+  }
+  let dir = scratch("mcp-attach");
+  let server = dir.join("server.py");
+  std::fs::write(&server, MCP_SERVER).expect("a server to run");
+  let config = dir.join("mcp.toml");
+  std::fs::write(
+    &config,
+    format!(
+      "[notes]\ncommand = \"python3 '{}' resources\"\ntimeout = 10\ntools = [\"jot\"]\n",
+      server.display()
+    ),
+  )
+  .expect("a config to read");
+  // Answering, the model writes tomorrow's note, which changes what the
+  // server has to read.
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "Jotting. ",
+      tool: "jot",
+      args: serde_json::json!({}),
+    },
+    Turn::Say("Milk it is."),
+  ]);
+  let term = Term::start(
+    "mcp-attach",
+    &provider,
+    &["--no-session", "--mcp-config", &shell(&config)],
+  );
+  term.wait_for("MCP notes: 1 tool");
+
+  // Everything the servers have, at a bare `&`; then matched the way a path
+  // is — the letters needing only to come in order, the first beginning
+  // the server's name.
+  term.type_in("what is on &");
+  term.wait_for("notes:note://today");
+  term.type_in("nday");
+  term.wait_for("notes:note://today");
+  term.wait_for("template");
+  term.type_in("Enter");
+  term.wait_for("│what is on &notes:note://today ");
+  // And code, which is no server's.
+  term.type_in(" for &mut self");
+  term.type_in("Enter");
+  let screen = term.wait_for("Milk it is.");
+  assert!(
+    screen.contains("❯ what is on &notes:note://today for &mut self"),
+    "the prompt as typed: {screen}"
+  );
+  assert!(!screen.contains("Not attached"), "nothing to attach: {screen}");
+
+  let body = provider.bodies().last().cloned().expect("a request");
+  let request: serde_json::Value = serde_json::from_str(&body).expect("JSON");
+  let user = request["messages"]
+    .as_array()
+    .expect("messages")
+    .iter()
+    .find(|message| message["role"] == "user")
+    .expect("the prompt")
+    .to_string();
+  assert!(
+    user.contains("what is on &notes:note://today for &mut self"),
+    "the prompt as typed: {user}"
+  );
+  assert!(!user.contains("Buy milk."), "a reference, not what it names: {user}");
+
+  // A server whose list changes is completed from the new one.
+  term.type_in("&notes:tom");
+  term.wait_for("note://tomorrow");
   let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3366,8 +3564,11 @@ fn the_at_popup_completes_a_path_and_a_full_path_attaches_too() {
     .save(term.dir.join("shots/red.png"))
     .expect("an image to complete to");
 
+  // A bare `@` lists the working directory at once, as `/` lists commands.
+  term.type_in("look at @");
+  term.wait_for("shots/");
   // The popup lists what a half-typed token could mean, sizes and all.
-  term.type_in("look at @shots/r");
+  term.type_in("shots/r");
   term.wait_for("red.png");
   term.wait_for("8×8");
   // Tab takes the row, and the border then says it resolved.

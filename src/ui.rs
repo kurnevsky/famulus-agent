@@ -191,8 +191,9 @@ pub struct Options {
   /// and what went wrong with the rest — said in the transcript, since there
   /// is nowhere else left to say it.
   pub notes: Vec<String>,
-  /// How many MCP servers came up, and how many tools they brought.
-  pub mcp: (usize, usize),
+  /// The MCP servers: how many there are and what they brought, and what an
+  /// `&token` is completed from.
+  pub catalog: crate::mcp::Catalog,
   /// Whether a question the model asks rings the terminal.
   pub bell: bool,
 }
@@ -222,15 +223,17 @@ const PATH_ROWS: usize = 20;
 enum Match {
   /// Index into `COMMANDS`.
   Command { index: usize, highlights: Vec<u32> },
-  /// A path an `@token` is reaching for: what the token becomes when it is
-  /// taken, how the row reads, and what the right-hand column says about it.
+  /// What a token is reaching for — a path after `@`, a resource after `&`:
+  /// what the token becomes when it is taken, how the row reads, and what
+  /// the right-hand column says about it.
   Path {
     /// The whole token, `@` and quotes and all.
     insert: String,
     /// The part of it the row shows and the query matched against.
     name: String,
     highlights: Vec<u32>,
-    /// Dimensions for an image, and nothing for a directory.
+    /// Dimensions for an image, a resource's type, and nothing for a
+    /// directory.
     meta: String,
     /// A directory, which is carried on into rather than attached.
     dir: bool,
@@ -583,9 +586,10 @@ pub struct App {
   toast: Option<(String, Instant)>,
   cwd: PathBuf,
   store: Option<Store>,
-  /// How many MCP servers came up, and how many tools they brought, for the
-  /// footer to say a session has more than the five it was built with.
-  mcp: (usize, usize),
+  /// The MCP servers: how many there are and what they brought, for the
+  /// footer to say a session has more than the five it was built with, and
+  /// what an `&token` is completed from.
+  catalog: crate::mcp::Catalog,
   /// Whether a question the model asks rings the terminal.
   bell: bool,
   /// The conversation: history plus its on-disk file.
@@ -677,7 +681,7 @@ impl App {
       store,
       start,
       notes,
-      mcp,
+      catalog,
       bell,
     } = options;
     let mut input = TextArea::default();
@@ -686,7 +690,7 @@ impl App {
     // itself, where three names picked out here only ever go stale.
     // Kept inside eighty columns, which is the narrowest terminal worth
     // drawing for: the hint is no use to anyone if its end is cut off.
-    input.set_placeholder_text("Enter sends, Alt+Enter a newline, / commands, @ images, Ctrl+C quits.");
+    input.set_placeholder_text("Enter sends, Alt+Enter a newline, / commands, @ attach, Ctrl+C quits.");
     // The terminal's own grey rather than a dimmed foreground, which some
     // terminals ignore and others render as the text colour proper.
     input.set_placeholder_style(Style::default().fg(Color::DarkGray));
@@ -701,7 +705,7 @@ impl App {
       scrollbar,
       last_scroll: None,
       toast: None,
-      mcp,
+      catalog,
       bell,
       cwd,
       store,
@@ -1023,8 +1027,9 @@ impl App {
     }
   }
 
-  /// Show the command popup while the input is a single `/word` prefix, and
-  /// the file popup while an `@token` is being typed.
+  /// Show the command popup while the input is a single `/word` prefix, the
+  /// file popup while an `@token` is being typed, and the resource popup
+  /// while an `&token` is.
   fn refresh_completion(&mut self) {
     let lines = self.input.lines();
     let commands = match lines {
@@ -1045,7 +1050,11 @@ impl App {
       None => match self.completing_token() {
         Some(range) => {
           let text = self.input.lines().join("\n");
-          let items = self.filter_paths(&text[range.0..range.1]);
+          let token = &text[range.0..range.1];
+          let items = match token.strip_prefix('&') {
+            Some(typed) => self.filter_resources(typed.trim_matches('"')),
+            None => self.filter_paths(token),
+          };
           (items, Some(range))
         }
         None => (Vec::new(), None),
@@ -1068,19 +1077,21 @@ impl App {
     });
   }
 
-  /// The `@token` the cursor is at the end of, which is the one being typed.
-  /// Only that one: an `@` earlier in the sentence is settled.
+  /// The token the cursor is at the end of, which is the one being typed.
+  /// Only that one: a token earlier in the sentence is settled.
   ///
   /// A token that already names an image is settled too, popup closed — so
   /// `Enter` on a finished token sends the prompt rather than being taken by
   /// a list offering the file that is already written there.
   fn completing_token(&self) -> Option<(usize, usize)> {
     let at = self.cursor_offset();
-    self
+    let text = self.input.lines().join("\n");
+    let word = attach::words(&text).into_iter().find(|word| word.range.1 == at)?;
+    let settled = self
       .attachments
       .iter()
-      .find(|token| token.range.1 == at && !token.is_image())
-      .map(|token| token.range)
+      .any(|token| token.range.0 == word.range.0 && token.is_image());
+    (!settled).then_some(word.range)
   }
 
   /// Where the cursor is, as a byte offset into the input.
@@ -1107,13 +1118,11 @@ impl App {
       true => self.cwd.clone(),
       false => crate::tools::resolve(&self.cwd, dir),
     };
-    let Ok(entries) = std::fs::read_dir(&base) else {
+    let Ok(listing) = std::fs::read_dir(&base) else {
       return Vec::new();
     };
-    let mut candidates: Vec<(u32, String, bool)> = Vec::new();
-    let pattern = Pattern::parse(prefix, CaseMatching::Ignore, Normalization::Smart);
-    let mut buf = Vec::new();
-    for entry in entries.flatten() {
+    let mut entries: Vec<(String, bool)> = Vec::new();
+    for entry in listing.flatten() {
       let name = entry.file_name().to_string_lossy().into_owned();
       // Hidden files only when they are being asked for by name.
       if name.starts_with('.') && !prefix.starts_with('.') {
@@ -1123,30 +1132,18 @@ impl App {
       if !is_dir && !attach::looks_like_image(&entry.path()) {
         continue;
       }
-      let Some(score) = pattern.score(Utf32Str::new(&name, &mut buf), &mut self.matcher) else {
-        continue;
-      };
-      candidates.push((score, name, is_dir));
+      entries.push((name, is_dir));
     }
-    // Best match first, directories after the images they sit beside at the
-    // same score, and then alphabetically so the list does not jitter.
-    candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.2.cmp(&b.2)).then(a.1.cmp(&b.1)));
-    candidates.truncate(PATH_ROWS);
-    candidates
+    // Directories after the images they sit beside, and then alphabetically,
+    // so the list does not jitter: the order a tie in the match keeps.
+    entries.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+    filter_rows(&mut self.matcher, entries.iter().map(|(name, _)| name.as_str()), prefix)
       .into_iter()
-      .map(|(_, name, is_dir)| {
-        let mut buf = Vec::new();
-        let mut highlights = Vec::new();
-        pattern.indices(Utf32Str::new(&name, &mut buf), &mut self.matcher, &mut highlights);
-        highlights.sort_unstable();
-        highlights.dedup();
+      .take(PATH_ROWS)
+      .map(|(at, highlights)| {
+        let (name, is_dir) = entries[at].clone();
         let path = format!("{dir}{name}{}", if is_dir { "/" } else { "" });
-        // A path with a space in it has to come back quoted, or the token
-        // would end at the space.
-        let insert = match path.contains(' ') {
-          true => format!("@\"{path}\""),
-          false => format!("@{path}"),
-        };
+        let insert = attach::written('@', &path);
         let meta = match is_dir {
           true => String::new(),
           false => match attach::dimensions(&base.join(&name)) {
@@ -1160,6 +1157,36 @@ impl App {
           highlights,
           meta,
           dir: is_dir,
+        }
+      })
+      .collect()
+  }
+
+  /// What `typed` — an `&token`, the sigil off — could be reaching for:
+  /// every `server:uri` the servers list, resources and then templates,
+  /// matched the way a path is — every one of them for a bare `&`. Once a
+  /// letter is typed, only the servers whose name it begins: `&mut` and
+  /// `&str` are code, and would otherwise match some URI or other.
+  fn filter_resources(&mut self, typed: &str) -> Vec<Match> {
+    let first = |text: &str| text.chars().next().map(|c| c.to_ascii_lowercase());
+    // Every row starts with its server's name.
+    let rows: Vec<(String, String)> = self
+      .catalog
+      .completions()
+      .into_iter()
+      .filter(|(name, _)| typed.is_empty() || first(name) == first(typed))
+      .collect();
+    filter_rows(&mut self.matcher, rows.iter().map(|(name, _)| name.as_str()), typed)
+      .into_iter()
+      .take(PATH_ROWS)
+      .map(|(at, highlights)| {
+        let (name, meta) = rows[at].clone();
+        Match::Path {
+          insert: attach::written('&', &name),
+          name,
+          highlights,
+          meta,
+          dir: false,
         }
       })
       .collect()
@@ -2195,6 +2222,12 @@ impl App {
       self.take_models(models);
       return;
     }
+    // Nor this: a server's tools can change with or without a run. Said
+    // where the servers were first said; the footer counts them afresh.
+    if let AgentEvent::Mcp(note) = ev {
+      self.entries.push(Entry::Info(note));
+      return;
+    }
     if self.run.is_none() {
       return; // stale event from an aborted run
     }
@@ -2282,12 +2315,7 @@ impl App {
       AgentEvent::Error(err) => {
         self.entries.push(Entry::Error(err));
       }
-      // A server's tools changed under the session: said where the servers
-      // were first said, and counted where they are counted.
-      AgentEvent::Mcp { note, servers, tools } => {
-        self.entries.push(Entry::Info(note));
-        self.mcp = (servers, tools);
-      }
+      AgentEvent::Mcp(_) => {}
       // One model call, counted as it happens: a run that takes twenty of
       // them moves the footer twenty times rather than sitting still until
       // it is over.
@@ -2797,7 +2825,8 @@ impl App {
       Span::raw("  "),
       Span::raw(model_label(&self.cfg)).dim(),
     ];
-    if let Some(label) = mcp_label(self.mcp.0, self.mcp.1) {
+    let (servers, tools) = self.catalog.count();
+    if let Some(label) = mcp_label(servers, tools) {
       left.push(Span::raw("  "));
       left.push(Span::raw(label).dim());
     }
@@ -3344,10 +3373,7 @@ fn as_token(text: &str, cwd: &Path) -> Option<String> {
   let path = crate::tools::resolve(cwd, trimmed);
   attach::dimensions(&path)?;
   let shown = path.strip_prefix(cwd).unwrap_or(&path).to_string_lossy().into_owned();
-  Some(match shown.contains(' ') {
-    true => format!("@\"{shown}\" "),
-    false => format!("@{shown} "),
-  })
+  Some(format!("{} ", attach::written('@', &shown)))
 }
 
 /// What a popup row is, for keeping the selection on the same row as the
@@ -3362,8 +3388,9 @@ fn key(item: &Match) -> String {
 /// Which of `rows` `query` leaves, best match first: each as its index into
 /// `rows` and the letters of it the query matched.
 ///
-/// The same fuzzy match the `/` popup is filtered by, over the one string a
-/// row is drawn as — so every letter picked out is a letter on screen.
+/// The one fuzzy match every popup and list is filtered by, over the one
+/// string a row is drawn as — so every letter picked out is a letter on
+/// screen.
 fn filter_rows<'a>(
   matcher: &mut Matcher,
   rows: impl IntoIterator<Item = &'a str>,

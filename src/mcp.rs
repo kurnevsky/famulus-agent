@@ -99,8 +99,9 @@ pub struct Server {
   /// The same, each value the output of a line of shell.
   #[serde(default, rename = "headers-command")]
   pub headers_command: BTreeMap<String, String>,
-  /// Seconds one of this server's tools may take before the call comes back
-  /// as an error the model can recover from. `0` waits forever.
+  /// Seconds one of this server's tools — or a listing or reading of its
+  /// resources — may take before the call comes back as an error the model
+  /// can recover from. `0` waits forever.
   #[serde(default)]
   pub timeout: Option<u64>,
   /// Take only these of the tools it offers. Everything it offers, when empty
@@ -222,6 +223,11 @@ type Rebuild = Box<dyn Fn(&Catalog) + Send + Sync>;
 struct Shelves {
   #[cfg(feature = "mcp")]
   offers: std::sync::Mutex<Vec<Offer>>,
+  /// What each server with resources has to read, by its name. A server is
+  /// here when it said it has resources as it came up, whether or not it
+  /// could list them then.
+  #[cfg(feature = "mcp")]
+  resources: std::sync::Mutex<std::collections::BTreeMap<String, crate::resources::ServerResources>>,
   /// What to do when an offer changes, once there are agents to tell.
   #[cfg(feature = "mcp")]
   changed: std::sync::OnceLock<Rebuild>,
@@ -238,6 +244,18 @@ struct Offer {
   timeout: Option<u64>,
 }
 
+/// How long a call to a server may take, from the seconds its table says.
+/// Rig bounds a call at five minutes unless told otherwise, and zero lets a
+/// call take as long as it takes.
+#[cfg(feature = "mcp")]
+fn call_timeout(seconds: Option<u64>) -> Option<std::time::Duration> {
+  match seconds {
+    Some(0) => None,
+    Some(seconds) => Some(std::time::Duration::from_secs(seconds)),
+    None => Some(rig_agent::tool::rmcp::DEFAULT_MCP_TOOL_TIMEOUT),
+  }
+}
+
 impl Catalog {
   /// How many servers came up, and how many tools they offer between them.
   pub fn count(&self) -> (usize, usize) {
@@ -250,31 +268,93 @@ impl Catalog {
     (0, 0)
   }
 
-  /// Every tool the servers offer, for a list that names tools without
+  /// Every tool the servers offer, and the two that read what they hold
+  /// when one of them holds anything, for a list that names tools without
   /// knowing where each came from.
   pub fn tool_names(&self) -> Vec<String> {
     #[cfg(feature = "mcp")]
+    {
+      let mut names: Vec<String> = self
+        .offers()
+        .iter()
+        .flat_map(|offer| offer.tools.iter().map(|tool| tool.name.to_string()))
+        .collect();
+      if self.has_resources() {
+        names.extend(crate::resources::NAMES.map(str::to_string));
+      }
+      names
+    }
+    #[cfg(not(feature = "mcp"))]
+    Vec::new()
+  }
+
+  /// Every `server:uri` the servers list, resources and then templates,
+  /// each with what the popup says beside it: a resource's type, or that it
+  /// is a template.
+  pub fn completions(&self) -> Vec<(String, String)> {
+    #[cfg(feature = "mcp")]
     return self
-      .offers()
+      .held()
       .iter()
-      .flat_map(|offer| offer.tools.iter().map(|tool| tool.name.to_string()))
+      .flat_map(|(server, held)| {
+        let resources = held
+          .resources
+          .iter()
+          .map(move |r| (format!("{server}:{}", r.uri), r.mime_type.clone().unwrap_or_default()));
+        let templates = held
+          .templates
+          .iter()
+          .map(move |t| (format!("{server}:{}", t.uri_template), "template".to_string()));
+        resources.chain(templates)
+      })
       .collect();
     #[cfg(not(feature = "mcp"))]
     Vec::new()
+  }
+
+  /// What each server with resources has to read, as it last said.
+  #[cfg(feature = "mcp")]
+  pub fn resources(&self) -> std::collections::BTreeMap<String, crate::resources::ServerResources> {
+    self.held().clone()
+  }
+
+  #[cfg(feature = "mcp")]
+  fn held(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<String, crate::resources::ServerResources>> {
+    self.0.resources.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+  }
+
+  /// Put what `server` has to read in place of what it had.
+  #[cfg(feature = "mcp")]
+  fn set_resources(&self, server: &str, held: crate::resources::ServerResources) {
+    self.held().insert(server.to_string(), held);
+  }
+
+  /// Whether any server has resources to read, which is when the tools
+  /// that read them are offered.
+  #[cfg(feature = "mcp")]
+  pub fn has_resources(&self) -> bool {
+    !self.held().is_empty()
+  }
+
+  /// The server called `named`, if it is one with resources, and how long
+  /// a request to it may take.
+  #[cfg(feature = "mcp")]
+  pub fn resource_peer(&self, named: &str) -> Option<(rmcp::service::ServerSink, Option<std::time::Duration>)> {
+    if !self.held().contains_key(named) {
+      return None;
+    }
+    self
+      .offers()
+      .iter()
+      .find(|offer| offer.server == named)
+      .map(|offer| (offer.peer.clone(), call_timeout(offer.timeout)))
   }
 
   /// Hand every tool on offer to the tools being built.
   pub fn attach(&self, server: rig_agent::tool::server::ToolServer) -> rig_agent::tool::server::ToolServer {
     #[cfg(feature = "mcp")]
     return self.offers().iter().fold(server, |server, offer| {
-      // Rig bounds a call at five minutes unless told otherwise. A server can
-      // say its own number, and zero lets a call take as long as it takes.
-      let timeout = match offer.timeout {
-        Some(0) => None,
-        Some(seconds) => Some(std::time::Duration::from_secs(seconds)),
-        None => Some(rig_agent::tool::rmcp::DEFAULT_MCP_TOOL_TIMEOUT),
-      };
-      server.rmcp_tools_with_timeout(offer.tools.clone(), offer.peer.clone(), timeout)
+      server.rmcp_tools_with_timeout(offer.tools.clone(), offer.peer.clone(), call_timeout(offer.timeout))
     });
     #[cfg(not(feature = "mcp"))]
     server
@@ -295,7 +375,9 @@ impl Catalog {
     self.0.offers.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
   }
 
-  /// The names a server may not take: the built-in tools', and every other
+  /// The names a server may not take: the built-in tools', the resource
+  /// tools' — kept whether or not any server has resources, so a name does
+  /// not change hands with the order servers come up in — and every other
   /// server's.
   #[cfg(feature = "mcp")]
   fn taken(&self, besides: &str) -> Vec<String> {
@@ -305,8 +387,9 @@ impl Catalog {
       .filter(|offer| offer.server != besides)
       .flat_map(|offer| offer.tools.iter().map(|tool| tool.name.to_string()));
     crate::tools::BUILT_IN
-      .map(str::to_string)
       .into_iter()
+      .chain(crate::resources::NAMES)
+      .map(str::to_string)
       .chain(others)
       .collect()
   }
@@ -406,8 +489,34 @@ pub struct Watch {
   busy: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
+/// Whether a server said, when it came up, that it has resources.
+#[cfg(feature = "mcp")]
+fn has_resources(peer: &rmcp::service::ServerSink) -> bool {
+  peer
+    .peer_info()
+    .is_some_and(|info| info.capabilities.resources.is_some())
+}
+
 #[cfg(feature = "mcp")]
 impl Watch {
+  /// The server says what it has to read has changed: ask it again. Said
+  /// only when it cannot be asked, since a server of files changes its list
+  /// whenever a file does, and none of that is news.
+  pub async fn resources_changed(&self, peer: &rmcp::service::ServerSink) {
+    // Only a server that said it has resources has a list to keep.
+    if !has_resources(peer) {
+      return;
+    }
+    let _one = self.busy.lock().await;
+    match crate::resources::inventory(peer, call_timeout(self.table.timeout)).await {
+      Ok(held) => self.catalog.set_resources(&self.server, held),
+      Err(err) => self.host.tell(crate::agent::AgentEvent::Mcp(format!(
+        "MCP {}: could not list resources: {err}",
+        self.server
+      ))),
+    }
+  }
+
   /// The server says its tools have changed: ask it for them, and put them
   /// in place of the ones it had.
   pub async fn changed(&self, peer: &rmcp::service::ServerSink) {
@@ -437,8 +546,7 @@ impl Watch {
         note
       }
     };
-    let (servers, tools) = self.catalog.count();
-    self.host.tell(crate::agent::AgentEvent::Mcp { note, servers, tools });
+    self.host.tell(crate::agent::AgentEvent::Mcp(note));
   }
 }
 
@@ -490,6 +598,20 @@ pub async fn connect(config: Config, host: &crate::modal::Host) -> Servers {
     servers
       .catalog
       .offer(&name, picked.tools, running.peer().clone(), table.timeout);
+    // What it has to read, for `&` to complete from. Kept empty when it
+    // cannot be listed, since it can still be read.
+    if has_resources(running.peer()) {
+      let held = match crate::resources::inventory(running.peer(), call_timeout(table.timeout)).await {
+        Ok(held) => held,
+        Err(err) => {
+          servers
+            .notes
+            .push(format!("MCP {name}: could not list resources: {err}"));
+          Default::default()
+        }
+      };
+      servers.catalog.set_resources(&name, held);
+    }
     servers.running.push(running);
   }
   servers

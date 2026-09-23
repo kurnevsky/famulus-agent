@@ -317,7 +317,7 @@ A server is a `command` to run, spoken to over its own stdin and stdout, or a
 | `token-keyring` | The same, kept in the system keyring: the attributes of the one item holding it |
 | `headers` | Sent with every request to it |
 | `headers-command` | The same, each value the output of a line of shell rather than written out |
-| `timeout` | Seconds one of this server's tools may take, `0` to wait forever (default 300) |
+| `timeout` | Seconds one of this server's tools — or a listing or reading of its resources — may take, `0` to wait forever (default 300) |
 | `tools` | Take only these of the tools it offers |
 | `except` | Take everything but these |
 | `oauth` | How to sign in, for a server that cannot work that out itself — see below |
@@ -437,6 +437,49 @@ oauth.port = 8765
 | `oauth.port` | The port the browser comes back to, for a client registered with one (default: any free port) |
 
 The address the browser is sent back to is `http://127.0.0.1:<port>/callback`.
+
+### Resources
+
+A server can hold things to be read rather than called — documents, records,
+files — each under a URI, with templates for the URIs it can make up
+([resources](https://modelcontextprotocol.io/specification/2025-11-25/server/resources)).
+When at least one server says it has any, the model is offered two tools of
+fa's own for them, beside the five:
+
+| Tool | What it does |
+|------|--------------|
+| `list_resources` | What there is to read, a resource to a line — URI, name, type, description — and the templates after, for every server with resources or the one it names |
+| `read_resource` | Read one, by server and URI: text as text, an image as an image the way `read` gives one, anything else binary said to be what it is |
+
+With no server that has resources — no servers at all, or none that say so
+when they come up — neither tool exists, and the model is not told about
+tools with nothing behind them. Each server's list is fetched when it comes
+up and again whenever it says the list has changed
+(`notifications/resources/list_changed`); `list_resources` answers from that,
+and `read_resource` asks the server, so a URI that is not listed — one a
+template makes, or one a tool's answer points at instead of carrying it — is
+still read.
+
+They are tools like any other as far as the session is concerned: `--tools`
+and `--no-tools` name them, and what they read is cut to size the way a
+server's own answer is. No server's tool may take either name.
+
+#### In a prompt
+
+A resource can be named in a prompt as `&server:uri`, with the popup `@`
+gives files: every `server:uri` the servers list, resources and then
+templates — all of them at a bare `&`, as a bare `@` lists the working
+directory and `/` every command — fuzzy-matched on what is typed: `&nday` finds
+`notes:note://today` — with the matched letters picked out. A template is
+taken as it is, for the `{…}` in it to be written over, and a URI with a
+space in it goes in quotes, `&"notes:note://a b"`. An `&` word whose first
+letter begins no server's name — `&mut self`, `&str` — offers nothing.
+
+The token is a reference, not an attachment: the prompt goes as it was typed,
+and the model reads what it names with `read_resource`, whose result is drawn
+under the call like any tool's. Nothing is read when the prompt is sent, so
+nothing is added to it — and a prompt handed back by `Up` or `/tree` names
+what the server holds whenever the model reads it.
 
 ### A server asking you
 
@@ -891,6 +934,7 @@ what it spent.
 | `↑` / `↓` | Walk back through the prompts already sent, and forward again — from the first/last line of the input |
 | `/` | Command popup: type to fuzzy-filter, `↑`/`↓` move, `Tab`/`Enter` complete, `Esc` dismiss |
 | `@` | Attach an image: `@path`, `@/full/path`, `@~/shot.png`, `@"with a space.png"` — same popup, `Tab` completes, a directory is carried on into |
+| `&` | Name an MCP resource for the model to read: `&server:uri` — same popup, `Tab` completes |
 | `Alt+Enter`, `Ctrl+J`, `Shift+Enter`* | Newline |
 | Paste | Goes in whole, newlines and all — a pasted snippet is not sent at its first line break. A lone path to an image becomes an `@` token |
 | `Esc` | Abort the current run |
@@ -1002,6 +1046,8 @@ comes back to say otherwise.
   lives as long as the program does.
 - `src/keyring.rs` – the system keyring through oo7, opened once for the
   session: what a sign-in is kept in, and where `token-keyring` looks.
+- `src/resources.rs` – `list_resources` and `read_resource`, the two tools
+  that read what MCP servers hold, offered when one of them holds anything.
 - `src/oauth.rs` – signing in to an MCP endpoint that wants it: the browser
   sent to the server and the code taken back on a loopback port, and the
   keyring the tokens are kept in between sessions. rmcp does the protocol.

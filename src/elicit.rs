@@ -69,6 +69,10 @@ impl rmcp::ClientHandler for Client {
     self.watch.changed(&context.peer).await;
   }
 
+  async fn on_resource_list_changed(&self, context: NotificationContext<RoleClient>) {
+    self.watch.resources_changed(&context.peer).await;
+  }
+
   fn get_info(&self) -> ClientInfo {
     let mut capabilities = ClientCapabilities::default();
     capabilities.elicitation = Some(ElicitationCapability::new().with_form(FormElicitationCapability::new()));
