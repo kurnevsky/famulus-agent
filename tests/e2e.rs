@@ -662,9 +662,18 @@ impl Term {
       .unwrap_or_else(|| panic!("an open overlay:\n{screen}"));
     let bottom = lines[top..]
       .iter()
-      .position(|line| line.contains('╰'))
+      .position(|line| line.starts_with('╰'))
       .map_or(lines.len(), |at| top + at);
-    let rows: Vec<String> = lines[top + 1..bottom].iter().map(|l| l.to_string()).collect();
+    // A toast in the corner is drawn over the rows; each row ends where its
+    // frame begins, so what it says is not read as part of the list.
+    let rows: Vec<String> = lines[top + 1..bottom]
+      .iter()
+      .map(|line| {
+        let row = line.strip_prefix('│').unwrap_or(line);
+        let end = row.find(['│', '╭', '╰']).unwrap_or(row.len());
+        format!("│{}", &row[..end])
+      })
+      .collect();
     let on = rows
       .iter()
       .position(|row| row.contains('›'))
@@ -1744,6 +1753,7 @@ fn the_picker_deletes_a_session_once_it_has_asked_about_it() {
   term.type_in("C-d");
   term.wait_for("delete? Ctrl+D to confirm");
   term.type_in("C-d");
+  term.wait_for("start another");
   term.settle();
   let (rows, _) = term.overlay();
   assert!(
@@ -1772,6 +1782,7 @@ fn the_picker_deletes_a_session_once_it_has_asked_about_it() {
   term.type_in("C-d");
   term.wait_for("delete? Ctrl+D to confirm");
   term.type_in("C-d");
+  term.wait_for("Deleted session apple.");
   term.wait_for("No session matches.");
   for _ in 0..4 {
     term.type_in("BSpace");
@@ -1785,15 +1796,6 @@ fn the_picker_deletes_a_session_once_it_has_asked_about_it() {
   let files = term.session_files();
   assert_eq!(files.len(), 1);
   assert!(files[0].1.contains("pear"), "the one that was kept: {files:?}");
-
-  // What the picker did, and would not do, is said behind it once it is out
-  // of the way.
-  term.type_in("Escape");
-  let screen = term.wait_for("Deleted session apple.");
-  assert!(
-    screen.contains("start another with /new"),
-    "why the session on screen was kept:\n{screen}"
-  );
 }
 
 /// Which row of an overlay says `needle`.
@@ -1975,6 +1977,7 @@ fn the_tree_deletes_a_branch_once_it_has_asked_about_it() {
   term.type_in("C-d");
   term.wait_for("delete? Ctrl+D to confirm");
   term.type_in("C-d");
+  term.wait_for("go somewhere else");
   term.settle();
   let (rows, _) = term.overlay();
   assert!(
@@ -1998,6 +2001,7 @@ fn the_tree_deletes_a_branch_once_it_has_asked_about_it() {
   term.type_in("C-d");
   term.wait_for("delete? Ctrl+D to confirm");
   term.type_in("C-d");
+  term.wait_for("Deleted ❯ pear, 2 messages in all.");
   term.settle();
   let (rows, _) = term.overlay();
   assert!(
@@ -2011,13 +2015,6 @@ fn the_tree_deletes_a_branch_once_it_has_asked_about_it() {
   let session = term.session_file();
   assert!(!session.contains("pear"), "the file forgets it too:\n{session}");
   assert!(session.contains("plum"));
-
-  term.type_in("Escape");
-  let screen = term.wait_for("Deleted ❯ pear, 2 messages in all.");
-  assert!(
-    screen.contains("go somewhere else before deleting it"),
-    "why the conversation on screen was kept:\n{screen}"
-  );
 }
 
 #[test]

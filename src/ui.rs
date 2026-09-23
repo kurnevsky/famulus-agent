@@ -10,10 +10,10 @@ use anyhow::Result;
 use ratatui::crossterm::event::{
   self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
-use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::{DefaultTerminal, Frame};
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 use rig_core::completion::{Message, Usage};
@@ -56,6 +56,11 @@ const IMAGE_KIND: u8 = 2;
 const WHEEL_LINES: usize = 3;
 /// How long the `auto` scrollbar stays visible after the last scroll.
 const SCROLLBAR_HIDE_DELAY: Duration = Duration::from_millis(1000);
+/// How long a toast stays in the corner of the transcript: a moment to
+/// notice it, and more for each character there is to read, up to a limit.
+const TOAST_DELAY: Duration = Duration::from_millis(1500);
+const TOAST_PER_CHAR: Duration = Duration::from_millis(40);
+const TOAST_MAX_DELAY: Duration = Duration::from_millis(5000);
 /// How close together two `Esc` presses count as one double press, as in pi.
 const DOUBLE_ESC: Duration = Duration::from_millis(500);
 /// What a tool call the user stopped is answered with, so the model knows it
@@ -576,6 +581,10 @@ pub struct App {
   scrollbar: ScrollbarMode,
   /// When the transcript was last scrolled, for the `auto` scrollbar.
   last_scroll: Option<Instant>,
+  /// A short note in the top right corner, and when it goes away: what a
+  /// toggle or a copy did, said where it cannot be missed and gone again
+  /// without leaving anything in the transcript.
+  toast: Option<(String, Instant)>,
   cwd: PathBuf,
   store: Option<Store>,
   /// How many MCP servers came up, and how many tools they brought, for the
@@ -689,6 +698,7 @@ impl App {
       listing: false,
       scrollbar,
       last_scroll: None,
+      toast: None,
       mcp,
       bell,
       cwd,
@@ -781,7 +791,7 @@ impl App {
                   self.handle_agent(ev);
               }
           }
-          _ = ticker.tick(), if self.run.is_some() || self.scrollbar_fading() => {
+          _ = ticker.tick(), if self.run.is_some() || self.scrollbar_fading() || self.toast.is_some() => {
               self.tick = self.tick.wrapping_add(1);
           }
       }
@@ -840,6 +850,7 @@ impl App {
       (KeyCode::Char('d'), true) if self.input.is_empty() => self.quit = true,
       (KeyCode::Char('t'), true) => {
         self.expand_thinking = !self.expand_thinking;
+        self.notify(if self.expand_thinking { "Thinking expanded" } else { "Thinking collapsed" });
         // Expanding moves everything below the block, so go back to following
         // the bottom rather than leaving the reader mid-paragraph. Only the
         // view changes: the conversation is the same one, and so is anything
@@ -848,6 +859,7 @@ impl App {
       }
       (KeyCode::Char('o'), true) => {
         self.expand_tools = !self.expand_tools;
+        self.notify(if self.expand_tools { "Tool output expanded" } else { "Tool output collapsed" });
         self.anchor = None;
       }
       (KeyCode::Esc, _) if self.run.is_some() => self.abort(),
@@ -1325,9 +1337,7 @@ impl App {
     // The conversation on screen goes on writing to its file, so deleting it
     // from under itself would only leave a shorter one behind.
     if self.session.path() == Some(path.as_path()) {
-      self.entries.push(Entry::Info(
-        "That is this session — start another with /new before deleting it.".into(),
-      ));
+      self.notify("That is this session — start another with /new before deleting it.");
       return;
     }
     let Some(store) = &self.store else { return };
@@ -1344,7 +1354,7 @@ impl App {
     // is the same list one row shorter.
     overlay.refilter(&mut self.matcher);
     overlay.selected = overlay.selected.min(overlay.len().saturating_sub(1));
-    self.entries.push(Entry::Info(format!("Deleted session {title}.")));
+    self.notify(format!("Deleted session {title}."));
     // Nothing left to pick from is nothing to keep a picker open for.
     if emptied {
       self.overlay = None;
@@ -1368,9 +1378,7 @@ impl App {
     // The next turn is written under the end of the conversation on screen,
     // so that is not something to take out from under it.
     if self.session.lineage(self.session.leaf(), true).contains(&id.as_str()) {
-      self.entries.push(Entry::Info(
-        "That is on the conversation you are in — go somewhere else before deleting it.".into(),
-      ));
+      self.notify("That is on the conversation you are in — go somewhere else before deleting it.");
       return;
     }
     let gone = match self.session.delete_branch(&id) {
@@ -1389,9 +1397,7 @@ impl App {
     overlay.list = OverlayList::Tree(rows);
     overlay.refilter(&mut self.matcher);
     overlay.selected = overlay.selected.min(overlay.len().saturating_sub(1));
-    self
-      .entries
-      .push(Entry::Info(format!("Deleted {label}, {} in all.", messages(gone))));
+    self.notify(format!("Deleted {label}, {} in all.", messages(gone)));
     if emptied {
       self.overlay = None;
     }
@@ -1473,11 +1479,20 @@ impl App {
     let text = self.selected_text(selection);
     // Blank cells are what the transcript pads with rather than anything the
     // user meant to take away with them.
-    if !text.trim().is_empty()
-      && let Err(note) = crate::clipboard::copy(&text)
-    {
-      self.entries.push(Entry::Info(note));
+    if text.trim().is_empty() {
+      return;
     }
+    match crate::clipboard::copy(&text) {
+      Ok(()) => self.notify("Copied"),
+      Err(note) => self.entries.push(Entry::Info(note)),
+    }
+  }
+
+  /// Put `text` in the corner, for longer the more of it there is to read.
+  fn notify(&mut self, text: impl Into<String>) {
+    let text = text.into();
+    let reading = TOAST_PER_CHAR * text.chars().count() as u32;
+    self.toast = Some((text, Instant::now() + (TOAST_DELAY + reading).min(TOAST_MAX_DELAY)));
   }
 
   /// The cell of the transcript under the cursor, clamped into the text — so
@@ -1654,18 +1669,14 @@ impl App {
       "/continue" => self.continue_run(),
       "/resume" => {
         if self.run.is_some() {
-          self.entries.push(Entry::Info(
-            "Finish or abort the current run before resuming another session.".into(),
-          ));
+          self.notify("Finish or abort the current run before resuming another session.");
         } else {
           self.open_picker();
         }
       }
       "/tree" | "/fork" => {
         if self.run.is_some() {
-          self
-            .entries
-            .push(Entry::Info(format!("Finish or abort the current run before {text}.")));
+          self.notify(format!("Finish or abort the current run before {text}."));
         } else {
           self.open_points(text == "/fork");
         }
@@ -1761,9 +1772,7 @@ impl App {
   /// since fa started has it here without being asked twice.
   fn open_models(&mut self) {
     if self.run.is_some() {
-      self.entries.push(Entry::Info(
-        "Finish or abort the current run before changing model.".into(),
-      ));
+      self.notify("Finish or abort the current run before changing model.");
       return;
     }
     self
@@ -1775,9 +1784,7 @@ impl App {
   /// Open the picker on the list as it stands, at the model in use.
   fn show_models(&mut self) {
     if self.models.is_empty() {
-      self.entries.push(Entry::Info(
-        "The provider offered no models — name one with /model <id>.".into(),
-      ));
+      self.notify("The provider offered no models — name one with /model <id>.");
       return;
     }
     let selected = self
@@ -1810,9 +1817,7 @@ impl App {
       return;
     }
     if self.run.is_some() {
-      self.entries.push(Entry::Info(
-        "Finish or abort the current run before changing model.".into(),
-      ));
+      self.notify("Finish or abort the current run before changing model.");
       return;
     }
     let mut cfg = self.cfg.clone();
@@ -1895,14 +1900,12 @@ impl App {
 
   fn open_picker(&mut self) {
     let Some(store) = &self.store else {
-      self
-        .entries
-        .push(Entry::Info("Sessions are disabled (--no-session).".into()));
+      self.notify("Sessions are disabled (--no-session).");
       return;
     };
     let sessions = store.list();
     if sessions.is_empty() {
-      self.entries.push(Entry::Info("No saved sessions.".into()));
+      self.notify("No saved sessions.");
       return;
     }
     self.overlay = Some(Overlay::new(OverlayList::Sessions(sessions), 0));
@@ -1918,10 +1921,10 @@ impl App {
       points.retain(|point| point.text.is_some());
     }
     if points.is_empty() {
-      self.entries.push(Entry::Info(match fork {
-        true => "Nothing to fork from.".into(),
-        false => "Nothing to go back to.".into(),
-      }));
+      self.notify(match fork {
+        true => "Nothing to fork from.",
+        false => "Nothing to go back to.",
+      });
       return;
     }
     // Start where the session already is, so the way back is one step up.
@@ -1951,7 +1954,7 @@ impl App {
       })
       .collect();
     if marks.is_empty() {
-      self.entries.push(Entry::Info("No prompts to go to.".into()));
+      self.notify("No prompts to go to.");
       return;
     }
     let selected = marks.len() - 1;
@@ -1978,7 +1981,7 @@ impl App {
   /// so the two cannot drift: what is on screen is what the model will be sent.
   fn go_to(&mut self, point: Point) {
     if point.here && point.text.is_none() {
-      self.entries.push(Entry::Info("Already there.".into()));
+      self.notify("Already there.");
       return;
     }
     let result = self.session.go_to(point.leaf.clone());
@@ -2066,7 +2069,7 @@ impl App {
 
   fn compact(&mut self) {
     if self.session.history.is_empty() {
-      self.entries.push(Entry::Info("Nothing to compact.".into()));
+      self.notify("Nothing to compact.");
       self.resuming = false;
       self.next_queued();
       return;
@@ -2104,7 +2107,7 @@ impl App {
   /// answer is continued.
   fn continue_run(&mut self) {
     if self.session.history.is_empty() {
-      self.entries.push(Entry::Info("Nothing to continue.".into()));
+      self.notify("Nothing to continue.");
       self.next_queued();
       return;
     }
@@ -2367,10 +2370,10 @@ impl App {
           // Nothing left to summarize but the turn the context is full of.
           // Carrying on regardless would only fill it again and ask for the
           // same summary, so this is where it stops and the user decides.
-          None => self.entries.push(Entry::Info(match resuming {
-            true => "The context is full and there is nothing left to compact — /continue to carry on anyway.".into(),
-            false => "Nothing to compact.".to_string(),
-          })),
+          None if resuming => self.entries.push(Entry::Info(
+            "The context is full and there is nothing left to compact — /continue to carry on anyway.".into(),
+          )),
+          None => self.notify("Nothing to compact."),
         }
         self.next_queued();
       }
@@ -2445,6 +2448,41 @@ impl App {
       f.render_widget(&self.input, input_area);
     }
     self.draw_footer(f, footer_area);
+    self.draw_toast(f, transcript_area);
+  }
+
+  /// Drawn last, over whatever the transcript area holds, so it shows above a
+  /// list or a question just as it does above the conversation.
+  fn draw_toast(&mut self, f: &mut Frame, area: Rect) {
+    if self.toast.as_ref().is_some_and(|(_, until)| Instant::now() >= *until) {
+      self.toast = None;
+    }
+    let Some((text, _)) = &self.toast else { return };
+    // A list or a question is framed, and its top border says which keys do
+    // what, so the toast goes inside the frame rather than over the hints.
+    let area = match self.overlay.is_some() || self.question.is_some() {
+      true => area.inner(Margin::new(1, 1)),
+      false => area,
+    };
+    // Wrapped to half the screen, so a sentence stays in the corner rather
+    // than turning into a banner across the conversation.
+    let most = (area.width / 2).max(24).min(area.width.saturating_sub(4));
+    let lines = crate::markdown::wrap_text(text, most, Style::default());
+    let widest = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let width = (widest + 4).min(area.width);
+    let toast = Rect {
+      x: area.right().saturating_sub(width),
+      y: area.y,
+      width,
+      height: (lines.len() as u16 + 2).min(area.height),
+    };
+    let block = Block::default()
+      .borders(Borders::ALL)
+      .border_type(BorderType::Rounded)
+      .border_style(Style::default().fg(Color::Gray))
+      .padding(Padding::horizontal(1));
+    f.render_widget(Clear, toast);
+    f.render_widget(Paragraph::new(lines).block(block), toast);
   }
 
   fn draw_transcript(&mut self, f: &mut Frame, transcript_area: Rect) {
