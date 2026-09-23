@@ -113,9 +113,7 @@ impl Host {
     })));
     rx.await.ok()
   }
-}
 
-impl Host {
   /// Tell the UI something that is not a question: a server whose tools
   /// changed, say. Nothing waits on it.
   #[cfg_attr(not(feature = "mcp"), allow(dead_code))]

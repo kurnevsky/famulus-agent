@@ -14,7 +14,7 @@
 use ratatui::text::Span;
 
 #[cfg(feature = "syntax")]
-use std::{borrow::Cow, sync::OnceLock};
+use std::sync::OnceLock;
 
 #[cfg(feature = "syntax")]
 use ratatui::style::{Color, Modifier, Style};
@@ -516,12 +516,9 @@ fn grammar(lang: &str) -> Option<&'static HighlightConfiguration> {
 /// `@comment` in front of it and comments come out plain. Removing the name
 /// leaves the pattern itself, and its other captures, exactly as they were.
 #[cfg(feature = "syntax")]
-fn without_spell(query: &str) -> Cow<'_, str> {
-  if !query.contains("@spell") && !query.contains("@nospell") {
-    return Cow::Borrowed(query);
-  }
+fn without_spell(query: &str) -> String {
   // `@nospell` first: it ends in the shorter name.
-  Cow::Owned(query.replace("@nospell", "").replace("@spell", ""))
+  query.replace("@nospell", "").replace("@spell", "")
 }
 
 /// Compiles a grammar's queries, or gives up on it for good.

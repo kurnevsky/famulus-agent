@@ -136,24 +136,16 @@ fn normalize(text: &str) -> String {
 /// Before validation rather than after it, so the reserved-label and
 /// duplicate-label checks compare what the user will actually read: `Other\r`
 /// is `Other`, and would otherwise walk straight past a check on `Other`.
-pub fn prepare(questions: Vec<Question>) -> Vec<Question> {
+pub fn prepare(mut questions: Vec<Question>) -> Vec<Question> {
+  for q in &mut questions {
+    q.question = normalize(&q.question);
+    q.header = normalize(&q.header);
+    for o in &mut q.options {
+      o.label = normalize(&o.label);
+      o.description = normalize(&o.description);
+    }
+  }
   questions
-    .into_iter()
-    .map(|q| Question {
-      question: normalize(&q.question),
-      header: normalize(&q.header),
-      options: q
-        .options
-        .into_iter()
-        .map(|o| Choice {
-          label: normalize(&o.label),
-          description: normalize(&o.description),
-        })
-        .collect(),
-      multi_select: q.multi_select,
-      options_only: q.options_only,
-    })
-    .collect()
 }
 
 /// Whether the questionnaire can be put to the user at all, with the sentence
@@ -541,9 +533,9 @@ impl Dialog {
         let text = draft_text(self.draft());
         return self.confirm(Answer::Typed(text));
       }
-      // Pi's line-kill, taken as the whole draft rather than the line: the row
-      // is one answer, and clearing it is what the key is reached for.
-      KeyCode::Char('u') if ctrl => *self.draft() = Draft::default(),
+      // The line-kill key, taken as the whole draft rather than the line: the
+      // row is one answer, and clearing it is what the key is reached for.
+      KeyCode::Char('u') if ctrl => _ = self.draft().clear(),
       KeyCode::Backspace => _ = self.draft().delete_char(),
       KeyCode::Left => self.draft().move_cursor(CursorMove::Back),
       KeyCode::Right => self.draft().move_cursor(CursorMove::Forward),
@@ -590,21 +582,14 @@ impl Dialog {
     for (index, question) in self.questions.iter().enumerate() {
       let answered = self.answers.contains_key(&index);
       let box_ = if answered { "■" } else { "□" };
-      let style = match (index == self.tab, answered) {
-        (true, _) => Style::default().fg(Color::Black).bg(Color::Cyan),
-        (false, true) => Style::default().fg(Color::Green),
-        (false, false) => Style::default().fg(Color::DarkGray),
-      };
-      spans.push(Span::styled(format!(" {box_} {} ", question.chip(index)), style));
+      spans.push(Span::styled(
+        format!(" {box_} {} ", question.chip(index)),
+        tab_style(index == self.tab, answered),
+      ));
       spans.push(Span::raw(" "));
     }
     let all = self.answers.len() == self.questions.len();
-    let style = match (self.on_submit_tab(), all) {
-      (true, _) => Style::default().fg(Color::Black).bg(Color::Cyan),
-      (false, true) => Style::default().fg(Color::Green),
-      (false, false) => Style::default().fg(Color::DarkGray),
-    };
-    spans.push(Span::styled(" ✓ Submit ", style));
+    spans.push(Span::styled(" ✓ Submit ", tab_style(self.on_submit_tab(), all)));
     spans.push(Span::styled(" →", Style::default().fg(Color::DarkGray)));
     Line::from(spans)
   }
@@ -640,7 +625,7 @@ impl Dialog {
             false => option.label.clone(),
           };
           self.draw_row(Label::Text(label), Some(at + 1), digits, ticked, active, width, out);
-          let indent = " ".repeat(prefix_width(digits, ticked.is_some()));
+          let indent = " ".repeat(row_prefix(false, Some(at + 1), digits, ticked).chars().count());
           for line in wrap_text(
             &option.description,
             width.saturating_sub(indent.len() as u16),
@@ -717,17 +702,7 @@ impl Dialog {
     width: u16,
     out: &mut Vec<Line<'static>>,
   ) {
-    let mut prefix = match active {
-      true => POINTER.to_string(),
-      false => NO_POINTER.to_string(),
-    };
-    if let Some(number) = number {
-      prefix.push_str(&format!("{number:>digits$}. "));
-    }
-    if let Some(ticked) = ticked {
-      prefix.push_str(if ticked { CHECKED } else { UNCHECKED });
-      prefix.push(' ');
-    }
+    let prefix = row_prefix(active, number, digits, ticked);
     let indent = " ".repeat(prefix.chars().count());
     let style = match active {
       true => Style::default().fg(Color::Cyan).bold(),
@@ -827,9 +802,9 @@ impl Dialog {
 /// the user is looking at off the bottom. What falls off the end is the keys
 /// that matter least, which is why the line is written in that order.
 fn clip(text: &str, width: u16) -> String {
-  use unicode_width::UnicodeWidthChar;
+  use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
   let width = width as usize;
-  if text.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>() <= width {
+  if text.width() <= width {
     return text.to_string();
   }
   let mut out = String::new();
@@ -846,10 +821,31 @@ fn clip(text: &str, width: u16) -> String {
   out
 }
 
-/// How far a row's text is indented: the pointer, the number and its dot, and
-/// the box when the question has boxes.
-fn prefix_width(digits: usize, boxed: bool) -> usize {
-  NO_POINTER.chars().count() + digits + 2 + if boxed { CHECKED.chars().count() + 1 } else { 0 }
+/// What a row's text is written after: the pointer, the number and its dot
+/// when it has one, and the box when the question has boxes.
+fn row_prefix(active: bool, number: Option<usize>, digits: usize, ticked: Option<bool>) -> String {
+  let mut prefix = match active {
+    true => POINTER.to_string(),
+    false => NO_POINTER.to_string(),
+  };
+  if let Some(number) = number {
+    prefix.push_str(&format!("{number:>digits$}. "));
+  }
+  if let Some(ticked) = ticked {
+    prefix.push_str(if ticked { CHECKED } else { UNCHECKED });
+    prefix.push(' ');
+  }
+  prefix
+}
+
+/// A tab of the strip: highlighted while it is the one shown, green once it
+/// is answered, dim until then.
+fn tab_style(shown: bool, answered: bool) -> Style {
+  match (shown, answered) {
+    (true, _) => Style::default().fg(Color::Black).bg(Color::Cyan),
+    (false, true) => Style::default().fg(Color::Green),
+    (false, false) => Style::default().fg(Color::DarkGray),
+  }
 }
 
 /// Puts `lead` in front of a rendered line, keeping the rest of its spans.

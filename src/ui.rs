@@ -1,6 +1,7 @@
 //! Ratatui front-end: a scrolling transcript, a multi-line input box and a
 //! one-line footer.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -13,9 +14,7 @@ use ratatui::crossterm::event::{
 use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-  Block, BorderType, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
-};
+use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 use ratatui::{DefaultTerminal, Frame};
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 use rig_core::completion::{Message, Usage};
@@ -27,7 +26,7 @@ use tokio::task::JoinHandle;
 
 use crate::agent::{self, AgentEvent, Agents, ModelInfo, start_compaction, start_run};
 use crate::attach::{self, Prompt, Token};
-use crate::compaction::{DEFAULT_CONTEXT_WINDOW, SUMMARY_PREFIX, SUMMARY_SUFFIX, estimate_tokens};
+use crate::compaction::{DEFAULT_CONTEXT_WINDOW, estimate_tokens};
 use crate::modal::Modal;
 use crate::session::{Node, NodeKind, Outcome, Session, SessionInfo, Store};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
@@ -316,6 +315,33 @@ enum OverlayList {
   Goto(Vec<Mark>),
 }
 
+impl OverlayList {
+  /// Each row as the one string it is matched over, which is the string it
+  /// is drawn as — so every letter picked out is a letter on screen.
+  fn labels(&self) -> Vec<Cow<'_, str>> {
+    match self {
+      // What a session is remembered by is its name, or the question it
+      // opened with.
+      OverlayList::Sessions(sessions) => sessions.iter().map(|s| Cow::Borrowed(s.title())).collect(),
+      // Indent and all, so the letters picked out sit under the letters
+      // typed.
+      OverlayList::Tree(points) => points.iter().map(|p| Cow::Owned(point_label(p))).collect(),
+      // The fork list draws its prompts flat.
+      OverlayList::Fork(points) => points.iter().map(|p| Cow::Borrowed(p.label.as_str())).collect(),
+      // Ids alone: a provider's display name is another spelling of the same
+      // thing, and matching both would rank a model twice for looking like
+      // itself.
+      OverlayList::Models(models) => models.iter().map(|m| Cow::Borrowed(m.id.as_str())).collect(),
+      OverlayList::Goto(marks) => marks.iter().map(|m| Cow::Borrowed(m.label.as_str())).collect(),
+    }
+  }
+
+  /// Which rows `query` leaves, best match first.
+  fn filter(&self, matcher: &mut Matcher, query: &str) -> Vec<(usize, Vec<u32>)> {
+    filter_rows(matcher, self.labels().iter().map(|label| label.as_ref()), query)
+  }
+}
+
 /// A prompt in the transcript, as `/goto` lists it.
 struct Mark {
   /// Index into the transcript's entries.
@@ -347,16 +373,10 @@ struct Point {
 impl Overlay {
   /// A list the filter has yet to touch, at the row `selected`.
   fn new(list: OverlayList, selected: usize) -> Self {
-    let len = match &list {
-      OverlayList::Sessions(sessions) => sessions.len(),
-      OverlayList::Tree(points) | OverlayList::Fork(points) => points.len(),
-      OverlayList::Models(models) => models.len(),
-      OverlayList::Goto(marks) => marks.len(),
-    };
     Self {
+      filter: Filter::new(list.labels().len()),
       list,
       selected,
-      filter: Filter::new(len),
       confirming: false,
     }
   }
@@ -372,25 +392,10 @@ impl Overlay {
     self.filter.shown.get(self.selected).map(|(at, _)| *at)
   }
 
-  /// The letters of each shown row the query matched, for picking out.
-  fn matched(&self) -> &[(usize, Vec<u32>)] {
-    &self.filter.shown
-  }
-
   /// Work out again which rows the query leaves. Called when the query
   /// changes, and when a row has gone from under it.
   fn refilter(&mut self, matcher: &mut Matcher) {
-    let Overlay { list, filter, .. } = self;
-    let query = &filter.query();
-    filter.shown = match list {
-      OverlayList::Sessions(sessions) => filter_sessions(matcher, sessions, query),
-      OverlayList::Tree(points) => filter_points(matcher, points, query),
-      // The fork list draws its prompts flat, so that is what is matched:
-      // what is picked out has to sit under what was typed.
-      OverlayList::Fork(points) => filter_rows(matcher, points.iter().map(|p| p.label.as_str()), query),
-      OverlayList::Models(models) => filter_models(matcher, models, query),
-      OverlayList::Goto(marks) => filter_rows(matcher, marks.iter().map(|m| m.label.as_str()), query),
-    };
+    self.filter.shown = self.list.filter(matcher, &self.filter.query());
   }
 
   fn title(&self) -> String {
@@ -1008,7 +1013,7 @@ impl App {
   /// Put `insert` in place of the bytes `from..to` of the input, and leave
   /// the cursor just after it.
   fn replace_token(&mut self, from: usize, to: usize, insert: String) {
-    let text = self.input.lines().join("\n");
+    let text = self.input_text();
     let (head, tail) = (&text[..from], &text[to.min(text.len())..]);
     let cursor = head.len() + insert.len();
     let replaced = format!("{head}{insert}{tail}");
@@ -1049,7 +1054,7 @@ impl App {
       Some(query) => (filter_commands(&mut self.matcher, &query), None),
       None => match self.completing_token() {
         Some(range) => {
-          let text = self.input.lines().join("\n");
+          let text = self.input_text();
           let token = &text[range.0..range.1];
           let items = match token.strip_prefix('&') {
             Some(typed) => self.filter_resources(typed.trim_matches('"')),
@@ -1077,6 +1082,11 @@ impl App {
     });
   }
 
+  /// What is in the input box, as the one string it will be sent as.
+  fn input_text(&self) -> String {
+    self.input.lines().join("\n")
+  }
+
   /// The token the cursor is at the end of, which is the one being typed.
   /// Only that one: a token earlier in the sentence is settled.
   ///
@@ -1085,7 +1095,7 @@ impl App {
   /// a list offering the file that is already written there.
   fn completing_token(&self) -> Option<(usize, usize)> {
     let at = self.cursor_offset();
-    let text = self.input.lines().join("\n");
+    let text = self.input_text();
     let word = attach::words(&text).into_iter().find(|word| word.range.1 == at)?;
     let settled = self
       .attachments
@@ -1195,7 +1205,7 @@ impl App {
   /// Resolve the `@path` tokens in the input box, so the border can say what
   /// they found. Called wherever the text changes.
   fn refresh_attachments(&mut self) {
-    let text = self.input.lines().join("\n");
+    let text = self.input_text();
     self.attachments = match text.contains('@') {
       true => attach::tokens(&text, &self.cwd),
       // The overwhelmingly common case, and worth not touching the disk for.
@@ -1378,17 +1388,7 @@ impl App {
       return;
     }
     sessions.remove(at);
-    let emptied = sessions.is_empty();
-    // Every index past the deleted one has moved, so the rows are worked out
-    // again rather than patched up — the query is the same, so what is left
-    // is the same list one row shorter.
-    overlay.refilter(&mut self.matcher);
-    overlay.selected = overlay.selected.min(overlay.len().saturating_sub(1));
-    self.notify(format!("Deleted session {title}."));
-    // Nothing left to pick from is nothing to keep a picker open for.
-    if emptied {
-      self.overlay = None;
-    }
+    self.deleted(format!("Deleted session {title}."));
   }
 
   /// Delete the branch the tree is on — the entry under the cursor and
@@ -1422,12 +1422,21 @@ impl App {
     };
     // The rows past it have moved and the indents where it branched off
     // have changed, so the tree is worked out again rather than patched up.
-    let rows = points(&self.session);
-    let emptied = rows.is_empty();
-    overlay.list = OverlayList::Tree(rows);
+    overlay.list = OverlayList::Tree(points(&self.session));
+    self.deleted(format!("Deleted {label}, {} in all.", messages(gone)));
+  }
+
+  /// The list once a row has gone from under it, and `note` to say so.
+  fn deleted(&mut self, note: String) {
+    let Some(overlay) = &mut self.overlay else { return };
+    // Every index past the deleted row has moved, so the rows are worked out
+    // again rather than patched up — the query is the same, so what is left
+    // is the same list one row shorter.
     overlay.refilter(&mut self.matcher);
     overlay.selected = overlay.selected.min(overlay.len().saturating_sub(1));
-    self.notify(format!("Deleted {label}, {} in all.", messages(gone)));
+    let emptied = overlay.list.labels().is_empty();
+    self.notify(note);
+    // Nothing left to pick from is nothing to keep a picker open for.
     if emptied {
       self.overlay = None;
     }
@@ -1599,9 +1608,12 @@ impl App {
   /// The replacement itself, without disturbing the yank buffer — the user's
   /// own cut text is theirs, not ours to overwrite.
   fn fill_input(&mut self, text: &str) {
-    self.input.select_all();
-    self.input.cut();
-    self.input.set_yank_text("");
+    // Clearing goes through the yank buffer too, so what was in it is put
+    // back afterwards; and a selection would be all it cleared.
+    let yank = self.input.yank_text();
+    self.input.cancel_selection();
+    self.input.clear();
+    self.input.set_yank_text(yank);
     self.input.insert_str(text);
     // Only the tokens: a prompt handed back by `/tree` or walked back to
     // should say what it attaches, but it should not open a popup over a
@@ -1623,7 +1635,7 @@ impl App {
       self.input.move_cursor(CursorMove::Head);
       return;
     }
-    let draft = self.input.lines().join("\n");
+    let draft = self.input_text();
     if let Some(text) = self.prompts.previous(&draft) {
       self.fill_input(&text);
       // At the top of the prompt it just handed back, so that holding Up
@@ -1651,7 +1663,7 @@ impl App {
   }
 
   fn submit(&mut self) {
-    let text = self.input.lines().join("\n").trim().to_string();
+    let text = self.input_text().trim().to_string();
     if text.is_empty() {
       return;
     }
@@ -1907,7 +1919,7 @@ impl App {
         let title = session.name.clone().unwrap_or_else(|| session.id.clone());
         // What a compaction summarized is back on screen but not back in the
         // context, so when the two differ both are worth saying.
-        let shown = session.transcript_len(session.leaf());
+        let shown = session.lineage(session.leaf(), true).len();
         let context = session.history.len();
         let counts = match shown > context {
           true => format!("{shown} messages shown, {context} in context"),
@@ -2216,22 +2228,15 @@ impl App {
   // ------------------------------------------------------------ agent events
 
   fn handle_agent(&mut self, ev: AgentEvent) {
-    // Nothing to do with a run: the list was asked for by the UI, and comes
-    // back whether or not the model is busy.
-    if let AgentEvent::Models(models) = ev {
-      self.take_models(models);
-      return;
-    }
-    // Nor this: a server's tools can change with or without a run. Said
-    // where the servers were first said; the footer counts them afresh.
-    if let AgentEvent::Mcp(note) = ev {
-      self.entries.push(Entry::Info(note));
-      return;
-    }
-    if self.run.is_none() {
-      return; // stale event from an aborted run
-    }
     match ev {
+      // Nothing to do with a run: the list was asked for by the UI, and comes
+      // back whether or not the model is busy.
+      AgentEvent::Models(models) => self.take_models(models),
+      // Nor this: a server's tools can change with or without a run. Said
+      // where the servers were first said; the footer counts them afresh.
+      AgentEvent::Mcp(note) => self.entries.push(Entry::Info(note)),
+      // A stale event from an aborted run.
+      _ if self.run.is_none() => {}
       AgentEvent::Text(delta) => match self.entries.last_mut() {
         Some(Entry::Assistant(text)) => text.push_str(&delta),
         _ => self.entries.push(Entry::Assistant(delta)),
@@ -2315,20 +2320,15 @@ impl App {
       AgentEvent::Error(err) => {
         self.entries.push(Entry::Error(err));
       }
-      AgentEvent::Mcp(_) => {}
       // One model call, counted as it happens: a run that takes twenty of
       // them moves the footer twenty times rather than sitting still until
       // it is over.
       AgentEvent::Usage { usage, context_tokens } => {
-        self.usage.input_tokens += usage.input_tokens;
-        self.usage.output_tokens += usage.output_tokens;
-        self.usage.total_tokens += usage.total_tokens;
+        self.usage += usage;
         self.context_tokens = Some(context_tokens);
       }
       AgentEvent::Done { messages } => {
-        self.run = None;
-        self.writing.clear();
-        self.modals.clear();
+        self.run_over();
         self.stopped(messages);
         // The run ended with its answer, so there is nothing to pick back
         // up; a context that outgrew the window is still made room in,
@@ -2341,9 +2341,7 @@ impl App {
         }
       }
       AgentEvent::Ended { messages } => {
-        self.run = None;
-        self.writing.clear();
-        self.modals.clear();
+        self.run_over();
         let full = self.overflowed();
         if self.compacting {
           // A compaction that did not finish is not worth starting again on
@@ -2378,13 +2376,14 @@ impl App {
         let resuming = std::mem::take(&mut self.resuming);
         match result {
           Some(compacted) => {
-            let result = self.session.compacted(compacted.history, &compacted.summary);
+            let kept = compacted.kept.len();
+            let result = self.session.compacted(&compacted.summary, compacted.kept);
             self.report(result);
             self.context_tokens = None;
             self.entries.push(Entry::Info(format!(
               "Compacted {} into a summary; kept the last {}.",
               messages(compacted.summarized),
-              messages(compacted.kept)
+              messages(kept)
             )));
             self.entries.push(Entry::Summary(compacted.summary));
             // What was cut short to make this room carries on where it
@@ -2405,10 +2404,15 @@ impl App {
         }
         self.next_queued();
       }
-      // Answered above, before a run was looked for: the list is the UI's
-      // own errand and arrives whether or not one is going.
-      AgentEvent::Models(_) => {}
     }
+  }
+
+  /// What a run leaves behind once it has stopped, however it stopped: the
+  /// calls it was writing and the questions it was waiting on go with it.
+  fn run_over(&mut self) {
+    self.run = None;
+    self.writing.clear();
+    self.modals.clear();
   }
 
   // ------------------------------------------------------------ drawing
@@ -2458,10 +2462,7 @@ impl App {
     } else {
       Color::Gray
     };
-    let mut block = Block::default()
-      .borders(Borders::ALL)
-      .border_type(BorderType::Rounded)
-      .border_style(Style::default().fg(border_color));
+    let mut block = frame(border_color);
     if let Some(filter) = self.overlay.as_mut().filter(|_| filtering).map(|o| &mut o.filter) {
       filter.field.set_block(block.title(" filter "));
       f.render_widget(&filter.field, input_area);
@@ -2504,11 +2505,7 @@ impl App {
       width,
       height: (lines.len() as u16 + 2).min(area.height),
     };
-    let block = Block::default()
-      .borders(Borders::ALL)
-      .border_type(BorderType::Rounded)
-      .border_style(Style::default().fg(Color::Gray))
-      .padding(Padding::horizontal(1));
+    let block = frame(Color::Gray).padding(Padding::horizontal(1));
     f.render_widget(Clear, toast);
     f.render_widget(Paragraph::new(lines).block(block), toast);
   }
@@ -2658,38 +2655,30 @@ impl App {
     let Some(modal) = self.modals.front() else { return };
     // The dialog says which keys do what along its own bottom, where the
     // answer to that changes with the question.
-    let block = Block::default()
-      .borders(Borders::ALL)
-      .border_type(BorderType::Rounded)
-      .border_style(Style::default().fg(Color::Gray))
-      .title(format!(" {} ", modal.title()));
+    let block = frame(Color::Gray).title(format!(" {} ", modal.title()));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let height = inner.height as usize;
     let (lines, focus) = modal.lines(inner.width);
     // More dialog than screen: scroll it just far enough to keep the row the
     // cursor is on in view, which is the row being answered.
-    let first = focus.saturating_sub(height.saturating_sub(1)).min(focus);
+    let first = focus.saturating_sub(height.saturating_sub(1));
     f.render_widget(
-      Paragraph::new(lines.into_iter().skip(first).take(height).collect::<Vec<_>>()),
+      Paragraph::new(lines).scroll((u16::try_from(first).unwrap_or(u16::MAX), 0)),
       inner,
     );
   }
 
   fn draw_overlay(&self, f: &mut Frame, area: Rect) {
     let Some(overlay) = &self.overlay else { return };
-    let block = Block::default()
-      .borders(Borders::ALL)
-      .border_type(BorderType::Rounded)
-      .border_style(Style::default().fg(Color::Gray))
-      .title(overlay.title());
+    let block = frame(Color::Gray).title(overlay.title());
     let inner = block.inner(area);
     f.render_widget(block, area);
     let height = inner.height as usize;
     let width = inner.width as usize;
     // Only the rows the filter left, which is all of them until something is
     // typed.
-    let shown = overlay.matched();
+    let shown = &overlay.filter.shown;
     // A filter that has narrowed the list to nothing says so, rather than
     // leaving an empty box to be read as a provider with no models, or as a
     // directory with nothing saved in it.
@@ -2843,18 +2832,15 @@ impl App {
       left.push(Span::raw("  "));
       left.push(Span::raw(format!("↑ {behind} lines — pgdn to follow")).dim());
     }
-    let context = (self.context() * 100)
-      .checked_div(self.cfg.compaction.context_window)
-      .map(|pct| (format!("ctx {pct}%  "), pct));
-    let tokens = format!("{}↑ {}↓", self.usage.input_tokens, self.usage.output_tokens);
-    let width = context.as_ref().map_or(0, |(text, _)| text.chars().count()) + tokens.chars().count();
-    let pad = (footer_area.width as usize).saturating_sub(Line::from(left.clone()).width() + width);
-    left.push(Span::raw(" ".repeat(pad)));
-    if let Some((text, percent)) = context {
-      left.push(Span::styled(text, context_style(percent)));
+    let mut right = Vec::new();
+    if let Some(percent) = (self.context() * 100).checked_div(self.cfg.compaction.context_window) {
+      right.push(Span::styled(format!("ctx {percent}%  "), context_style(percent)));
     }
-    left.push(Span::raw(tokens).dim());
-    f.render_widget(Paragraph::new(Line::from(left)), footer_area);
+    right.push(Span::raw(format!("{}↑ {}↓", self.usage.input_tokens, self.usage.output_tokens)).dim());
+    // The figures go over the end of the rest where the two do not both fit:
+    // how full the context is matters more than the tail of a notice.
+    f.render_widget(Line::from(left), footer_area);
+    f.render_widget(Line::from(right).right_aligned(), footer_area);
   }
 
   /// Builds the transcript for a `width`-column viewport.
@@ -3150,6 +3136,13 @@ impl App {
   }
 }
 
+/// The rounded box every panel is drawn in, its border in `color`.
+fn frame(color: Color) -> Block<'static> {
+  Block::bordered()
+    .border_type(BorderType::Rounded)
+    .border_style(Style::default().fg(color))
+}
+
 /// The mark a picker puts on the row the cursor is on.
 fn pointer(selected: bool) -> Span<'static> {
   Span::styled(
@@ -3418,30 +3411,6 @@ fn filter_rows<'a>(
   scored.into_iter().map(|(_, at, hits)| (at, hits)).collect()
 }
 
-/// Which models `query` leaves, matched over ids alone: a provider's display
-/// name is another spelling of the same thing, and matching both would rank a
-/// model twice for looking like itself.
-fn filter_models(matcher: &mut Matcher, models: &[ModelInfo], query: &str) -> Vec<(usize, Vec<u32>)> {
-  filter_rows(matcher, models.iter().map(|model| model.id.as_str()), query)
-}
-
-/// Which sessions `query` leaves, matched over the titles: what a session is
-/// remembered by is its name, or the question it opened with.
-fn filter_sessions(matcher: &mut Matcher, sessions: &[SessionInfo], query: &str) -> Vec<(usize, Vec<u32>)> {
-  filter_rows(matcher, sessions.iter().map(SessionInfo::title), query)
-}
-
-/// Which points `query` leaves, matched over the rows they are drawn as —
-/// indent and all, so the letters picked out sit under the letters typed.
-///
-/// The rows are built to be matched and built again to be drawn, which is two
-/// short strings a keystroke and a list that cannot say one thing and match
-/// another.
-fn filter_points(matcher: &mut Matcher, points: &[Point], query: &str) -> Vec<(usize, Vec<u32>)> {
-  let labels: Vec<String> = points.iter().map(point_label).collect();
-  filter_rows(matcher, labels.iter().map(String::as_str), query)
-}
-
 /// A point as its row reads: indented by the branch points crossed to reach
 /// it.
 fn point_label(point: &Point) -> String {
@@ -3655,22 +3624,10 @@ fn diff_lines(path: Option<&str>, diff: &str) -> Vec<Vec<Span<'static>>> {
 /// The prefix keeps `style` either way: it is the transcript talking about the
 /// line — the half of an edit it belongs to — not part of the line itself.
 fn marked_code(prefix: &str, style: Style, language: &str, text: &str) -> Vec<Vec<Span<'static>>> {
-  let highlighted = crate::highlight::highlight(language, text);
-  // Split rather than `lines`, so a body ending in a newline keeps the empty
-  // line the model is about to write into.
-  text
-    .split('\n')
-    .enumerate()
-    .map(|(i, line)| {
-      let mut row = vec![Span::styled(format!(" {prefix}"), style)];
-      match highlighted
-        .as_ref()
-        .and_then(|lines| lines.get(i))
-        .filter(|spans| !spans.is_empty())
-      {
-        Some(spans) => row.extend(spans.iter().cloned()),
-        None => row.push(Span::styled(line.to_string(), style)),
-      }
+  code_rows(language, text, Style::default(), style)
+    .into_iter()
+    .map(|mut row| {
+      row.insert(0, Span::styled(format!(" {prefix}"), style));
       row
     })
     .collect()
@@ -3924,8 +3881,7 @@ fn highlight(line: &Line<'static>, from: usize, to: usize) -> Line<'static> {
 /// and the styling of what is kept is kept with it: a clipped line is the same
 /// line, shorter.
 fn clip(line: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
-  use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
-  if line.iter().map(|span| span.content.width()).sum::<usize>() <= width {
+  if line.iter().map(|span| span.width()).sum::<usize>() <= width {
     return line;
   }
   // Nowhere to put even the ellipsis: the transcript is narrower than its own
@@ -3933,30 +3889,19 @@ fn clip(line: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
   if width == 0 {
     return Vec::new();
   }
-  let mut out: Vec<Span<'static>> = Vec::with_capacity(line.len() + 1);
-  let mut used = 0;
-  for span in line {
-    let span_width = span.content.width();
-    // A column short of the width, since the ellipsis is going to want one.
-    if used + span_width < width {
-      used += span_width;
-      out.push(span);
-      continue;
-    }
-    // The span the line runs out in, kept as far as it goes.
-    let mut kept = String::new();
-    for c in span.content.chars() {
-      let w = c.width().unwrap_or(0);
-      if used + w + 1 > width {
-        break;
-      }
-      kept.push(c);
-      used += w;
-    }
+  // A column short of the width, since the ellipsis is going to want one.
+  let room = width - 1;
+  let (_, mut out, _) = cut(&Line::from(line), 0, room);
+  // A wide character the cut falls inside goes with its first cell, which
+  // here is one cell more than there is room for.
+  while out.iter().map(|span| span.width()).sum::<usize>() > room
+    && let Some(last) = out.pop()
+  {
+    let mut kept = last.content.into_owned();
+    kept.pop();
     if !kept.is_empty() {
-      out.push(Span::styled(kept, span.style));
+      out.push(Span::styled(kept, last.style));
     }
-    break;
   }
   out.push(Span::styled("…", mark_style(None)));
   out
@@ -3983,7 +3928,15 @@ fn gutter(running: bool, is_error: bool) -> Span<'static> {
 /// Falls back to the plain line wherever the grammar was not built in or had
 /// nothing to say about it, which is the same text either way.
 fn code_spans(language: &str, code: &str, style: Style) -> Vec<Vec<Span<'static>>> {
+  code_rows(language, code, style, style)
+}
+
+/// Each line of `code` highlighted as `language` over `base`, or as the plain
+/// line in `plain` where the grammar had nothing to say about it.
+fn code_rows(language: &str, code: &str, base: Style, plain: Style) -> Vec<Vec<Span<'static>>> {
   let highlighted = crate::highlight::highlight(language, code);
+  // Split rather than `lines`, so a body ending in a newline keeps the empty
+  // line the model is about to write into.
   code
     .split('\n')
     .enumerate()
@@ -3995,9 +3948,9 @@ fn code_spans(language: &str, code: &str, style: Style) -> Vec<Vec<Span<'static>
       {
         Some(spans) => spans
           .iter()
-          .map(|span| Span::styled(span.content.clone(), style.patch(span.style)))
+          .map(|span| Span::styled(span.content.clone(), base.patch(span.style)))
           .collect(),
-        None => vec![Span::styled(line.to_string(), style)],
+        None => vec![Span::styled(line.to_string(), plain)],
       }
     })
     .collect()
@@ -4226,6 +4179,10 @@ fn entries_from_history(session: &Session) -> Vec<Entry> {
   let results = Results::collect(&history);
   let mut answered: HashSet<usize> = HashSet::new();
   for message in &history {
+    if let Some(summary) = crate::compaction::previous_summary(message) {
+      entries.push(Entry::Summary(summary.to_string()));
+      continue;
+    }
     match message {
       Message::System { .. } => {}
       Message::User { content } => {
@@ -4248,14 +4205,6 @@ fn entries_from_history(session: &Session) -> Vec<Entry> {
         for c in content {
           match c {
             UserContent::Text(t) => {
-              let summary = t
-                .text
-                .strip_prefix(SUMMARY_PREFIX)
-                .and_then(|r| r.strip_suffix(SUMMARY_SUFFIX));
-              if let Some(s) = summary {
-                entries.push(Entry::Summary(s.to_string()));
-                continue;
-              }
               if prompt_seen && attachments {
                 continue;
               }
@@ -4443,7 +4392,7 @@ fn point(session: &Session, node: &Node, depth: usize) -> Option<Point> {
     // The prompt that was answered here ends the conversation in the same
     // place, but hands itself back to be asked again, which is not nothing.
     here: leaf.as_deref() == session.leaf() && text.is_none(),
-    len: session.branch_len(leaf.as_deref()),
+    len: session.lineage(leaf.as_deref(), false).len(),
     leaf,
     text,
     label,
@@ -4692,11 +4641,12 @@ fn value_after(json: &str, at: usize) -> Option<String> {
   Some(out)
 }
 
-fn shorten_home(path: &std::path::Path) -> String {
-  let s = path.display().to_string();
-  match std::env::var("HOME") {
-    Ok(home) if !home.is_empty() && s.starts_with(&home) => format!("~{}", &s[home.len()..]),
-    _ => s,
+fn shorten_home(path: &Path) -> String {
+  let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
+  match home.as_deref().and_then(|home| path.strip_prefix(home).ok()) {
+    Some(rest) if rest.as_os_str().is_empty() => "~".into(),
+    Some(rest) => format!("~/{}", rest.display()),
+    None => path.display().to_string(),
   }
 }
 
@@ -4858,8 +4808,10 @@ mod tests {
         context_length: None,
       })
       .collect();
+    let list = OverlayList::Models(models.clone());
     let mut ids = |query| {
-      filter_models(&mut matcher, &models, query)
+      list
+        .filter(&mut matcher, query)
         .into_iter()
         .map(|(at, _)| models[at].id.as_str())
         .collect::<Vec<_>>()
@@ -4872,10 +4824,10 @@ mod tests {
     assert_eq!(ids("claude"), ["claude-sonnet-5", "claude-haiku-4-5"]);
     assert!(ids("zzz").is_empty());
     // And the letters it matched are picked out where they are: s-o-n-net.
-    let matched = filter_models(&mut matcher, &models, "son");
+    let matched = list.filter(&mut matcher, "son");
     assert_eq!(matched[0].1, [7, 8, 9]);
     // Nothing typed, nothing picked out.
-    assert!(filter_models(&mut matcher, &models, "")[0].1.is_empty());
+    assert!(list.filter(&mut matcher, "")[0].1.is_empty());
   }
 
   #[test]
@@ -4895,8 +4847,10 @@ mod tests {
       session(Some("release notes"), "unrelated first message"),
       session(None, "add a filter to the picker"),
     ];
+    let list = OverlayList::Sessions(sessions.clone());
     let mut titles = |query| {
-      filter_sessions(&mut matcher, &sessions, query)
+      list
+        .filter(&mut matcher, query)
         .into_iter()
         .map(|(at, _)| sessions[at].title())
         .collect::<Vec<_>>()
@@ -4912,7 +4866,7 @@ mod tests {
     assert_eq!(titles("scrlbr"), ["fix the scrollbar"]);
     assert!(titles("zzz").is_empty());
     // And the letters it matched are picked out where they are: f-i-lter.
-    let matched = filter_sessions(&mut matcher, &sessions, "fil");
+    let matched = list.filter(&mut matcher, "fil");
     assert_eq!(matched[0].1, [6, 7, 8]);
   }
 
@@ -4934,8 +4888,13 @@ mod tests {
       point("It prints hi.", 1),
       point("Actually it prints hi and exits 0.", 1),
     ];
+    let list = OverlayList::Tree(points);
+    let OverlayList::Tree(points) = &list else {
+      unreachable!()
+    };
     let mut labels = |query| {
-      filter_points(&mut matcher, &points, query)
+      list
+        .filter(&mut matcher, query)
         .into_iter()
         .map(|(at, _)| points[at].label.as_str())
         .collect::<Vec<_>>()
@@ -4957,7 +4916,7 @@ mod tests {
     assert!(labels("zzz").is_empty());
     // The indent counts as part of the row, so the letters picked out land on
     // the letters the row draws: two spaces, then I-t, and p a space later.
-    let matched = filter_points(&mut matcher, &points, "itp");
+    let matched = list.filter(&mut matcher, "itp");
     assert_eq!(matched[0].1, [2, 3, 5]);
   }
 
@@ -5055,9 +5014,7 @@ mod tests {
     let mut history = tool_history();
     // A compaction checkpoint travels as a user message, and is no more a
     // prompt than the tool result above it is.
-    history.push(Message::user(format!(
-      "{SUMMARY_PREFIX}Files were read.{SUMMARY_SUFFIX}"
-    )));
+    history.push(crate::compaction::summary_message("Files were read."));
     history.push(Message::user("and now b.rs"));
     let prompts = Prompts::of(&session_of(history));
     assert_eq!(prompts.sent, ["look at a.rs", "and now b.rs"]);
@@ -5270,6 +5227,8 @@ mod tests {
     assert_eq!(text(&[clip(plain("0123456789abc"), 10)]), ["012345678…"]);
     // Columns, not characters: a wide one takes two of them.
     assert_eq!(text(&[clip(plain("ありがとう"), 5)]), ["あり…"]);
+    // And one that would straddle the ellipsis's column is left out whole.
+    assert_eq!(text(&[clip(plain("ありがとう"), 4)]), ["あ…"]);
     // Narrower than the ellipsis itself, there is nothing to say.
     assert_eq!(clip(plain("anything"), 0), []);
     // A clipped line is the same line, shorter: what is kept keeps its colour.

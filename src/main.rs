@@ -239,7 +239,7 @@ async fn main() -> Result<()> {
   // The servers come up before the terminal does, and stay up as long as this
   // binding: a stdio server is a child process of ours, and closing the
   // connection is what stops it.
-  let (servers, notes) = match no_mcp {
+  let (servers, mut notes) = match no_mcp {
     true => (mcp::Servers::default(), Vec::new()),
     false => {
       let files = mcp::files(mcp_config.as_deref());
@@ -258,7 +258,6 @@ async fn main() -> Result<()> {
     .chain(servers.catalog().tool_names())
     .collect();
   let (allowed, unknown) = tools::choose(&available, &tools, &no_tools);
-  let mut notes = notes;
   if !unknown.is_empty() {
     notes.push(format!(
       "No tool named {} — nothing left in or out by it.",
@@ -304,7 +303,7 @@ async fn main() -> Result<()> {
   // first one at its first newline.
   let bracketed = execute!(stdout(), EnableBracketedPaste).is_ok();
   // Lets terminals that speak the kitty keyboard protocol report Shift+Enter.
-  let enhanced = matches!(supports_keyboard_enhancement(), Ok(true))
+  let enhanced = supports_keyboard_enhancement().unwrap_or(false)
     && execute!(
       stdout(),
       PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)

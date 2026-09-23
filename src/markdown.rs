@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 // `::markdown` is the crate; this module shares its name.
 use ::markdown::ParseOptions;
-use ::markdown::mdast::{AlignKind, List, Node};
+use ::markdown::mdast::{AlignKind, FootnoteDefinition, List, Node};
 use mdstitch::{StitchOptions, stitch};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -99,7 +99,11 @@ pub fn render(md: &str, width: u16, streaming: bool) -> Vec<Line<'static>> {
 /// The indent a line starts with is part of it and is kept; the space a break
 /// falls on belongs to neither side and is dropped, as `wrap` drops it.
 pub fn wrap_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
-  let width = width as usize;
+  fold(line, width.into())
+}
+
+/// `wrap_line` to any width, a width of none leaving the line as it is.
+fn fold(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
   // A tab is measured as no columns and drawn as however many the terminal
   // feels like, and a carriage return draws the rest of the line over the
   // start of it, so a line carrying either is rebuilt even when it fits.
@@ -191,7 +195,11 @@ pub fn wrap_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
 /// written rather than parsed — the reasoning block, which is the model
 /// thinking aloud and not markdown it meant for us to render.
 pub fn wrap_text(text: &str, width: u16, style: Style) -> Vec<Line<'static>> {
-  let width = (width as usize).max(1);
+  plain(text, width.into(), style)
+}
+
+/// Each line of `text` wrapped on its own, all in the one style.
+fn plain(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
   text
     .lines()
     .flat_map(|line| wrap(vec![Span::styled(line.to_string(), style)], width))
@@ -220,8 +228,9 @@ struct Refs<'a> {
   referenced: Vec<String>,
   /// Link and image definitions, by their (already lowercased) label.
   links: HashMap<String, String>,
-  /// Every footnote's body, referred to or not, in the order written.
-  footnotes: Vec<&'a Node>,
+  /// Every footnote's body, referred to or not, by its label. A label
+  /// defined twice keeps its first body, as on github.com.
+  footnotes: HashMap<&'a str, &'a FootnoteDefinition>,
 }
 
 impl<'a> Refs<'a> {
@@ -239,7 +248,9 @@ impl<'a> Refs<'a> {
       Node::Definition(definition) => {
         self.links.insert(definition.identifier.clone(), definition.url.clone());
       }
-      Node::FootnoteDefinition(_) => self.footnotes.push(node),
+      Node::FootnoteDefinition(definition) => {
+        self.footnotes.entry(&definition.identifier).or_insert(definition);
+      }
       _ => {}
     }
     for child in children(node) {
@@ -255,25 +266,24 @@ impl<'a> Refs<'a> {
 
   /// Appends the footnote list, in reference order, after the body.
   fn render_footnotes(&self, width: usize, out: &mut Vec<Line<'static>>) {
-    let mut definitions: Vec<(usize, &Node)> = self
-      .footnotes
+    // Numbered by position among the references, so a reference with no
+    // body leaves a gap rather than renumbering the ones after it.
+    let definitions: Vec<(usize, &FootnoteDefinition)> = self
+      .referenced
       .iter()
-      .filter_map(|&node| match node {
-        Node::FootnoteDefinition(definition) => Some((self.number(&definition.identifier)?, node)),
-        _ => None,
-      })
+      .enumerate()
+      .filter_map(|(i, id)| Some((i + 1, *self.footnotes.get(id.as_str())?)))
       .collect();
     if definitions.is_empty() {
       return;
     }
-    definitions.sort_by_key(|(number, _)| *number);
     out.push(Line::default());
     out.push(Line::styled("─".repeat(width.min(HR_MAX)), style::BORDER));
     for (number, definition) in definitions {
       let marker = Span::styled(format!("[{number}] "), style::FOOTNOTE);
       let body = width.saturating_sub(marker.width()).max(1);
       let mut inner = Vec::new();
-      blocks(children(definition), body, self, &mut inner);
+      blocks(&definition.children, body, self, &mut inner);
       hang(inner, &marker, &mut false, out);
     }
   }
@@ -355,19 +365,12 @@ fn block(node: &Node, width: usize, refs: &Refs, out: &mut Vec<Line<'static>>) {
       let mut inner = Vec::new();
       blocks(children(node), body, refs, &mut inner);
       trim_blank(&mut inner);
-      for line in inner {
+      for mut line in inner {
         // The quote style is a floor, not an override: inline code and links
         // inside a quote keep their own colour.
-        let line = Line::from(
-          line
-            .spans
-            .into_iter()
-            .map(|span| {
-              let style = style::QUOTE.patch(span.style);
-              Span::styled(span.content, style)
-            })
-            .collect::<Vec<_>>(),
-        );
+        for span in &mut line.spans {
+          span.style = style::QUOTE.patch(span.style);
+        }
         out.push(prefix(Span::styled(QUOTE_PREFIX, style::BORDER), line));
       }
     }
@@ -375,16 +378,8 @@ fn block(node: &Node, width: usize, refs: &Refs, out: &mut Vec<Line<'static>>) {
       out.push(Line::styled("─".repeat(width.min(HR_MAX)), style::BORDER));
     }
     Node::Table(table) => table_block(&table.children, &table.align, width, refs, out),
-    Node::Html(html) => {
-      for line in html.value.lines() {
-        out.extend(wrap(vec![Span::styled(line.to_string(), style::DIM)], width));
-      }
-    }
-    Node::Math(math) => {
-      for line in math.value.lines() {
-        out.extend(wrap(vec![Span::raw(line.to_string())], width));
-      }
-    }
+    Node::Html(html) => out.extend(plain(&html.value, width, style::DIM)),
+    Node::Math(math) => out.extend(plain(&math.value, width, Style::default())),
     // Link reference targets and footnote bodies carry no visible text of
     // their own; anything else block-shaped is rendered as its inline run.
     Node::Definition(_) | Node::FootnoteDefinition(_) => {}
@@ -446,12 +441,18 @@ fn list_block(list: &List, depth: usize, width: usize, refs: &Refs, out: &mut Ve
 fn table_block(rows: &[Node], align: &[AlignKind], width: usize, refs: &Refs, out: &mut Vec<Line<'static>>) {
   let cells: Vec<Vec<Vec<Span<'static>>>> = rows
     .iter()
-    .map(|row| {
+    .enumerate()
+    .map(|(r, row)| {
+      // The header row is bold throughout.
+      let base = match r {
+        0 => Style::new().add_modifier(Modifier::BOLD),
+        _ => Style::default(),
+      };
       children(row)
         .iter()
         .map(|cell| {
           let mut spans = Vec::new();
-          inline(children(cell), Style::default(), refs, &mut spans);
+          inline(children(cell), base, refs, &mut spans);
           spans
         })
         .collect()
@@ -468,7 +469,7 @@ fn table_block(rows: &[Node], align: &[AlignKind], width: usize, refs: &Refs, ou
       cells
         .iter()
         .filter_map(|row| row.get(c))
-        .map(|spans| spans.iter().map(|s| s.content.width()).sum::<usize>())
+        .map(|spans| spans.iter().map(Span::width).sum::<usize>())
         .max()
         .unwrap_or(0)
         .max(1)
@@ -491,26 +492,14 @@ fn table_block(rows: &[Node], align: &[AlignKind], width: usize, refs: &Refs, ou
   for (r, row) in cells.iter().enumerate() {
     // Every cell wraps to its column, then the row is as tall as the tallest.
     let wrapped: Vec<Vec<Line<'static>>> = (0..columns)
-      .map(|c| {
-        let spans = row.get(c).cloned().unwrap_or_default();
-        let spans = if r == 0 {
-          spans
-            .into_iter()
-            .map(|s| Span::styled(s.content, s.style.add_modifier(Modifier::BOLD)))
-            .collect()
-        } else {
-          spans
-        };
-        wrap(spans, widths[c])
-      })
+      .map(|c| wrap(row.get(c).cloned().unwrap_or_default(), widths[c]))
       .collect();
     let height = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
     for line in 0..height {
       let mut spans = vec![Span::styled("│", style::BORDER)];
       for (c, column) in wrapped.iter().enumerate() {
         let content = column.get(line).cloned().unwrap_or_default();
-        let used: usize = content.spans.iter().map(|s| s.content.width()).sum();
-        let pad = widths[c].saturating_sub(used);
+        let pad = widths[c].saturating_sub(content.width());
         let (before, after) = match align.get(c) {
           Some(AlignKind::Right) => (pad, 0),
           Some(AlignKind::Center) => (pad / 2, pad - pad / 2),
@@ -520,7 +509,6 @@ fn table_block(rows: &[Node], align: &[AlignKind], width: usize, refs: &Refs, ou
         spans.extend(content.spans);
         spans.push(Span::raw(" ".repeat(after + 1)));
         spans.push(Span::styled("│", style::BORDER));
-        let _ = c;
       }
       out.push(Line::from(spans));
     }
@@ -587,7 +575,7 @@ fn inline(nodes: &[Node], base: Style, refs: &Refs, out: &mut Vec<Span<'static>>
       // resolving it the text would render as unmarked prose, losing both the
       // fact that it is a link and where it points.
       Node::LinkReference(reference) => match refs.links.get(&reference.identifier) {
-        Some(url) => link_spans(&reference.children, &url.clone(), base, refs, out),
+        Some(url) => link_spans(&reference.children, url, base, refs, out),
         None => inline(&reference.children, base, refs, out),
       },
       Node::Image(image) => out.push(image_span(&image.alt, base)),
@@ -659,17 +647,15 @@ fn hang(mut lines: Vec<Line<'static>>, marker: &Span<'static>, marked: &mut bool
 }
 
 /// Puts `lead` in front of `line`, keeping the rest of its spans.
-fn prefix(lead: Span<'static>, line: Line<'static>) -> Line<'static> {
-  let mut spans = Vec::with_capacity(line.spans.len() + 1);
-  spans.push(lead);
-  spans.extend(line.spans);
-  Line::from(spans)
+fn prefix(lead: Span<'static>, mut line: Line<'static>) -> Line<'static> {
+  line.spans.insert(0, lead);
+  line
 }
 
 /// Word-wraps a run of spans to `width`, carrying each span's style onto its
 /// fragments.
 fn wrap(spans: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>> {
-  wrap_line(Line::from(spans), width.clamp(1, u16::MAX.into()) as u16)
+  fold(Line::from(spans), width.max(1))
 }
 
 /// Splits on whitespace, keeping the separators so spacing survives wrapping.

@@ -4,11 +4,10 @@
 //! And the other direction: an image a tool answered with, drawn in the
 //! transcript as half-blocks.
 
-use std::io::Cursor;
-
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use image::codecs::jpeg::JpegEncoder;
+use image::codecs::png::PngEncoder;
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, ImageFormat, Rgba};
 use ratatui::style::{Color, Style};
@@ -18,7 +17,7 @@ use rig_core::message::{DocumentSourceKind, ImageMediaType, ToolResultContent};
 const MAX_WIDTH: u32 = 2000;
 const MAX_HEIGHT: u32 = 2000;
 /// Limit on the base64-encoded size.
-const MAX_BASE64_BYTES: usize = (4.5 * 1024.0 * 1024.0) as usize;
+const MAX_BASE64_BYTES: usize = 9 * 512 * 1024;
 const JPEG_QUALITIES: [u8; 4] = [80, 70, 55, 40];
 const UNCONVERTIBLE: &str = "[Image omitted: could not be converted to a supported inline image format.]";
 
@@ -60,8 +59,9 @@ pub fn detect(bytes: &[u8]) -> Option<ImageFormat> {
   image::guess_format(bytes).ok().filter(|f| supported(*f))
 }
 
-fn base64_len(bytes: usize) -> usize {
-  bytes.div_ceil(3) * 4
+/// Whether `bytes` of image stay under the base64 limit once encoded.
+fn fits(bytes: &[u8]) -> bool {
+  base64::encoded_len(bytes.len(), true).is_some_and(|len| len < MAX_BASE64_BYTES)
 }
 
 /// Prepare an image for the model. `Err` carries the note shown in place of
@@ -82,7 +82,7 @@ pub fn process(bytes: &[u8], format: ImageFormat) -> Result<ProcessedImage, Stri
     }
   };
 
-  if width <= MAX_WIDTH && height <= MAX_HEIGHT && base64_len(bytes.len()) < MAX_BASE64_BYTES {
+  if width <= MAX_WIDTH && height <= MAX_HEIGHT && fits(&bytes) {
     return Ok(ProcessedImage {
       bytes,
       media_type,
@@ -107,40 +107,45 @@ pub fn process(bytes: &[u8], format: ImageFormat) -> Result<ProcessedImage, Stri
 /// and keep shrinking by 25% until something fits.
 fn shrink(image: &DynamicImage) -> Option<(Vec<u8>, ImageMediaType, u32, u32)> {
   let (ow, oh) = image.dimensions();
-  let ratio = f64::min(MAX_WIDTH as f64 / ow as f64, MAX_HEIGHT as f64 / oh as f64).min(1.0);
-  let mut w = ((ow as f64 * ratio) as u32).max(1);
-  let mut h = ((oh as f64 * ratio) as u32).max(1);
+  // The box the image is fitted into, aspect kept; it is what shrinks.
+  let (mut bw, mut bh) = (ow.min(MAX_WIDTH), oh.min(MAX_HEIGHT));
   loop {
-    let resized = if (w, h) == (ow, oh) {
+    let resized = if (bw, bh) == (ow, oh) {
       image.clone()
     } else {
-      image.resize_exact(w, h, FilterType::Lanczos3)
+      image.resize(bw, bh, FilterType::Lanczos3)
     };
+    let (w, h) = resized.dimensions();
     // Encoded one at a time, stopping at the first that fits: an encode of a
     // large image is the expensive part.
     let png = std::iter::once_with(|| encode_png(&resized).map(|b| (b, ImageMediaType::PNG)));
     let jpegs = JPEG_QUALITIES
       .iter()
       .map(|&quality| encode_jpeg(&resized, quality).map(|b| (b, ImageMediaType::JPEG)));
-    if let Some((bytes, media_type)) = png
-      .chain(jpegs)
-      .flatten()
-      .find(|(b, _)| base64_len(b.len()) < MAX_BASE64_BYTES)
-    {
+    if let Some((bytes, media_type)) = png.chain(jpegs).flatten().find(|(b, _)| fits(b)) {
       return Some((bytes, media_type, w, h));
     }
     if w == 1 && h == 1 {
       return None;
     }
-    w = ((w as f64 * 0.75) as u32).max(1);
-    h = ((h as f64 * 0.75) as u32).max(1);
+    bw = (bw * 3 / 4).max(1);
+    bh = (bh * 3 / 4).max(1);
   }
 }
 
 fn encode_png(image: &DynamicImage) -> Option<Vec<u8>> {
-  let mut out = Cursor::new(Vec::new());
-  image.write_to(&mut out, ImageFormat::Png).ok()?;
-  Some(out.into_inner())
+  let mut out = Vec::new();
+  image.write_with_encoder(PngEncoder::new(&mut out)).ok()?;
+  Some(out)
+}
+
+/// JPEG has no alpha channel; the encoder is handed the image without it.
+fn encode_jpeg(image: &DynamicImage, quality: u8) -> Option<Vec<u8>> {
+  let mut out = Vec::new();
+  image
+    .write_with_encoder(JpegEncoder::new_with_quality(&mut out, quality))
+    .ok()?;
+  Some(out)
 }
 
 /// A pixel this transparent is left to the terminal's own background.
@@ -236,19 +241,11 @@ fn cell(upper: &Rgba<u8>, lower: Option<&Rgba<u8>>) -> (char, Style) {
   }
 }
 
-fn encode_jpeg(image: &DynamicImage, quality: u8) -> Option<Vec<u8>> {
-  let mut out = Cursor::new(Vec::new());
-  // JPEG has no alpha channel.
-  let rgb = image.to_rgb8();
-  let encoder = JpegEncoder::new_with_quality(&mut out, quality);
-  rgb.write_with_encoder(encoder).ok()?;
-  Some(out.into_inner())
-}
-
 #[cfg(test)]
 mod tests {
   use super::*;
   use image::ImageBuffer;
+  use std::io::Cursor;
 
   fn png(width: u32, height: u32) -> Vec<u8> {
     let img = ImageBuffer::from_fn(width, height, |x, y| Rgba([(x % 256) as u8, (y % 256) as u8, 128, 255]));

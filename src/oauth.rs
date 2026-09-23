@@ -40,7 +40,7 @@ use rmcp::transport::auth::{
 };
 use rmcp::transport::streamable_http_client::StreamableHttpError;
 use serde::Deserialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::keyring;
@@ -69,25 +69,20 @@ const CLIENT_NAME: &str = "fa";
 /// clients itself or needs to be asked for something in particular. A server
 /// that does need nothing here: signing in is what a 401 starts.
 #[derive(Debug, Default, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Settings {
   /// The client registered with the server by hand, for one that registers
   /// no one itself.
-  #[serde(default)]
   pub client_id: Option<String>,
   /// Its secret, if it has one.
-  #[serde(default)]
   pub client_secret: Option<String>,
   /// The same, for a secret that should not sit in a file: a line of shell
   /// whose output is the secret.
-  #[serde(default)]
   pub client_secret_command: Option<String>,
   /// What to ask for, where what the server says it offers is not it.
-  #[serde(default)]
   pub scopes: Vec<String>,
   /// The port the browser comes back to. Any free one, unless the client
   /// was registered with an address that names one.
-  #[serde(default)]
   pub port: Option<u16>,
 }
 
@@ -123,9 +118,6 @@ pub fn client(manager: AuthorizationManager) -> rmcp::transport::auth::AuthClien
 /// The login the keyring has for `url`, set up to be used, or `None` when
 /// there is none to use.
 pub async fn resume(url: &str, settings: &Settings, store: &Store) -> Result<Option<AuthorizationManager>> {
-  if store.load().await?.is_none() {
-    return Ok(None);
-  }
   let mut manager = AuthorizationManager::new(url).await?;
   manager.set_credential_store(store.clone());
   if !manager.initialize_from_store().await? {
@@ -164,8 +156,7 @@ pub async fn login(name: &str, url: &str, settings: &Settings, store: &Store) ->
   let scopes: Vec<&str> = scopes.iter().map(String::as_str).collect();
   match &settings.client_id {
     Some(id) => {
-      let mut client =
-        OAuthClientConfig::new(id, &redirect).with_scopes(scopes.iter().map(|s| s.to_string()).collect());
+      let mut client = OAuthClientConfig::new(id, &redirect);
       if let Some(secret) = secret {
         client = client.with_client_secret(secret);
       }
@@ -260,24 +251,20 @@ async fn opened(opener: &str, address: &str) -> Option<String> {
 async fn callback(listener: TcpListener, name: &str) -> Result<String> {
   let origin = format!("http://{}", listener.local_addr()?);
   // Every connection on its own, since the one with the code need not be the
-  // first: a browser opens a spare, and asks for an icon.
-  let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-  let accepting = tokio::spawn(async move {
-    loop {
-      let Ok((stream, _)) = listener.accept().await else {
-        return;
-      };
-      let tx = tx.clone();
-      tokio::spawn(async move {
-        if let Ok(Some(target)) = tokio::time::timeout(REQUEST_TIMEOUT, target(stream)).await {
-          let _ = tx.send(target);
-        }
-      });
-    }
-  });
-  let result = loop {
-    let Some((target, stream)) = rx.recv().await else {
-      bail!("stopped listening for the browser");
+  // first: a browser opens a spare, and asks for an icon. Those still being
+  // read once it has come go with the set.
+  let mut reading = tokio::task::JoinSet::new();
+  loop {
+    let (target, stream) = tokio::select! {
+      accepted = listener.accept() => {
+        let (stream, _) = accepted.context("stopped listening for the browser")?;
+        reading.spawn(tokio::time::timeout(REQUEST_TIMEOUT, target(stream)));
+        continue;
+      }
+      Some(read) = reading.join_next() => match read {
+        Ok(Ok(Some(read))) => read,
+        _ => continue,
+      },
     };
     let address = format!("{origin}{target}");
     let Ok(url) = url::Url::parse(&address) else {
@@ -294,7 +281,7 @@ async fn callback(listener: TcpListener, name: &str) -> Result<String> {
         None => error,
       };
       reply(stream, "200 OK", &format!("{name} did not sign you in: {reason}")).await;
-      break Err(anyhow::anyhow!("the sign-in was turned down: {reason}"));
+      bail!("the sign-in was turned down: {reason}");
     }
     reply(
       stream,
@@ -302,30 +289,24 @@ async fn callback(listener: TcpListener, name: &str) -> Result<String> {
       &format!("Signed in to {name}. This tab can be closed."),
     )
     .await;
-    break Ok(address);
-  };
-  accepting.abort();
-  result
+    return Ok(address);
+  }
 }
 
 /// What one connection asks for — the path and query of its request line —
 /// and the connection, to answer it on.
-async fn target(mut stream: TcpStream) -> Option<(String, TcpStream)> {
-  let mut read = Vec::new();
-  let mut buffer = [0; 4096];
+async fn target(stream: TcpStream) -> Option<(String, TcpStream)> {
+  let mut reader = BufReader::new(stream);
+  let mut line = String::new();
   // The request line is all that is wanted, and it comes first; a request
   // that has sent a lot without one is not a browser coming back.
-  while !read.windows(2).any(|w| w == b"\r\n") {
-    let n = stream.read(&mut buffer).await.ok()?;
-    if n == 0 || read.len() > 16 * 1024 {
-      return None;
-    }
-    read.extend_from_slice(&buffer[..n]);
+  (&mut reader).take(16 * 1024).read_line(&mut line).await.ok()?;
+  if !line.ends_with('\n') {
+    return None;
   }
-  let line = String::from_utf8_lossy(&read);
-  let mut parts = line.lines().next()?.split_whitespace();
+  let mut parts = line.split_whitespace();
   let (method, target) = (parts.next()?, parts.next()?);
-  (method == "GET" && target.starts_with('/')).then(|| (target.to_string(), stream))
+  (method == "GET" && target.starts_with('/')).then(|| (target.to_string(), reader.into_inner()))
 }
 
 async fn reply(mut stream: TcpStream, status: &str, text: &str) {
@@ -386,12 +367,9 @@ impl Store {
     [("application", APPLICATION), ("mcp-url", &self.url)]
   }
 
-  async fn read(&self) -> Result<Option<StoredCredentials>, String> {
-    let keyring = keyring::shared().await?;
-    let items = keyring
-      .search_items(&self.attributes())
-      .await
-      .map_err(|e| e.to_string())?;
+  async fn read(&self) -> Result<Option<StoredCredentials>> {
+    let keyring = keyring::shared().await.map_err(anyhow::Error::msg)?;
+    let items = keyring.search_items(&self.attributes()).await?;
     let Some(item) = items.first() else {
       return Ok(None);
     };
@@ -401,14 +379,11 @@ impl Store {
     Ok(serde_json::from_slice(secret.as_bytes()).ok())
   }
 
-  async fn write(&self, credentials: &StoredCredentials) -> Result<(), String> {
-    let keyring = keyring::shared().await?;
-    let secret = serde_json::to_vec(credentials).map_err(|e| e.to_string())?;
+  async fn write(&self, credentials: &StoredCredentials) -> Result<()> {
+    let keyring = keyring::shared().await.map_err(anyhow::Error::msg)?;
+    let secret = serde_json::to_vec(credentials)?;
     let label = format!("fa: MCP login for {}", self.url);
-    keyring
-      .create_item(&label, &self.attributes(), secret, true)
-      .await
-      .map_err(|e| e.to_string())
+    Ok(keyring.create_item(&label, &self.attributes(), secret, true).await?)
   }
 }
 

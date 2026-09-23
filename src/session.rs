@@ -211,7 +211,7 @@ fn read_info(path: &Path) -> Result<SessionInfo> {
     path: path.to_path_buf(),
     // A file that has been gone back through holds more entries than the
     // conversation does, and it is the conversation the picker is describing.
-    message_count: session.branch_len(session.leaf()),
+    message_count: session.lineage(session.leaf(), false).len(),
     first_message,
     id: session.id,
     name: session.name,
@@ -234,6 +234,9 @@ pub fn user_text(message: &Message) -> Option<String> {
   let Message::User { content } = message else {
     return None;
   };
+  if compaction::is_summary(message) {
+    return None;
+  }
   let attachments = content.iter().any(|c| matches!(c, UserContent::Image(_)));
   let mut text: Vec<&str> = content
     .iter()
@@ -248,11 +251,7 @@ pub fn user_text(message: &Message) -> Option<String> {
   if text.is_empty() {
     return None;
   }
-  let text = text.join("\n");
-  if text.starts_with(compaction::SUMMARY_PREFIX) {
-    return None;
-  }
-  Some(text)
+  Some(text.join("\n"))
 }
 
 /// Every way a tool result names the call it answers.
@@ -311,18 +310,6 @@ fn rewrite_without(path: &Path, gone: &HashSet<String>) -> Result<()> {
   let temp = path.with_extension("jsonl.tmp");
   std::fs::write(&temp, kept).with_context(|| format!("cannot write {}", temp.display()))?;
   std::fs::rename(&temp, path).with_context(|| format!("cannot replace {}", path.display()))
-}
-
-/// The compaction checkpoint as it travels in a history: a user message
-/// wearing the summary markers.
-fn is_summary(message: &Message) -> bool {
-  let Message::User { content } = message else {
-    return false;
-  };
-  content.iter().any(|c| match c {
-    UserContent::Text(t) => t.text.starts_with(compaction::SUMMARY_PREFIX),
-    _ => false,
-  })
 }
 
 fn first_line(text: &str) -> String {
@@ -563,16 +550,6 @@ impl Session {
     messages(self.ancestry(leaf, true))
   }
 
-  /// How long that conversation is, without building it.
-  pub fn branch_len(&self, leaf: Option<&str>) -> usize {
-    self.ancestry(leaf, false).len()
-  }
-
-  /// The same for the transcript, which a compaction leaves longer.
-  pub fn transcript_len(&self, leaf: Option<&str>) -> usize {
-    self.ancestry(leaf, true).len()
-  }
-
   /// A fresh id, past anything the file already holds.
   fn mint(&mut self) -> String {
     self.ids += 1;
@@ -613,27 +590,36 @@ impl Session {
   pub fn append_with(&mut self, messages: Vec<Message>, outcomes: &HashMap<String, Outcome>) -> Result<()> {
     let mut records = Vec::with_capacity(messages.len());
     for message in messages {
-      let id = self.mint();
       let answered: Vec<Outcome> = call_ids(&message).filter_map(|id| outcomes.get(&id).cloned()).collect();
       for outcome in &answered {
         self.outcomes.insert(outcome.call.clone(), outcome.clone());
       }
-      records.push(Record::Message {
-        id: id.clone(),
-        parent: self.leaf.clone(),
-        outcomes: answered,
-        message: message.clone(),
-      });
       self.history.push(message.clone());
-      let parent = self.leaf.take();
-      self.push(Node {
-        id: id.clone(),
-        parent,
-        kind: NodeKind::Message(message),
-      });
-      self.leaf = Some(id);
+      records.push(self.grow(NodeKind::Message(message), answered));
     }
     self.write_all(&records)
+  }
+
+  /// Add an entry under the leaf and make it the leaf, answering the record
+  /// that writes it. `outcomes` are for a message's record.
+  fn grow(&mut self, kind: NodeKind, outcomes: Vec<Outcome>) -> Record {
+    let id = self.mint();
+    let parent = self.leaf.replace(id.clone());
+    let record = match &kind {
+      NodeKind::Message(message) => Record::Message {
+        id: id.clone(),
+        parent: parent.clone(),
+        outcomes,
+        message: message.clone(),
+      },
+      NodeKind::Checkpoint { summary } => Record::Compaction {
+        id: id.clone(),
+        parent: parent.clone(),
+        summary: summary.clone(),
+      },
+    };
+    self.push(Node { id, parent, kind });
+    record
   }
 
   /// How the tool result answering `call` went, if anything was recorded.
@@ -646,26 +632,15 @@ impl Session {
   /// The checkpoint is one entry standing for everything above it; the turns
   /// the compaction kept verbatim are written after it as entries of their
   /// own, so each stays a place the conversation can go back to.
-  pub fn compacted(&mut self, history: Vec<Message>, summary: &str) -> Result<()> {
-    let id = self.mint();
-    let record = Record::Compaction {
-      id: id.clone(),
-      parent: self.leaf.clone(),
-      summary: summary.to_string(),
-    };
-    let parent = self.leaf.take();
-    self.push(Node {
-      id: id.clone(),
-      parent,
-      kind: NodeKind::Checkpoint {
+  pub fn compacted(&mut self, summary: &str, kept: Vec<Message>) -> Result<()> {
+    let record = self.grow(
+      NodeKind::Checkpoint {
         summary: summary.to_string(),
       },
-    });
-    self.leaf = Some(id);
+      Vec::new(),
+    );
     self.history = vec![compaction::summary_message(summary)];
     self.write_all(&[record])?;
-    // The summary the checkpoint already stands for is not written twice.
-    let kept = history.into_iter().skip_while(is_summary).collect();
     self.append(kept)
   }
 
@@ -764,10 +739,7 @@ impl Session {
     };
     // Forking from the very start leaves an empty session, which — like any
     // other empty session — gets its file once it has something to say.
-    let history = self.branch(leaf);
-    if !history.is_empty() {
-      forked.append(history)?;
-    }
+    forked.append(self.branch(leaf))?;
     Ok(forked)
   }
 
@@ -796,10 +768,34 @@ impl Session {
     self.write_all(&[Record::Name { name }])
   }
 
+  /// Write `records` to the end of the file, opening it with its header
+  /// first when this is the first thing written. Nothing to write opens no
+  /// file.
   fn write_all(&mut self, records: &[Record]) -> Result<()> {
     let Some(dir) = &self.dir else {
       return Ok(());
     };
+    if records.is_empty() {
+      return Ok(());
+    }
+    let mut lines = String::new();
+    let mut line = |record: &Record| -> Result<()> {
+      lines.push_str(&serde_json::to_string(record)?);
+      lines.push('\n');
+      Ok(())
+    };
+    if self.file.is_none() {
+      line(&Record::Header {
+        id: self.id.clone(),
+        created: self.created,
+        cwd: self.cwd.clone(),
+        model: self.model.clone(),
+        parent: self.parent.clone(),
+      })?;
+    }
+    for record in records {
+      line(record)?;
+    }
     if self.file.is_none() {
       std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
       let path = dir.join(format!(
@@ -807,28 +803,16 @@ impl Session {
         self.created.format("%Y-%m-%dT%H-%M-%S"),
         self.id
       ));
-      let mut file = OpenOptions::new()
+      let file = OpenOptions::new()
         .create_new(true)
         .append(true)
         .open(&path)
         .with_context(|| format!("cannot create {}", path.display()))?;
-      let header = Record::Header {
-        id: self.id.clone(),
-        created: self.created,
-        cwd: self.cwd.clone(),
-        model: self.model.clone(),
-        parent: self.parent.clone(),
-      };
-      serde_json::to_writer(&mut file, &header)?;
-      file.write_all(b"\n")?;
       self.file = Some((path, file));
     }
     let (_, file) = self.file.as_mut().expect("opened above");
-    for record in records {
-      serde_json::to_writer(&mut *file, record)?;
-      file.write_all(b"\n")?;
-    }
-    file.flush()?;
+    // One write for the lot, rather than one per line.
+    file.write_all(lines.as_bytes())?;
     Ok(())
   }
 }
@@ -873,7 +857,7 @@ mod tests {
       Message::user("second"),
       Message::assistant("reply"),
     ];
-    session.compacted(compacted.clone(), "summary").unwrap();
+    session.compacted("summary", compacted[1..].to_vec()).unwrap();
     session.append(vec![Message::user("third")]).unwrap();
 
     let loaded = Session::load(&path).unwrap();
@@ -1034,7 +1018,7 @@ mod tests {
       Message::user("second"),
       Message::assistant("reply"),
     ];
-    session.compacted(compacted.clone(), "summary").unwrap();
+    session.compacted("summary", compacted[1..].to_vec()).unwrap();
     assert_eq!(session.history, compacted);
 
     // The checkpoint stands for what came before it, and the turns it kept
@@ -1056,16 +1040,16 @@ mod tests {
     let old = vec![Message::user("old"), Message::assistant("older")];
     session.append(old.clone()).unwrap();
     let kept = vec![compaction::summary_message("summary"), Message::user("second")];
-    session.compacted(kept.clone(), "summary").unwrap();
+    session.compacted("summary", kept[1..].to_vec()).unwrap();
 
     // The model is given the summary in place of the turns above it. The
     // transcript is given both: they were on screen when the compaction
     // happened, and reopening the session should not lose them.
     assert_eq!(session.branch(session.leaf()), kept);
-    assert_eq!(session.branch_len(session.leaf()), 2);
+    assert_eq!(session.lineage(session.leaf(), false).len(), 2);
     let whole: Vec<Message> = old.into_iter().chain(kept).collect();
     assert_eq!(session.transcript(session.leaf()), whole);
-    assert_eq!(session.transcript_len(session.leaf()), 4);
+    assert_eq!(session.lineage(session.leaf(), true).len(), 4);
 
     // Which is what the file is for: it says as much when reopened.
     let path = session.path().unwrap().to_path_buf();

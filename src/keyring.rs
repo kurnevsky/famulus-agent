@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::OnceCell;
 
 /// The keyring, or why there is none.
@@ -24,11 +24,11 @@ pub async fn shared() -> Result<&'static oo7::Keyring, String> {
 
 /// What `item` holds, unlocked first if it has to be — which is the keyring's
 /// own dialog, not a question in this terminal.
-pub async fn secret(item: &oo7::Item) -> Result<oo7::Secret, String> {
-  if item.is_locked().await.map_err(|e| e.to_string())? {
-    item.unlock().await.map_err(|e| e.to_string())?;
+pub async fn secret(item: &oo7::Item) -> Result<oo7::Secret> {
+  if item.is_locked().await? {
+    item.unlock().await?;
   }
-  item.secret().await.map_err(|e| e.to_string())
+  Ok(item.secret().await?)
 }
 
 /// The text the keyring holds under exactly these attributes, without the
@@ -46,7 +46,7 @@ pub async fn lookup(attributes: &BTreeMap<String, String>) -> Result<String> {
   let items = keyring
     .search_items(attributes)
     .await
-    .map_err(|err| anyhow!("could not search the keyring: {err}"))?;
+    .context("could not search the keyring")?;
   let item = match items.as_slice() {
     [item] => item,
     [] => bail!("nothing in the keyring under {named}"),
@@ -55,7 +55,7 @@ pub async fn lookup(attributes: &BTreeMap<String, String>) -> Result<String> {
       many.len()
     ),
   };
-  let secret = secret(item).await.map_err(|err| anyhow!("{named}: {err}"))?;
+  let secret = secret(item).await.with_context(|| named.clone())?;
   let text = std::str::from_utf8(secret.as_bytes()).map_err(|_| anyhow!("{named}: not text"))?;
   Ok(text.trim_end().to_string())
 }

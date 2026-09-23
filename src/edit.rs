@@ -82,6 +82,9 @@ struct Replacement {
 /// for diffing.
 pub fn apply_edits(normalized: &str, edits: &[Edit], path: &str) -> Result<Applied, String> {
   let total = edits.len();
+  // A call with one edit is told about "the text"; one with several, about
+  // the edit by its index.
+  let say = |one: String, several: String| if total == 1 { one } else { several };
   let edits: Vec<Edit> = edits
     .iter()
     .map(|e| Edit {
@@ -91,11 +94,10 @@ pub fn apply_edits(normalized: &str, edits: &[Edit], path: &str) -> Result<Appli
     .collect();
   for (i, edit) in edits.iter().enumerate() {
     if edit.old_text.is_empty() {
-      return Err(if total == 1 {
-        format!("oldText must not be empty in {path}.")
-      } else {
-        format!("edits[{i}].oldText must not be empty in {path}.")
-      });
+      return Err(say(
+        format!("oldText must not be empty in {path}."),
+        format!("edits[{i}].oldText must not be empty in {path}."),
+      ));
     }
   }
 
@@ -115,31 +117,32 @@ pub fn apply_edits(normalized: &str, edits: &[Edit], path: &str) -> Result<Appli
       true => normalize_for_fuzzy_match(&edit.old_text),
       false => edit.old_text.clone(),
     };
-    let found = (!needle.is_empty())
-      .then(|| base_for_replacement.find(&needle))
-      .flatten();
-    let Some(index) = found else {
-      return Err(if total == 1 {
+    // Folding can leave nothing of an edit that was all whitespace, and an
+    // empty needle is found everywhere.
+    let mut found = base_for_replacement
+      .match_indices(needle.as_str())
+      .map(|(at, _)| at)
+      .filter(|_| !needle.is_empty());
+    let Some(index) = found.next() else {
+      return Err(say(
         format!(
           "Could not find the exact text in {path}. The old text must match exactly including all whitespace and newlines."
-        )
-      } else {
+        ),
         format!(
           "Could not find edits[{i}] in {path}. The oldText must match exactly including all whitespace and newlines."
-        )
-      });
+        ),
+      ));
     };
-    let occurrences = base_for_replacement.matches(&needle).count();
+    let occurrences = 1 + found.count();
     if occurrences > 1 {
-      return Err(if total == 1 {
+      return Err(say(
         format!(
           "Found {occurrences} occurrences of the text in {path}. The text must be unique. Please provide more context to make it unique."
-        )
-      } else {
+        ),
         format!(
           "Found {occurrences} occurrences of edits[{i}] in {path}. Each oldText must be unique. Please provide more context to make it unique."
-        )
-      });
+        ),
+      ));
     }
     matched.push(Replacement {
       edit_index: i,
@@ -166,13 +169,12 @@ pub fn apply_edits(normalized: &str, edits: &[Edit], path: &str) -> Result<Appli
     apply_replacements(&base_for_replacement, &matched, 0)
   };
   if new == normalized {
-    return Err(if total == 1 {
+    return Err(say(
       format!(
         "No changes made to {path}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected."
-      )
-    } else {
-      format!("No changes made to {path}. The replacements produced identical content.")
-    });
+      ),
+      format!("No changes made to {path}. The replacements produced identical content."),
+    ));
   }
   Ok(Applied {
     base: normalized.to_string(),
@@ -212,7 +214,7 @@ fn apply_preserving_unchanged_lines(
   // Group replacements by the (possibly shared) line ranges they touch.
   let mut groups: Vec<(usize, usize, Vec<Replacement>)> = Vec::new();
   for r in replacements {
-    let (start_line, end_line) = line_range(&spans, r)?;
+    let (start_line, end_line) = line_range(base, r);
     if let Some(last) = groups.last_mut()
       && start_line < last.1
     {
@@ -236,75 +238,42 @@ fn apply_preserving_unchanged_lines(
   Ok(result)
 }
 
-fn line_range(spans: &[(usize, usize)], r: &Replacement) -> Result<(usize, usize), String> {
-  let end = r.index + r.len;
-  let start_line = spans
-    .iter()
-    .position(|&(s, e)| r.index >= s && r.index < e)
-    .ok_or("Replacement range is outside the base content.")?;
-  let mut end_line = start_line;
-  while end_line < spans.len() && spans[end_line].1 < end {
-    end_line += 1;
-  }
-  if end_line >= spans.len() {
-    return Err("Replacement range is outside the base content.".into());
-  }
-  Ok((start_line, end_line + 1))
+/// The lines of `base` a replacement touches, as a range of line indices.
+fn line_range(base: &str, r: &Replacement) -> (usize, usize) {
+  // Counted in bytes: a newline is one, so no character is cut in half by
+  // looking at the last byte of the replacement.
+  let line_of = |at: usize| base.as_bytes()[..at].iter().filter(|&&b| b == b'\n').count();
+  (line_of(r.index), line_of(r.index + r.len - 1) + 1)
 }
 
 /// Compact diff: `+N line` / `-N line` for changes, ` N line` for up to
 /// `context` lines around them, and `...` where context was skipped.
 pub fn generate_diff_string(old: &str, new: &str, context: usize) -> String {
-  use similar::ChangeTag;
   let diff = similar::TextDiff::from_lines(old, new);
-  // Collapse the change stream into runs of equal/removed/added lines.
-  let mut parts: Vec<(ChangeTag, Vec<&str>)> = Vec::new();
-  for change in diff.iter_all_changes() {
-    let line = change.value().trim_end_matches('\n');
-    match parts.last_mut() {
-      Some((tag, lines)) if *tag == change.tag() => lines.push(line),
-      _ => parts.push((change.tag(), vec![line])),
+  let width = old.split('\n').count().max(new.split('\n').count()).to_string().len();
+  let gap = format!(" {} ...", " ".repeat(width));
+  let groups = diff.grouped_ops(context);
+  let mut out: Vec<String> = Vec::new();
+  for (i, group) in groups.iter().enumerate() {
+    // Lines were skipped between any two groups, and before the first one
+    // unless it starts at the top.
+    if i > 0 || group[0].old_range().start > 0 {
+      out.push(gap.clone());
+    }
+    for change in group.iter().flat_map(|op| diff.iter_changes(op)) {
+      // An added line is numbered where it lands, everything else where it
+      // was.
+      let at = change.old_index().or(change.new_index()).unwrap_or_default();
+      let line = change.value().trim_end_matches('\n');
+      out.push(format!("{}{:>width$} {line}", change.tag(), at + 1));
     }
   }
-
-  let width = old.split('\n').count().max(new.split('\n').count()).to_string().len();
-  let num = |n: usize| format!("{n:>width$}");
-  let mut out: Vec<String> = Vec::new();
-  let (mut old_num, mut new_num) = (1usize, 1usize);
-
-  for (i, (tag, lines)) in parts.iter().enumerate() {
-    match tag {
-      ChangeTag::Insert => {
-        for line in lines {
-          out.push(format!("+{} {line}", num(new_num)));
-          new_num += 1;
-        }
-      }
-      ChangeTag::Delete => {
-        for line in lines {
-          out.push(format!("-{} {line}", num(old_num)));
-          old_num += 1;
-        }
-      }
-      ChangeTag::Equal => {
-        // Context is kept on the side of a run that touches a change: the end
-        // of the change before it, the start of the change after it.
-        let after_change = i > 0;
-        let before_change = i + 1 < parts.len();
-        let head = if after_change { context } else { 0 };
-        let tail = if before_change { context } else { 0 };
-        let hidden = head..lines.len().saturating_sub(tail);
-        for (k, line) in lines.iter().enumerate() {
-          if !hidden.contains(&k) {
-            out.push(format!(" {} {line}", num(old_num + k)));
-          } else if k == hidden.start && (after_change || before_change) {
-            out.push(format!(" {} ...", " ".repeat(width)));
-          }
-        }
-        old_num += lines.len();
-        new_num += lines.len();
-      }
-    }
+  let skipped_after = groups
+    .last()
+    .and_then(|group| group.last())
+    .is_some_and(|op| op.old_range().end < diff.old_len());
+  if skipped_after {
+    out.push(gap);
   }
   out.join("\n")
 }
@@ -380,5 +349,18 @@ mod tests {
       generate_diff_string(&old, &new, 2),
       "    ...\n  4 l4\n  5 l5\n- 6 l6\n- 7 l7\n+ 6 L6\n+ 7 L7\n  8 l8\n  9 l9\n    ..."
     );
+    // A change on the first line has nothing skipped above it.
+    assert_eq!(
+      generate_diff_string("a\nb\nc\n", "A\nb\nc\n", 1),
+      "-1 a\n+1 A\n 2 b\n   ..."
+    );
+    // Two changes far apart are two stretches, with the gap marked once
+    // between them; a context that reaches the ends leaves no mark there.
+    let new = old.replace("l2\n", "L2\n").replace("l11", "L11");
+    assert_eq!(
+      generate_diff_string(&old, &new, 1),
+      "  1 l1\n- 2 l2\n+ 2 L2\n  3 l3\n    ...\n 10 l10\n-11 l11\n+11 L11\n 12 l12"
+    );
+    assert_eq!(generate_diff_string(&old, &old, 2), "", "no change, nothing to draw");
   }
 }

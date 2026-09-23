@@ -14,7 +14,7 @@ use rig_core::completion::Message;
 use rig_core::message::{MimeType, UserContent};
 
 use crate::images::{self, ProcessedImage};
-use crate::tools::resolve;
+use crate::tools::resolve_literal;
 
 /// Trailing characters a sentence leaves stuck to a path: `@shot.png,` is a
 /// token and a comma. Only tried when the whole run is not a file, so a name
@@ -139,14 +139,9 @@ fn probe(text: &str, word: &Word, cwd: &Path) -> Token {
     false => raw.trim_end_matches(TRAILING),
   };
   let token = |raw: &str, end: usize| {
-    // `tools::resolve` strips a leading `@`, which is a chat reference when
-    // the model writes one — but our own sigil has already been taken off,
-    // so a second one is part of the name. `./` keeps it from being eaten,
-    // which is what otherwise turned `@@` into the working directory.
-    let path = match raw.starts_with('@') {
-      true => resolve(cwd, &format!("./{raw}")),
-      false => resolve(cwd, raw),
-    };
+    // The sigil is already off, so an `@` still in front is part of the name
+    // rather than a reference to it: `@@` is not the working directory.
+    let path = resolve_literal(cwd, raw);
     let state = describe(&path);
     Token {
       range: (start, end),
@@ -176,10 +171,13 @@ fn probe(text: &str, word: &Word, cwd: &Path) -> Token {
 /// What is at `path`, read from the file's header rather than by decoding it:
 /// this runs as the user types.
 fn describe(path: &Path) -> State {
-  if path.is_dir() {
+  let Ok(meta) = std::fs::metadata(path) else {
+    return State::Missing;
+  };
+  if meta.is_dir() {
     return State::Directory;
   }
-  if !path.is_file() {
+  if !meta.is_file() {
     return State::Missing;
   }
   let Ok(reader) = image::ImageReader::open(path).and_then(image::ImageReader::with_guessed_format) else {

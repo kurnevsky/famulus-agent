@@ -18,28 +18,19 @@ use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use rmcp::model::{
   ClientCapabilities, ClientInfo, ConstTitle, ElicitRequestParams, ElicitResult, ElicitationAction,
-  ElicitationCapability, ElicitationSchema, EnumSchema, ErrorData, FormElicitationCapability, MultiSelectEnumSchema,
-  PrimitiveSchemaDefinition, SingleSelectEnumSchema,
+  ElicitationCapability, ElicitationSchema, EnumSchema, ErrorData, FormElicitationCapability, Implementation,
+  MultiSelectEnumSchema, PrimitiveSchemaDefinition, SingleSelectEnumSchema,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleClient};
 use serde_json::{Map, Value};
 
 use crate::ask::{Answer, Choice, Dialog, Question, Refusal};
 use crate::markdown::wrap_text;
-use crate::modal::{Component, Host};
+use crate::modal::Component;
 
 /// The client side of one server's connection: what it says it can do, and
 /// what it does when asked.
-#[derive(Clone)]
-pub struct Client {
-  /// The server's name in the file, which is who the form says is asking.
-  pub server: String,
-  pub host: Host,
-  /// Where what it offers is kept, for when it says that has changed.
-  pub watch: crate::mcp::Watch,
-}
-
-impl rmcp::ClientHandler for Client {
+impl rmcp::ClientHandler for crate::mcp::Watch {
   async fn create_elicitation(
     &self,
     request: ElicitRequestParams,
@@ -66,19 +57,23 @@ impl rmcp::ClientHandler for Client {
   }
 
   async fn on_tool_list_changed(&self, context: NotificationContext<RoleClient>) {
-    self.watch.changed(&context.peer).await;
+    self.changed(&context.peer).await;
   }
 
   async fn on_resource_list_changed(&self, context: NotificationContext<RoleClient>) {
-    self.watch.resources_changed(&context.peer).await;
+    self.resources_changed(&context.peer).await;
   }
 
+  /// Forms and nothing else, under this program's own name rather than the
+  /// library's.
   fn get_info(&self) -> ClientInfo {
-    let mut capabilities = ClientCapabilities::default();
-    capabilities.elicitation = Some(ElicitationCapability::new().with_form(FormElicitationCapability::new()));
-    let mut info = ClientInfo::default();
-    info.capabilities = capabilities;
-    info
+    let capabilities = ClientCapabilities::builder()
+      .enable_elicitation_with(ElicitationCapability::new().with_form(FormElicitationCapability::new()))
+      .build();
+    ClientInfo::new(
+      capabilities,
+      Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+    )
   }
 }
 

@@ -63,58 +63,45 @@ pub type Config = BTreeMap<String, Server>;
 /// a server that never came up for no stated reason.
 #[cfg(feature = "mcp")]
 #[derive(Debug, Default, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Server {
   /// A line of shell run for a server that speaks over its own stdin and
   /// stdout — the same shape `bash` takes, and run the same way, so a command
   /// that works in the terminal works here.
-  #[serde(default)]
   pub command: Option<String>,
   /// Added to the environment that command inherits.
-  #[serde(default)]
   pub env: BTreeMap<String, String>,
   /// The same, for a value that should not sit in a file: a line of shell
   /// whose output is what the variable is set to.
-  #[serde(default, rename = "env-command")]
   pub env_command: BTreeMap<String, String>,
   /// The endpoint of a server that speaks streamable HTTP.
-  #[serde(default)]
   pub url: Option<String>,
   /// The bearer token that endpoint is called with, which rmcp sends as the
   /// `Authorization` of every request. A server given one is not signed in
   /// to any other way.
-  #[serde(default)]
   pub token: Option<String>,
   /// The same, for a token that should not sit in a file: a line of shell
   /// whose output is the token — `pass`, `gh auth token`, `op read`.
-  #[serde(default, rename = "token-command")]
   pub token_command: Option<String>,
   /// The same, kept in the system keyring: the attributes of the one item
   /// whose secret is the token.
-  #[serde(default, rename = "token-keyring")]
   pub token_keyring: BTreeMap<String, String>,
   /// Sent with every request to that endpoint.
-  #[serde(default)]
   pub headers: BTreeMap<String, String>,
   /// The same, each value the output of a line of shell.
-  #[serde(default, rename = "headers-command")]
   pub headers_command: BTreeMap<String, String>,
   /// Seconds one of this server's tools — or a listing or reading of its
   /// resources — may take before the call comes back as an error the model
   /// can recover from. `0` waits forever.
-  #[serde(default)]
   pub timeout: Option<u64>,
   /// Take only these of the tools it offers. Everything it offers, when empty
   /// — which is not the same as naming them all, since a server that grows a
   /// tool later would keep it.
-  #[serde(default)]
   pub tools: Vec<String>,
   /// Take everything but these. Named in both lists, a tool is refused.
-  #[serde(default)]
   pub except: Vec<String>,
   /// How to sign in to an endpoint that wants a login, where the server
   /// cannot work that out for itself.
-  #[serde(default)]
   pub oauth: crate::oauth::Settings,
 }
 
@@ -189,7 +176,7 @@ pub struct Servers {
 
 /// A connection to one server, answering what it asks through `elicit`.
 #[cfg(feature = "mcp")]
-type Service = rmcp::service::RunningService<rmcp::service::RoleClient, crate::elicit::Client>;
+type Service = rmcp::service::RunningService<rmcp::service::RoleClient, Watch>;
 
 impl Servers {
   /// What to say in the transcript about the servers this session has: which
@@ -223,11 +210,6 @@ type Rebuild = Box<dyn Fn(&Catalog) + Send + Sync>;
 struct Shelves {
   #[cfg(feature = "mcp")]
   offers: std::sync::Mutex<Vec<Offer>>,
-  /// What each server with resources has to read, by its name. A server is
-  /// here when it said it has resources as it came up, whether or not it
-  /// could list them then.
-  #[cfg(feature = "mcp")]
-  resources: std::sync::Mutex<std::collections::BTreeMap<String, crate::resources::ServerResources>>,
   /// What to do when an offer changes, once there are agents to tell.
   #[cfg(feature = "mcp")]
   changed: std::sync::OnceLock<Rebuild>,
@@ -242,6 +224,9 @@ struct Offer {
   peer: rmcp::service::ServerSink,
   /// How long one of its calls may take.
   timeout: Option<u64>,
+  /// What it has to read, for a server that said it has resources as it came
+  /// up — whether or not it could list them then.
+  resources: Option<crate::resources::ServerResources>,
 }
 
 /// How long a call to a server may take, from the seconds its table says.
@@ -294,7 +279,7 @@ impl Catalog {
   pub fn completions(&self) -> Vec<(String, String)> {
     #[cfg(feature = "mcp")]
     return self
-      .held()
+      .resources()
       .iter()
       .flat_map(|(server, held)| {
         let resources = held
@@ -314,39 +299,29 @@ impl Catalog {
 
   /// What each server with resources has to read, as it last said.
   #[cfg(feature = "mcp")]
-  pub fn resources(&self) -> std::collections::BTreeMap<String, crate::resources::ServerResources> {
-    self.held().clone()
-  }
-
-  #[cfg(feature = "mcp")]
-  fn held(&self) -> std::sync::MutexGuard<'_, std::collections::BTreeMap<String, crate::resources::ServerResources>> {
-    self.0.resources.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-  }
-
-  /// Put what `server` has to read in place of what it had.
-  #[cfg(feature = "mcp")]
-  fn set_resources(&self, server: &str, held: crate::resources::ServerResources) {
-    self.held().insert(server.to_string(), held);
+  pub fn resources(&self) -> BTreeMap<String, crate::resources::ServerResources> {
+    self
+      .offers()
+      .iter()
+      .filter_map(|offer| Some((offer.server.clone(), offer.resources.clone()?)))
+      .collect()
   }
 
   /// Whether any server has resources to read, which is when the tools
   /// that read them are offered.
   #[cfg(feature = "mcp")]
   pub fn has_resources(&self) -> bool {
-    !self.held().is_empty()
+    self.offers().iter().any(|offer| offer.resources.is_some())
   }
 
   /// The server called `named`, if it is one with resources, and how long
   /// a request to it may take.
   #[cfg(feature = "mcp")]
   pub fn resource_peer(&self, named: &str) -> Option<(rmcp::service::ServerSink, Option<std::time::Duration>)> {
-    if !self.held().contains_key(named) {
-      return None;
-    }
     self
       .offers()
       .iter()
-      .find(|offer| offer.server == named)
+      .find(|offer| offer.server == named && offer.resources.is_some())
       .map(|offer| (offer.peer.clone(), call_timeout(offer.timeout)))
   }
 
@@ -395,7 +370,8 @@ impl Catalog {
   }
 
   /// The tools `server` offers now, in place of what it offered before, and
-  /// the names of those it offered before.
+  /// the names of those it offered before — `None` for a server not on offer
+  /// until now.
   #[cfg(feature = "mcp")]
   fn offer(
     &self,
@@ -403,20 +379,24 @@ impl Catalog {
     tools: Vec<rmcp::model::Tool>,
     peer: rmcp::service::ServerSink,
     timeout: Option<u64>,
-  ) -> Vec<String> {
+  ) -> Option<Vec<String>> {
     let before = {
       let mut offers = self.offers();
-      let offer = Offer {
-        server: server.to_string(),
-        tools,
-        peer,
-        timeout,
-      };
       match offers.iter_mut().find(|offer| offer.server == server) {
-        Some(old) => std::mem::replace(old, offer).tools,
+        Some(old) => {
+          old.peer = peer;
+          old.timeout = timeout;
+          Some(std::mem::replace(&mut old.tools, tools))
+        }
         None => {
-          offers.push(offer);
-          Vec::new()
+          offers.push(Offer {
+            server: server.to_string(),
+            tools,
+            peer,
+            timeout,
+            resources: None,
+          });
+          None
         }
       }
     };
@@ -424,7 +404,20 @@ impl Catalog {
     if let Some(rebuild) = self.0.changed.get() {
       rebuild(self);
     }
-    before.iter().map(|tool| tool.name.to_string()).collect()
+    before.map(|tools| tools.iter().map(|tool| tool.name.to_string()).collect())
+  }
+
+  /// Put what `server` has to read in place of what it had. A list that
+  /// could not be had leaves what was there, or nothing, since the server can
+  /// still be read from.
+  #[cfg(feature = "mcp")]
+  fn stock(&self, server: &str, listed: Option<crate::resources::ServerResources>) {
+    if let Some(offer) = self.offers().iter_mut().find(|offer| offer.server == server) {
+      match listed {
+        Some(held) => offer.resources = Some(held),
+        None => _ = offer.resources.get_or_insert_default(),
+      }
+    }
   }
 }
 
@@ -474,16 +467,18 @@ fn tools_count(n: usize) -> String {
   }
 }
 
-/// What one server's connection needs to put what it offers on the shelf
-/// again, when it says that has changed.
+/// The client side of one server's connection: what it answers the server
+/// with, through `elicit`, and what it needs to put what the server offers on
+/// the shelf again, when it says that has changed.
 #[cfg(feature = "mcp")]
 #[derive(Clone)]
 pub struct Watch {
-  server: String,
+  /// The server's name in the file, which is who a form says is asking.
+  pub(crate) server: String,
   /// Its table, for the `tools` and `except` it narrows what it offers by.
   table: std::sync::Arc<Server>,
   catalog: Catalog,
-  host: crate::modal::Host,
+  pub(crate) host: crate::modal::Host,
   /// One refresh at a time: two lists fetched at once could land in either
   /// order, and the older one would win.
   busy: std::sync::Arc<tokio::sync::Mutex<()>>,
@@ -503,50 +498,76 @@ impl Watch {
   /// only when it cannot be asked, since a server of files changes its list
   /// whenever a file does, and none of that is news.
   pub async fn resources_changed(&self, peer: &rmcp::service::ServerSink) {
-    // Only a server that said it has resources has a list to keep.
-    if !has_resources(peer) {
-      return;
-    }
-    let _one = self.busy.lock().await;
-    match crate::resources::inventory(peer, call_timeout(self.table.timeout)).await {
-      Ok(held) => self.catalog.set_resources(&self.server, held),
-      Err(err) => self.host.tell(crate::agent::AgentEvent::Mcp(format!(
-        "MCP {}: could not list resources: {err}",
-        self.server
-      ))),
+    if let Some(note) = self.stock_resources(peer).await {
+      self.host.tell(crate::agent::AgentEvent::Mcp(note));
     }
   }
 
   /// The server says its tools have changed: ask it for them, and put them
   /// in place of the ones it had.
   pub async fn changed(&self, peer: &rmcp::service::ServerSink) {
+    let note = self.stock_tools(peer).await.unwrap_or_else(|err| {
+      format!(
+        "MCP {}: said its tools changed, but could not list them: {err}",
+        self.server
+      )
+    });
+    self.host.tell(crate::agent::AgentEvent::Mcp(note));
+  }
+
+  /// Ask the server for its tools and put them on the shelf, and what to say
+  /// about it: how many there are the first time, and what changed after.
+  async fn stock_tools(&self, peer: &rmcp::service::ServerSink) -> Result<String, rmcp::ServiceError> {
     let _one = self.busy.lock().await;
     let name = &self.server;
-    let note = match peer.list_all_tools().await {
-      Err(err) => format!("MCP {name}: said its tools changed, but could not list them: {err}"),
-      Ok(tools) => {
-        let picked = pick(&self.table, tools, &self.catalog.taken(name));
-        let now: Vec<String> = picked.tools.iter().map(|tool| tool.name.to_string()).collect();
-        let before = self.catalog.offer(name, picked.tools, peer.clone(), self.table.timeout);
+    let tools = peer.list_all_tools().await?;
+    let picked = pick(&self.table, tools, &self.catalog.taken(name));
+    let now: Vec<String> = picked.tools.iter().map(|tool| tool.name.to_string()).collect();
+    let mut note = format!("MCP {name}: ");
+    match self.catalog.offer(name, picked.tools, peer.clone(), self.table.timeout) {
+      None => {
+        note.push_str(&tools_count(now.len()));
+        // Said once, as it comes up: a typo in the file is not news again
+        // every time the server's list changes.
+        if !picked.unknown.is_empty() {
+          note.push_str(&format!("; offers no {}", picked.unknown.join(", ")));
+        }
+      }
+      Some(before) => {
+        note.push_str(&format!("now {}", tools_count(now.len())));
         let gained: Vec<&str> = now.iter().filter(|n| !before.contains(n)).map(String::as_str).collect();
         let lost: Vec<&str> = before.iter().filter(|n| !now.contains(n)).map(String::as_str).collect();
-        let mut note = format!("MCP {name}: now {}", tools_count(now.len()));
         if !gained.is_empty() {
           note.push_str(&format!(", new: {}", gained.join(", ")));
         }
         if !lost.is_empty() {
           note.push_str(&format!(", gone: {}", lost.join(", ")));
         }
-        if !picked.clashed.is_empty() {
-          note.push_str(&format!(
-            "; not taking {} (name already used)",
-            picked.clashed.join(", ")
-          ));
-        }
-        note
       }
-    };
-    self.host.tell(crate::agent::AgentEvent::Mcp(note));
+    }
+    if !picked.clashed.is_empty() {
+      note.push_str(&format!(
+        "; not taking {} (name already used)",
+        picked.clashed.join(", ")
+      ));
+    }
+    Ok(note)
+  }
+
+  /// Ask a server that said it has resources what they are, for `&` to
+  /// complete from, and why it could not say, if it could not.
+  async fn stock_resources(&self, peer: &rmcp::service::ServerSink) -> Option<String> {
+    if !has_resources(peer) {
+      return None;
+    }
+    let _one = self.busy.lock().await;
+    let listed = crate::resources::inventory(peer, call_timeout(self.table.timeout)).await;
+    let note = listed
+      .as_ref()
+      .err()
+      .map(|err| format!("MCP {}: could not list resources: {err}", self.server));
+    self.catalog.stock(&self.server, listed.ok());
+    note
   }
 }
 
@@ -554,64 +575,28 @@ impl Watch {
 pub async fn connect(config: Config, host: &crate::modal::Host) -> Servers {
   let mut servers = Servers::default();
   for (name, server) in config {
-    let table = std::sync::Arc::new(server);
-    let client = crate::elicit::Client {
+    let watch = Watch {
       server: name.clone(),
+      table: std::sync::Arc::new(server),
+      catalog: servers.catalog.clone(),
       host: host.clone(),
-      watch: Watch {
-        server: name.clone(),
-        table: table.clone(),
-        catalog: servers.catalog.clone(),
-        host: host.clone(),
-        busy: Default::default(),
-      },
+      busy: Default::default(),
     };
-    let running = match start(&name, &table, client, &mut servers.notes).await {
+    let running = match start(&name, &watch.table, watch.clone(), &mut servers.notes).await {
       Ok(running) => running,
       Err(err) => {
         servers.notes.push(format!("MCP {name}: {err:#}"));
         continue;
       }
     };
-    let tools = match running.list_all_tools().await {
-      Ok(tools) => tools,
+    match watch.stock_tools(running.peer()).await {
+      Ok(note) => servers.notes.push(note),
       Err(err) => {
         servers.notes.push(format!("MCP {name}: could not list tools: {err}"));
         continue;
       }
-    };
-    let picked = pick(&table, tools, &servers.catalog.taken(&name));
-    if !picked.unknown.is_empty() {
-      servers
-        .notes
-        .push(format!("MCP {name}: offers no {}", picked.unknown.join(", ")));
     }
-    if !picked.clashed.is_empty() {
-      servers.notes.push(format!(
-        "MCP {name}: not taking {} (name already used)",
-        picked.clashed.join(", ")
-      ));
-    }
-    servers
-      .notes
-      .push(format!("MCP {name}: {}", tools_count(picked.tools.len())));
-    servers
-      .catalog
-      .offer(&name, picked.tools, running.peer().clone(), table.timeout);
-    // What it has to read, for `&` to complete from. Kept empty when it
-    // cannot be listed, since it can still be read.
-    if has_resources(running.peer()) {
-      let held = match crate::resources::inventory(running.peer(), call_timeout(table.timeout)).await {
-        Ok(held) => held,
-        Err(err) => {
-          servers
-            .notes
-            .push(format!("MCP {name}: could not list resources: {err}"));
-          Default::default()
-        }
-      };
-      servers.catalog.set_resources(&name, held);
-    }
+    servers.notes.extend(watch.stock_resources(running.peer()).await);
     servers.running.push(running);
   }
   servers
@@ -620,12 +605,7 @@ pub async fn connect(config: Config, host: &crate::modal::Host) -> Servers {
 /// Reach one server, however it is reached. What it is worth saying about
 /// the way there goes in `notes`.
 #[cfg(feature = "mcp")]
-async fn start(
-  name: &str,
-  server: &Server,
-  client: crate::elicit::Client,
-  notes: &mut Vec<String>,
-) -> anyhow::Result<Service> {
+async fn start(name: &str, server: &Server, client: Watch, notes: &mut Vec<String>) -> anyhow::Result<Service> {
   use anyhow::{Context, bail};
   use rmcp::ServiceExt;
 
@@ -660,7 +640,7 @@ async fn endpoint(
   name: &str,
   server: &Server,
   url: &str,
-  client: crate::elicit::Client,
+  client: Watch,
   notes: &mut Vec<String>,
 ) -> anyhow::Result<Service> {
   use rmcp::ServiceExt;
@@ -679,9 +659,7 @@ async fn endpoint(
   .await?;
   // A token in the file is the one this server is called with: what it
   // makes of it is its own business, and no login is started over it.
-  if config.auth_header.is_some() {
-    return within(async { Ok(client.serve(StreamableHttpClientTransport::from_config(config)).await?) }).await;
-  }
+  let given = config.auth_header.is_some();
 
   let store = oauth::Store::new(url);
   let signed_in = async |manager| {
@@ -690,7 +668,11 @@ async fn endpoint(
   };
   // Signed in before, and it still holds; or never asked to sign in at all.
   let first = within(async {
-    Ok(match oauth::resume(url, &server.oauth, &store).await? {
+    let manager = match given {
+      true => None,
+      false => oauth::resume(url, &server.oauth, &store).await?,
+    };
+    Ok(match manager {
       Some(manager) => signed_in(manager).await,
       None => {
         let transport = StreamableHttpClientTransport::from_config(config.clone());
@@ -701,7 +683,7 @@ async fn endpoint(
   .await?;
   let running = match first {
     Ok(running) => Ok(running),
-    Err(err) if oauth::wants_login(&err) => {
+    Err(err) if !given && oauth::wants_login(&err) => {
       // A login that no longer holds is not one to be tried again next time.
       let _ = rmcp::transport::auth::CredentialStore::clear(&store).await;
       let manager = oauth::login(name, url, &server.oauth, &store).await?;

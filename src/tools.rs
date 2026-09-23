@@ -10,12 +10,14 @@ use std::time::{Duration, Instant};
 
 use rig_agent::tool::{Tool, ToolContext, ToolExecutionError};
 use rig_core::message::{MimeType, ToolResultContent};
-use rustix::process::{Pid, Signal, kill_process, kill_process_group};
+use rustix::process::{Pid, Signal, kill_process_group};
 
 use crate::ask::{self, Dialog, Question};
 use crate::modal::Host;
 use crate::{edit, images};
-use schemars::JsonSchema;
+use schemars::generate::SchemaSettings;
+use schemars::transform::RecursiveTransform;
+use schemars::{JsonSchema, Schema};
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 
@@ -44,10 +46,15 @@ pub struct Rules {
 
 impl Rules {
   /// Whether `name` is offered: allowed, if there is an allow-list, and not
-  /// refused — the same way round as `choose`.
+  /// refused.
   pub fn permits(&self, name: &str) -> bool {
-    (self.allow.is_empty() || self.allow.iter().any(|n| n == name)) && !self.deny.iter().any(|n| n == name)
+    permitted(&self.allow, &self.deny, name)
   }
+}
+
+/// The one rule both `Rules` and `choose` hold a name to.
+fn permitted(allow: &[String], deny: &[String], name: &str) -> bool {
+  (allow.is_empty() || allow.iter().any(|n| n == name)) && !deny.iter().any(|n| n == name)
 }
 
 /// Which of `available` to offer the model, given what was allowed and what
@@ -72,8 +79,7 @@ pub fn choose(available: &[String], allow: &[String], deny: &[String]) -> (Optio
   }
   let chosen = available
     .iter()
-    .filter(|name| allow.is_empty() || allow.contains(name))
-    .filter(|name| !deny.contains(name))
+    .filter(|name| permitted(allow, deny, name))
     .cloned()
     .collect();
   (Some(chosen), unknown)
@@ -127,28 +133,31 @@ pub(crate) use tool_args;
 
 /// JSON schema for a tool's arguments, stripped of metadata that some
 /// OpenAI-compatible servers reject (`$schema`, `title`, integer `format`).
+///
+/// Taken off every schema and subschema, and only those: an argument that
+/// happens to be called `title` is a property rather than metadata, and stays.
 pub fn schema<T: JsonSchema>() -> serde_json::Value {
-  let mut value = serde_json::to_value(schemars::schema_for!(T)).expect("schema serializes");
-  fn strip(v: &mut serde_json::Value) {
-    match v {
-      serde_json::Value::Object(map) => {
-        map.remove("$schema");
-        map.remove("title");
-        map.remove("format");
-        map.values_mut().for_each(strip);
-      }
-      serde_json::Value::Array(items) => items.iter_mut().for_each(strip),
-      _ => {}
-    }
-  }
-  strip(&mut value);
-  value
+  SchemaSettings::draft2020_12()
+    .with(|settings| settings.meta_schema = None)
+    .with_transform(RecursiveTransform(|schema: &mut Schema| {
+      schema.remove("title");
+      schema.remove("format");
+    }))
+    .into_generator()
+    .into_root_schema_for::<T>()
+    .to_value()
 }
 
 /// Path normalization: Unicode spaces folded, a leading `@` (chat file
 /// reference) stripped, `~` expanded, `file://` URLs accepted, then resolved
 /// against the working directory.
 pub fn resolve(cwd: &Path, path: &str) -> PathBuf {
+  resolve_literal(cwd, path.strip_prefix('@').unwrap_or(path))
+}
+
+/// `resolve`, for a path whose leading `@` is part of its name rather than a
+/// reference to it.
+pub fn resolve_literal(cwd: &Path, path: &str) -> PathBuf {
   let mut normalized: String = path
     .chars()
     .map(|c| match c {
@@ -156,9 +165,6 @@ pub fn resolve(cwd: &Path, path: &str) -> PathBuf {
       c => c,
     })
     .collect();
-  if let Some(rest) = normalized.strip_prefix('@') {
-    normalized = rest.to_string();
-  }
   if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
     if normalized == "~" {
       return PathBuf::from(home);
@@ -246,22 +252,17 @@ impl Tool for ReadTool {
     let total_lines = all_lines.len();
     let start = args.offset.map_or(0, |o| o.saturating_sub(1));
     let start_display = start + 1;
+    // Only an offset can start past the end: there is always a first line.
     if start >= total_lines {
       return Err(ToolError(format!(
-        "Offset {} is beyond end of file ({total_lines} lines total)",
-        args.offset.unwrap_or(start_display)
+        "Offset {start_display} is beyond end of file ({total_lines} lines total)"
       )));
     }
-    let (selected, user_limited) = match args.limit {
-      Some(limit) => {
-        let end = (start + limit).min(total_lines);
-        (all_lines[start..end].join("\n"), Some(end - start))
-      }
-      None => (all_lines[start..].join("\n"), None),
-    };
+    let end = args.limit.map_or(total_lines, |limit| (start + limit).min(total_lines));
+    let selected = all_lines[start..end].join("\n");
 
     let cut = keep(&selected, false);
-    let output = if cut.by.is_some() && cut.kept.is_empty() {
+    let output = if cut.partial() {
       format!(
         "[Line {start_display} is {}, exceeds {} limit. Use bash: sed -n '{start_display}p' {} | head -c {MAX_BYTES}]",
         format_size(all_lines[start].len()),
@@ -271,19 +272,14 @@ impl Tool for ReadTool {
     } else if let Some(by) = cut.by {
       let end_display = start_display + cut.kept.len() - 1;
       let next = end_display + 1;
-      let limit = match by {
-        TruncatedBy::Lines => String::new(),
-        TruncatedBy::Bytes => format!(" ({} limit)", format_size(MAX_BYTES)),
-      };
       format!(
-        "{}\n\n[Showing lines {start_display}-{end_display} of {total_lines}{limit}. Use offset={next} to continue.]",
-        cut.text()
+        "{}\n\n[Showing lines {start_display}-{end_display} of {total_lines}{}. Use offset={next} to continue.]",
+        cut.text(),
+        by.limit()
       )
-    } else if let Some(shown) = user_limited
-      && start + shown < total_lines
-    {
-      let remaining = total_lines - (start + shown);
-      let next = start + shown + 1;
+    } else if end < total_lines {
+      let remaining = total_lines - end;
+      let next = end + 1;
       format!("{selected}\n\n[{remaining} more lines in file. Use offset={next} to continue.]")
     } else {
       selected
@@ -294,19 +290,45 @@ impl Tool for ReadTool {
 
 /// What of some output fits in `MAX_LINES` lines and `MAX_BYTES` bytes.
 struct Cut<'a> {
+  /// The output as it was given.
+  content: &'a str,
   /// Every line, without the empty one after a final newline.
   lines: Vec<&'a str>,
   /// The lines kept: from the start, or up to the end, depending on which end
   /// was kept.
   kept: Vec<&'a str>,
-  /// Which limit made the cut; `None` when everything fits. A cut that kept
-  /// nothing is one line on its own longer than the byte budget.
+  /// Which limit made the cut; `None` when everything fits.
   by: Option<TruncatedBy>,
+  from_end: bool,
 }
 
 impl Cut<'_> {
+  /// Whether the cut kept no line at all: one line on its own is longer than
+  /// the byte budget.
+  fn partial(&self) -> bool {
+    self.by.is_some() && self.kept.is_empty()
+  }
+
+  /// What is left of the output. A line longer than the whole budget is cut
+  /// inside itself, keeping the end that was being kept, and between
+  /// characters rather than inside one.
   fn text(&self) -> String {
-    self.kept.join("\n")
+    if self.by.is_none() {
+      return self.content.to_string();
+    }
+    if !self.partial() {
+      return self.kept.join("\n");
+    }
+    match self.from_end {
+      false => {
+        let line = self.lines[0];
+        line[..line.floor_char_boundary(MAX_BYTES)].to_string()
+      }
+      true => {
+        let line = self.lines[self.lines.len() - 1];
+        line[line.ceil_char_boundary(line.len() - MAX_BYTES)..].to_string()
+      }
+    }
   }
 }
 
@@ -324,7 +346,13 @@ fn keep(content: &str, from_end: bool) -> Cut<'_> {
   if from_end {
     kept.reverse();
   }
-  Cut { lines, kept, by }
+  Cut {
+    content,
+    lines,
+    kept,
+    by,
+    from_end,
+  }
 }
 
 /// The lines, in the order given, until one of the limits is reached, and
@@ -375,34 +403,22 @@ pub fn cap_reply(content: &[ToolResultContent]) -> Option<Vec<ToolResultContent>
   let cut = keep(&text, false);
   let by = cut.by?;
   let full = spill("fa-mcp", &text).map_or_else(|| "(unavailable)".to_string(), |p| p.display().to_string());
-  let kept = match cut.kept.is_empty() {
+  let shown = cut.text();
+  let kept = match cut.partial() {
     // One line longer than the whole budget — a JSON document written flat,
     // usually. There is no line to stop at, so it is cut where the budget
-    // runs out, at a character boundary rather than inside one.
-    true => {
-      let mut end = MAX_BYTES;
-      while !text.is_char_boundary(end) {
-        end -= 1;
-      }
-      format!(
-        "{}\n\n[Showing first {} of line 1 (line is {}). Full output: {full}]",
-        &text[..end],
-        format_size(end),
-        format_size(cut.lines[0].len())
-      )
-    }
-    false => {
-      let limit = match by {
-        TruncatedBy::Lines => String::new(),
-        TruncatedBy::Bytes => format!(" ({} limit)", format_size(MAX_BYTES)),
-      };
-      format!(
-        "{}\n\n[Showing lines 1-{} of {}{limit}. Full output: {full}]",
-        cut.text(),
-        cut.kept.len(),
-        cut.lines.len()
-      )
-    }
+    // runs out.
+    true => format!(
+      "{shown}\n\n[Showing first {} of line 1 (line is {}). Full output: {full}]",
+      format_size(shown.len()),
+      format_size(cut.lines[0].len())
+    ),
+    false => format!(
+      "{shown}\n\n[Showing lines 1-{} of {}{}. Full output: {full}]",
+      cut.kept.len(),
+      cut.lines.len(),
+      by.limit()
+    ),
   };
   let mut capped = vec![ToolResultContent::text(kept)];
   capped.extend(images);
@@ -423,8 +439,7 @@ fn temp_path(prefix: &str) -> PathBuf {
 /// head, which is the part it was going to read.
 fn spill(prefix: &str, text: &str) -> Option<PathBuf> {
   let path = temp_path(prefix);
-  let mut file = std::fs::File::create(&path).ok()?;
-  file.write_all(text.as_bytes()).ok()?;
+  std::fs::write(&path, text).ok()?;
   Some(path)
 }
 
@@ -521,29 +536,26 @@ mod capping_tests {
 const NON_VISION_NOTE: &str = "[Current model does not support images. The image will be omitted from this request.]";
 
 pub fn read_image(bytes: &[u8], format: image::ImageFormat, vision: bool) -> Vec<ToolResultContent> {
-  let mime = format.to_mime_type();
-  match images::process(bytes, format) {
-    Ok(image) => {
-      let mut note = image.note(format!("Read image file [{}]", image.media_type.to_mime_type()));
-      if !vision {
-        note.push('\n');
-        note.push_str(NON_VISION_NOTE);
-        return vec![ToolResultContent::text(note)];
-      }
-      vec![
-        ToolResultContent::text(note),
-        ToolResultContent::image_base64(image.base64(), Some(image.media_type), None),
-      ]
-    }
-    Err(reason) => {
-      let mut note = format!("Read image file [{mime}]\n{reason}");
-      if !vision {
-        note.push('\n');
-        note.push_str(NON_VISION_NOTE);
-      }
-      vec![ToolResultContent::text(note)]
-    }
+  let processed = images::process(bytes, format);
+  let mut note = match &processed {
+    Ok(image) => image.note(format!("Read image file [{}]", image.media_type.to_mime_type())),
+    Err(reason) => format!("Read image file [{}]\n{reason}", format.to_mime_type()),
+  };
+  if !vision {
+    note.push('\n');
+    note.push_str(NON_VISION_NOTE);
   }
+  let mut content = vec![ToolResultContent::text(note)];
+  if let Ok(image) = processed
+    && vision
+  {
+    content.push(ToolResultContent::image_base64(
+      image.base64(),
+      Some(image.media_type),
+      None,
+    ));
+  }
+  content
 }
 
 #[cfg(test)]
@@ -774,22 +786,11 @@ impl Tool for EditTool {
     let path = resolve(&self.cwd, &args.path);
     let _guard = lock_file(&path).await;
 
+    // A directory, a missing file and one that may not be written to are all
+    // found out by trying, and all reported the same way.
     let could_not_edit =
-      |e: &std::io::Error| ToolError(format!("Could not edit file: {}. {}.", args.path, io_error_code(e)));
-    let meta = tokio::fs::metadata(&path).await.map_err(|e| could_not_edit(&e))?;
-    if meta.is_dir() {
-      return Err(ToolError(format!(
-        "Could not edit file: {}. Error code: EISDIR.",
-        args.path
-      )));
-    }
-    if meta.permissions().readonly() {
-      return Err(ToolError(format!(
-        "Could not edit file: {}. Error code: EACCES.",
-        args.path
-      )));
-    }
-    let raw = tokio::fs::read_to_string(&path).await.map_err(|e| could_not_edit(&e))?;
+      |e: std::io::Error| ToolError(format!("Could not edit file: {}. {}.", args.path, io_error_code(&e)));
+    let raw = tokio::fs::read_to_string(&path).await.map_err(could_not_edit)?;
 
     let (bom, content) = edit::split_bom(&raw);
     let ending = edit::detect_line_ending(content);
@@ -797,7 +798,7 @@ impl Tool for EditTool {
     let applied = edit::apply_edits(&normalized, &args.edits, &args.path).map_err(ToolError)?;
 
     let final_content = format!("{bom}{}", edit::restore_line_endings(&applied.new, ending));
-    tokio::fs::write(&path, final_content).await?;
+    tokio::fs::write(&path, final_content).await.map_err(could_not_edit)?;
 
     attach_diff(ctx, &applied.base, &applied.new);
     Ok(format!(
@@ -973,6 +974,11 @@ mod edit_tests {
     std::fs::remove_dir_all(&dir).unwrap();
     let (result, _) = run(&dir, vec![("a", "b")]).await;
     assert_eq!(result.unwrap_err().0, "Could not edit file: f.txt. Error code: ENOENT.");
+    // Found out by reading it, like the rest.
+    std::fs::create_dir_all(dir.join("f.txt")).unwrap();
+    let (result, _) = run(&dir, vec![("a", "b")]).await;
+    assert_eq!(result.unwrap_err().0, "Could not edit file: f.txt. Error code: EISDIR.");
+    std::fs::remove_dir_all(&dir).unwrap();
   }
 }
 
@@ -1061,7 +1067,6 @@ impl Tool for BashTool {
 
     let mut output = OutputAccumulator::new();
     let mut throttle = UpdateThrottle::new(ctx.get::<Output>().cloned());
-    let far_future = tokio::time::Instant::now() + Duration::from_secs(365 * 24 * 3600);
     // The timeout while the command runs; once it has exited, how long what
     // it left behind may keep the pipe open.
     let mut deadline = timeout.map(|t| tokio::time::Instant::now() + t);
@@ -1083,7 +1088,7 @@ impl Tool for BashTool {
               exit = Some(status?);
               deadline = Some(tokio::time::Instant::now() + DRAIN_GRACE);
           }
-          _ = tokio::time::sleep_until(deadline.unwrap_or(far_future)), if deadline.is_some() => {
+          _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => {
               if exit.is_none() {
                   timed_out = true;
                   guard.kill();
@@ -1143,12 +1148,11 @@ impl ProcessGroupGuard {
     }
   }
 
+  /// The command was started as the leader of its own group, so the group is
+  /// all of it, and a failure means nothing is left in it to kill.
   fn kill(&self) {
     if let Some(pgid) = self.pgid {
-      // Failures are ignored: the process may already be gone.
-      if kill_process_group(pgid, Signal::KILL).is_err() {
-        let _ = kill_process(pgid, Signal::KILL);
-      }
+      let _ = kill_process_group(pgid, Signal::KILL);
     }
   }
 
@@ -1187,6 +1191,17 @@ impl UpdateThrottle {
 enum TruncatedBy {
   Lines,
   Bytes,
+}
+
+impl TruncatedBy {
+  /// What a note says about the limit that was reached: the byte budget by
+  /// name, since the line count is already in the lines the note gives.
+  fn limit(self) -> String {
+    match self {
+      TruncatedBy::Lines => String::new(),
+      TruncatedBy::Bytes => format!(" ({} limit)", format_size(MAX_BYTES)),
+    }
+  }
 }
 
 /// Streams command output, keeping only a rolling tail in memory and spilling
@@ -1285,17 +1300,18 @@ impl OutputAccumulator {
 
   /// The end of the output as it stands, for showing while it runs.
   fn tail(&self) -> String {
-    truncate_tail(&self.visible_tail()).0
+    keep(&self.visible_tail(), true).text()
   }
 
   /// Model-facing rendering: the tail, then a note on what was cut and where
   /// the full output lives.
   fn render(&self, empty_text: &str) -> String {
-    let (content, by, output_lines, output_bytes, partial) = truncate_tail(&self.visible_tail());
-    let mut text = if content.is_empty() {
-      empty_text.to_string()
-    } else {
-      content
+    let tail = self.visible_tail();
+    let cut = keep(&tail, true);
+    let shown = cut.text();
+    let mut text = match shown.is_empty() {
+      true => empty_text.to_string(),
+      false => shown.clone(),
     };
     if !self.exceeds_limits() {
       return text;
@@ -1305,49 +1321,26 @@ impl OutputAccumulator {
       .as_ref()
       .map_or_else(|| "(unavailable)".to_string(), |(p, _)| p.display().to_string());
     let total_lines = self.total_lines();
-    let start_line = total_lines - output_lines + 1;
-    let by = by.unwrap_or(if self.total_bytes > MAX_BYTES {
-      TruncatedBy::Bytes
-    } else {
-      TruncatedBy::Lines
-    });
-    if partial {
+    if cut.partial() {
       text.push_str(&format!(
         "\n\n[Showing last {} of line {total_lines} (line is {}). Full output: {path}]",
-        format_size(output_bytes),
+        format_size(shown.len()),
         format_size(self.current_line_bytes)
       ));
-    } else if by == TruncatedBy::Lines {
-      text.push_str(&format!(
-        "\n\n[Showing lines {start_line}-{total_lines} of {total_lines}. Full output: {path}]"
-      ));
-    } else {
-      text.push_str(&format!(
-        "\n\n[Showing lines {start_line}-{total_lines} of {total_lines} ({} limit). Full output: {path}]",
-        format_size(MAX_BYTES)
-      ));
+      return text;
     }
+    let start_line = total_lines - cut.kept.len() + 1;
+    // A tail that fits whole was cut already, by the rolling window: it is the
+    // output in front of it that ran over.
+    let by = cut.by.unwrap_or(match self.total_bytes > MAX_BYTES {
+      true => TruncatedBy::Bytes,
+      false => TruncatedBy::Lines,
+    });
+    text.push_str(&format!(
+      "\n\n[Showing lines {start_line}-{total_lines} of {total_lines}{}. Full output: {path}]",
+      by.limit()
+    ));
     text
-  }
-}
-
-/// Keep the last `MAX_LINES` lines within `MAX_BYTES`.
-/// Returns (content, truncated_by, output_lines, output_bytes, last_line_partial).
-fn truncate_tail(content: &str) -> (String, Option<TruncatedBy>, usize, usize, bool) {
-  let cut = keep(content, true);
-  match cut.by {
-    None => (content.to_string(), None, cut.kept.len(), content.len(), false),
-    // A single line larger than the budget: keep its end.
-    Some(by) if cut.kept.is_empty() => {
-      let line = cut.lines[cut.lines.len() - 1];
-      let tail = &line[line.ceil_char_boundary(line.len() - MAX_BYTES)..];
-      (tail.to_string(), Some(by), 1, tail.len(), true)
-    }
-    Some(by) => {
-      let text = cut.text();
-      let bytes = text.len();
-      (text, Some(by), cut.kept.len(), bytes, false)
-    }
   }
 }
 
@@ -1374,6 +1367,29 @@ mod bash_tests {
     assert_eq!(first(schema::<EditArgs>()), "path");
     assert_eq!(first(schema::<ReadArgs>()), "path");
     assert_eq!(first(schema::<BashArgs>()), "command");
+  }
+
+  #[test]
+  fn an_argument_named_like_metadata_is_still_an_argument() {
+    #[derive(Deserialize, JsonSchema)]
+    #[allow(dead_code)]
+    struct Titled {
+      title: String,
+      format: Option<u32>,
+    }
+    let schema = schema::<Titled>();
+    let properties = schema["properties"].as_object().unwrap();
+    assert!(
+      properties.contains_key("title") && properties.contains_key("format"),
+      "{schema}"
+    );
+    assert_eq!(schema["required"], serde_json::json!(["title"]));
+    // The metadata itself still goes, at the top and inside.
+    assert!(
+      schema.get("title").is_none() && schema.get("$schema").is_none(),
+      "{schema}"
+    );
+    assert!(properties["format"].get("format").is_none(), "{schema}");
   }
 
   #[tokio::test]
