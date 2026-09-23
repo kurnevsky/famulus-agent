@@ -19,7 +19,8 @@ use ratatui::text::Line;
 use rmcp::model::{
   ClientCapabilities, ClientInfo, ConstTitle, ElicitRequestParams, ElicitResult, ElicitationAction,
   ElicitationCapability, ElicitationSchema, EnumSchema, ErrorData, FormElicitationCapability, Implementation,
-  MultiSelectEnumSchema, PrimitiveSchemaDefinition, ProgressNotificationParam, SingleSelectEnumSchema,
+  MultiSelectEnumSchema, PrimitiveSchemaDefinition, ProgressNotificationParam, PromptArgument, SingleSelectEnumSchema,
+  StringSchema,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleClient};
 use serde_json::{Map, Value};
@@ -62,6 +63,10 @@ impl rmcp::ClientHandler for crate::mcp::Watch {
 
   async fn on_resource_list_changed(&self, context: NotificationContext<RoleClient>) {
     self.resources_changed(&context.peer).await;
+  }
+
+  async fn on_prompt_list_changed(&self, context: NotificationContext<RoleClient>) {
+    self.prompts_changed(&context.peer).await;
   }
 
   async fn on_progress(&self, note: ProgressNotificationParam, _context: NotificationContext<RoleClient>) {
@@ -141,7 +146,8 @@ const NO: &str = "No";
 
 /// A form from a server, being filled in.
 pub struct Form {
-  server: String,
+  /// What the frame around it says it is.
+  title: String,
   message: String,
   fields: Vec<Field>,
   dialog: Dialog,
@@ -158,10 +164,50 @@ impl Form {
       .map(|(key, property)| field(key, property, required.contains(key)))
       .unzip();
     Self {
-      server: server.to_string(),
+      title: format!("{server} is asking"),
       message,
       fields,
       dialog: Dialog::new(questions),
+      error: None,
+    }
+  }
+
+  /// The arguments a server's prompt takes, sent as `/command`: a line of
+  /// text each, in the order the server gives them — which a schema's
+  /// properties do not keep — with the ones already `given` filled in, and
+  /// the first required one still missing asked first.
+  pub fn arguments(command: &str, message: String, arguments: &[PromptArgument], given: &Map<String, Value>) -> Self {
+    let (fields, questions): (Vec<Field>, Vec<Question>) = arguments
+      .iter()
+      .map(|argument| {
+        let mut text = StringSchema::new();
+        if let Some(title) = &argument.title {
+          text = text.title(title.clone());
+        }
+        if let Some(description) = &argument.description {
+          text = text.description(description.clone());
+        }
+        let required = argument.required == Some(true);
+        field(&argument.name, &PrimitiveSchemaDefinition::String(text), required)
+      })
+      .unzip();
+    let mut dialog = Dialog::new(questions);
+    for (index, field) in fields.iter().enumerate() {
+      if let Some(Value::String(text)) = given.get(&field.key)
+        && !text.is_empty()
+      {
+        dialog.fill(index, text);
+      }
+    }
+    let missing = fields
+      .iter()
+      .position(|field| field.required && !given.contains_key(&field.key));
+    dialog.open(missing.unwrap_or(0));
+    Self {
+      title: command.to_string(),
+      message,
+      fields,
+      dialog,
       error: None,
     }
   }
@@ -195,7 +241,7 @@ impl Component for Form {
   type Output = ElicitResult;
 
   fn title(&self) -> String {
-    format!("{} is asking", self.server)
+    self.title.clone()
   }
 
   fn key(&mut self, key: KeyEvent) -> Option<ElicitResult> {
@@ -501,6 +547,27 @@ mod tests {
     let result = press(&mut refused, KeyCode::Enter).expect("Cancel on the submit tab");
     assert_eq!(result.action, ElicitationAction::Decline);
     assert_eq!(result.content, None);
+  }
+
+  #[test]
+  fn a_prompts_arguments_are_asked_in_order_with_what_was_given_filled_in() {
+    let arguments = [
+      PromptArgument::new("zone").with_required(false),
+      PromptArgument::new("pr").with_title("Pull request").with_required(true),
+    ];
+    let mut given = Map::new();
+    given.insert("zone".into(), Value::String("src".into()));
+    let mut form = Form::arguments("/notes:review", "Review a change.".into(), &arguments, &given);
+    assert_eq!(form.title(), "/notes:review");
+    // In the server's order, not the alphabet's.
+    let keys: Vec<&str> = form.fields.iter().map(|field| field.key.as_str()).collect();
+    assert_eq!(keys, ["zone", "pr"]);
+    // Opened at the one still missing: what is typed answers it.
+    type_in(&mut form, "12");
+    assert!(press(&mut form, KeyCode::Enter).is_none(), "on to the review");
+    let result = press(&mut form, KeyCode::Enter).expect("submitted");
+    assert_eq!(result.action, ElicitationAction::Accept);
+    assert_eq!(result.content, Some(serde_json::json!({ "zone": "src", "pr": "12" })));
   }
 
   #[test]

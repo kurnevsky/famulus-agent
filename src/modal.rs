@@ -95,11 +95,21 @@ impl<C: Component> Modal for Shown<C> {
 #[derive(Clone)]
 pub struct Host {
   tx: mpsc::UnboundedSender<AgentEvent>,
+  /// Asking for the UI itself rather than for a run, so what it shows is
+  /// shown whether or not a run is going.
+  own: bool,
 }
 
 impl Host {
   pub fn new(tx: mpsc::UnboundedSender<AgentEvent>) -> Self {
-    Self { tx }
+    Self { tx, own: false }
+  }
+
+  /// A host for what the UI asks on its own account — the arguments of a
+  /// server's prompt, say — which no run is waiting on.
+  #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+  pub fn own(tx: mpsc::UnboundedSender<AgentEvent>) -> Self {
+    Self { tx, own: true }
   }
 
   /// Show `component`, and wait for however long the user takes to finish
@@ -107,10 +117,14 @@ impl Host {
   /// finished.
   pub async fn show<C: Component>(&self, component: C) -> Option<C::Output> {
     let (tx, rx) = oneshot::channel();
-    let _ = self.tx.send(AgentEvent::Show(Box::new(Shown {
+    let shown = Box::new(Shown {
       component,
       reply: Some(tx),
-    })));
+    });
+    let _ = self.tx.send(match self.own {
+      true => AgentEvent::Ask(shown),
+      false => AgentEvent::Show(shown),
+    });
     rx.await.ok()
   }
 

@@ -92,8 +92,8 @@ pub struct Server {
   /// The same, each value the output of a line of shell.
   pub headers_command: BTreeMap<String, String>,
   /// Seconds one of this server's tools — or a listing or reading of its
-  /// resources — may take before the call comes back as an error the model
-  /// can recover from. `0` waits forever. For a tool, the seconds are
+  /// resources, or of its prompts — may take before the call comes back as
+  /// an error the model can recover from. `0` waits forever. For a tool, the seconds are
   /// counted from the last word from the server, so one that keeps saying
   /// how far along it is may take as long as it needs.
   pub timeout: Option<u64>,
@@ -232,6 +232,8 @@ struct Offer {
   /// What it has to read, for a server that said it has resources as it came
   /// up — whether or not it could list them then.
   resources: Option<crate::resources::ServerResources>,
+  /// What it has written out for the user to send, as it last said.
+  prompts: Vec<rmcp::model::Prompt>,
 }
 
 /// How long a call to a server may take, from the seconds its table says:
@@ -330,6 +332,59 @@ impl Catalog {
       .map(|offer| (offer.peer.clone(), call_timeout(offer.timeout)))
   }
 
+  /// Every prompt the servers offer, as the `/` popup offers it: its
+  /// `server:name`, what it takes and does, and whether it takes anything.
+  pub fn prompt_commands(&self) -> Vec<(String, String, bool)> {
+    #[cfg(feature = "mcp")]
+    return self
+      .offers()
+      .iter()
+      .flat_map(|offer| {
+        offer.prompts.iter().map(|prompt| {
+          let takes = prompt.arguments.as_ref().is_some_and(|a| !a.is_empty());
+          (
+            format!("{}:{}", offer.server, prompt.name),
+            crate::prompts::described(prompt),
+            takes,
+          )
+        })
+      })
+      .collect();
+    #[cfg(not(feature = "mcp"))]
+    Vec::new()
+  }
+
+  /// What sending `text` comes to, when it is `/server:name` and a server
+  /// offers that prompt: the messages the server writes out from the rest of
+  /// the line, asking the user through `host` for what it leaves out. `None`
+  /// for anything else, which is sent as it was typed.
+  pub fn expansion(&self, text: &str, host: &crate::modal::Host, vision: bool) -> Option<Expansion> {
+    #[cfg(feature = "mcp")]
+    {
+      let typed = text.strip_prefix('/')?;
+      let (named, rest) = typed.split_once(char::is_whitespace).unwrap_or((typed, ""));
+      let asking = self.offers().iter().find_map(|offer| {
+        let (server, name) = named.split_at_checked(offer.server.len())?;
+        let name = name.strip_prefix(':').filter(|_| server == offer.server)?;
+        let prompt = offer.prompts.iter().find(|prompt| prompt.name == name)?;
+        Some(crate::prompts::Asking {
+          server: offer.server.clone(),
+          prompt: prompt.clone(),
+          peer: offer.peer.clone(),
+          timeout: call_timeout(offer.timeout),
+        })
+      })?;
+      let rest = rest.to_string();
+      let host = host.clone();
+      Some(Box::pin(async move { asking.expand(&rest, &host, vision).await }))
+    }
+    #[cfg(not(feature = "mcp"))]
+    {
+      let _ = (text, host, vision);
+      None
+    }
+  }
+
   /// Hand every tool on offer to the tools being built.
   pub fn attach(&self, server: rig_agent::tool::server::ToolServer) -> rig_agent::tool::server::ToolServer {
     #[cfg(feature = "mcp")]
@@ -416,6 +471,7 @@ impl Catalog {
             timeout,
             progress,
             resources: None,
+            prompts: Vec::new(),
           });
           None
         }
@@ -426,6 +482,18 @@ impl Catalog {
       rebuild(self);
     }
     before.map(|tools| tools.iter().map(|tool| tool.name.to_string()).collect())
+  }
+
+  /// Put the prompts `server` offers in place of the ones it had, and the
+  /// names of those it had.
+  #[cfg(feature = "mcp")]
+  fn shelve(&self, server: &str, prompts: Vec<rmcp::model::Prompt>) -> Vec<String> {
+    let mut offers = self.offers();
+    let Some(offer) = offers.iter_mut().find(|offer| offer.server == server) else {
+      return Vec::new();
+    };
+    let before = std::mem::replace(&mut offer.prompts, prompts);
+    before.into_iter().map(|prompt| prompt.name).collect()
   }
 
   /// Put what `server` has to read in place of what it had. A list that
@@ -441,6 +509,11 @@ impl Catalog {
     }
   }
 }
+
+/// What sending an MCP prompt comes to: the messages the server wrote out,
+/// or `None` when the user put away the form that asked for its arguments.
+pub type Expansion =
+  std::pin::Pin<Box<dyn Future<Output = Result<Option<Vec<rig_core::completion::Message>>, String>> + Send>>;
 
 /// What a server offers, narrowed to what its table asks of it and to the
 /// names nothing else has taken.
@@ -479,13 +552,29 @@ fn pick(server: &Server, tools: Vec<rmcp::model::Tool>, taken: &[String]) -> Pic
   }
 }
 
-/// "1 tool", "3 tools".
+/// "1 tool", "3 prompts".
 #[cfg(feature = "mcp")]
-fn tools_count(n: usize) -> String {
+fn counted(n: usize, what: &str) -> String {
   match n {
-    1 => "1 tool".to_string(),
-    n => format!("{n} tools"),
+    1 => format!("1 {what}"),
+    n => format!("{n} {what}s"),
   }
+}
+
+/// Which of `now` are new since `before`, and which of `before` are gone,
+/// as the end of a sentence saying how many there are now.
+#[cfg(feature = "mcp")]
+fn changes(before: &[String], now: &[String]) -> String {
+  let gained: Vec<&str> = now.iter().filter(|n| !before.contains(n)).map(String::as_str).collect();
+  let lost: Vec<&str> = before.iter().filter(|n| !now.contains(n)).map(String::as_str).collect();
+  let mut said = String::new();
+  if !gained.is_empty() {
+    said.push_str(&format!(", new: {}", gained.join(", ")));
+  }
+  if !lost.is_empty() {
+    said.push_str(&format!(", gone: {}", lost.join(", ")));
+  }
+  said
 }
 
 /// The client side of one server's connection: what it answers the server
@@ -516,6 +605,12 @@ fn has_resources(peer: &rmcp::service::ServerSink) -> bool {
     .is_some_and(|info| info.capabilities.resources.is_some())
 }
 
+/// Whether a server said, when it came up, that it has prompts.
+#[cfg(feature = "mcp")]
+fn has_prompts(peer: &rmcp::service::ServerSink) -> bool {
+  peer.peer_info().is_some_and(|info| info.capabilities.prompts.is_some())
+}
+
 #[cfg(feature = "mcp")]
 impl Watch {
   /// The server says what it has to read has changed: ask it again. Said
@@ -523,6 +618,15 @@ impl Watch {
   /// whenever a file does, and none of that is news.
   pub async fn resources_changed(&self, peer: &rmcp::service::ServerSink) {
     if let Some(note) = self.stock_resources(peer).await {
+      self.host.tell(crate::agent::AgentEvent::Mcp(note));
+    }
+  }
+
+  /// The server says its prompts have changed: ask it for them, and say
+  /// which came and went — they are commands the user types, and one that
+  /// appears without a word is one nobody knows to type.
+  pub async fn prompts_changed(&self, peer: &rmcp::service::ServerSink) {
+    if let Some(note) = self.stock_prompts(peer, true).await {
       self.host.tell(crate::agent::AgentEvent::Mcp(note));
     }
   }
@@ -557,7 +661,7 @@ impl Watch {
     );
     match offered {
       None => {
-        note.push_str(&tools_count(now.len()));
+        note.push_str(&counted(now.len(), "tool"));
         // Said once, as it comes up: a typo in the file is not news again
         // every time the server's list changes.
         if !picked.unknown.is_empty() {
@@ -565,15 +669,8 @@ impl Watch {
         }
       }
       Some(before) => {
-        note.push_str(&format!("now {}", tools_count(now.len())));
-        let gained: Vec<&str> = now.iter().filter(|n| !before.contains(n)).map(String::as_str).collect();
-        let lost: Vec<&str> = before.iter().filter(|n| !now.contains(n)).map(String::as_str).collect();
-        if !gained.is_empty() {
-          note.push_str(&format!(", new: {}", gained.join(", ")));
-        }
-        if !lost.is_empty() {
-          note.push_str(&format!(", gone: {}", lost.join(", ")));
-        }
+        note.push_str(&format!("now {}", counted(now.len(), "tool")));
+        note.push_str(&changes(&before, &now));
       }
     }
     if !picked.clashed.is_empty() {
@@ -583,6 +680,32 @@ impl Watch {
       ));
     }
     Ok(note)
+  }
+
+  /// Ask a server that said it has prompts what they are, for the `/` popup
+  /// to offer, and what to say about it: how many there are the first time,
+  /// what changed after, and why it could not say, if it could not.
+  async fn stock_prompts(&self, peer: &rmcp::service::ServerSink, again: bool) -> Option<String> {
+    if !has_prompts(peer) {
+      return None;
+    }
+    let _one = self.busy.lock().await;
+    let name = &self.server;
+    let prompts = match crate::prompts::inventory(peer, call_timeout(self.table.timeout)).await {
+      Ok(prompts) => prompts,
+      Err(err) => return Some(format!("MCP {name}: could not list prompts: {err}")),
+    };
+    let now: Vec<String> = prompts.iter().map(|prompt| prompt.name.clone()).collect();
+    let before = self.catalog.shelve(name, prompts);
+    match again {
+      false if now.is_empty() => None,
+      false => Some(format!("MCP {name}: {}", counted(now.len(), "prompt"))),
+      true => Some(format!(
+        "MCP {name}: now {}{}",
+        counted(now.len(), "prompt"),
+        changes(&before, &now)
+      )),
+    }
   }
 
   /// Ask a server that said it has resources what they are, for `&` to
@@ -630,6 +753,7 @@ pub async fn connect(config: Config, host: &crate::modal::Host) -> Servers {
       }
     }
     servers.notes.extend(watch.stock_resources(running.peer()).await);
+    servers.notes.extend(watch.stock_prompts(running.peer(), false).await);
     servers.running.push(running);
   }
   servers

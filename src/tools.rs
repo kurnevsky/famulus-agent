@@ -533,7 +533,8 @@ mod capping_tests {
 
 /// Image files come back as a note plus the image itself. Images the
 /// pipeline cannot deliver are replaced by the reason.
-const NON_VISION_NOTE: &str = "[Current model does not support images. The image will be omitted from this request.]";
+pub const NON_VISION_NOTE: &str =
+  "[Current model does not support images. The image will be omitted from this request.]";
 
 pub fn read_image(bytes: &[u8], format: image::ImageFormat, vision: bool) -> Vec<ToolResultContent> {
   let processed = images::process(bytes, format);

@@ -317,7 +317,7 @@ A server is a `command` to run, spoken to over its own stdin and stdout, or a
 | `token-keyring` | The same, kept in the system keyring: the attributes of the one item holding it |
 | `headers` | Sent with every request to it |
 | `headers-command` | The same, each value the output of a line of shell rather than written out |
-| `timeout` | Seconds one of this server's tools — or a listing or reading of its resources — may take, `0` to wait forever (default 300) |
+| `timeout` | Seconds one of this server's tools — or a listing or reading of its resources, or of its prompts — may take, `0` to wait forever (default 300) |
 | `tools` | Take only these of the tools it offers |
 | `except` | Take everything but these |
 | `oauth` | How to sign in, for a server that cannot work that out itself — see below |
@@ -480,6 +480,38 @@ and the model reads what it names with `read_resource`, whose result is drawn
 under the call like any tool's. Nothing is read when the prompt is sent, so
 nothing is added to it — and a prompt handed back by `Up` or `/tree` names
 what the server holds whenever the model reads it.
+
+### Prompts
+
+A server can also offer prompts: messages it writes out for the user to send,
+from arguments it is given
+([prompts](https://modelcontextprotocol.io/specification/2025-11-25/server/prompts)).
+Each is a command, `/server:name`, offered by the `/` popup after fa's own with
+what it takes — `<…>` required, `[…]` not — and what it does:
+
+```
+/notes:review <pr> [focus] Review a change.
+```
+
+What follows the name is its arguments, a word each in the order the server
+gives them, `"in quotes"` for one with a space in it, and the last one taking
+the rest of the line as it is typed: `/notes:review 12 the error handling`
+gives `pr` 12 and `focus` "the error handling". A required one left out is
+asked for in a form — the one [a server asking you](#a-server-asking-you)
+gets — with the ones given filled in; `Esc` puts it away and sends nothing.
+
+What the server writes out is what is sent, in place of what was typed, and
+what the transcript shows: text as text, an image as an image (or said not to
+be sent, with `--no-vision`), a resource it carries whole as its text under a
+line naming it `&server:uri`, and one it only points at as that line alone,
+for the model to read with `read_resource`. A prompt may be a conversation —
+the user, then the assistant, then the user again — and it goes to the model
+as one. Sent while a run is going, it waits for the next turn like anything
+else typed then; `Up` recalls it as the `/server:name` line it was typed as.
+
+Each server's prompts are fetched when it comes up and again whenever it says
+they have changed (`notifications/prompts/list_changed`), and the transcript
+says which came and went.
 
 ### A server asking you
 
@@ -932,7 +964,7 @@ what it spent.
 | `Enter` | Send (queued if a run is in progress) |
 | `Alt+↑` | Take the last queued message back for editing (empty input) |
 | `↑` / `↓` | Walk back through the prompts already sent, and forward again — from the first/last line of the input |
-| `/` | Command popup: type to fuzzy-filter, `↑`/`↓` move, `Tab`/`Enter` complete, `Esc` dismiss |
+| `/` | Command popup: type to fuzzy-filter, `↑`/`↓` move, `Tab`/`Enter` complete, `Esc` dismiss — an MCP server's prompts are in it as `/server:name` |
 | `@` | Attach an image: `@path`, `@/full/path`, `@~/shot.png`, `@"with a space.png"` — same popup, `Tab` completes, a directory is carried on into |
 | `&` | Name an MCP resource for the model to read: `&server:uri` — same popup, `Tab` completes |
 | `Alt+Enter`, `Ctrl+J`, `Shift+Enter`* | Newline |
@@ -1048,6 +1080,9 @@ comes back to say otherwise.
   session: what a sign-in is kept in, and where `token-keyring` looks.
 - `src/resources.rs` – `list_resources` and `read_resource`, the two tools
   that read what MCP servers hold, offered when one of them holds anything.
+- `src/prompts.rs` – MCP servers' prompts, sent as `/server:name`: the
+  arguments typed after the name, the form for the ones left out, and what the
+  server writes out made into the messages the model is sent.
 - `src/oauth.rs` – signing in to an MCP endpoint that wants it: the browser
   sent to the server and the code taken back on a loopback port, and the
   keyring the tokens are kept in between sessions. rmcp does the protocol.

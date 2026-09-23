@@ -19,6 +19,8 @@ mod modal;
 #[cfg(feature = "mcp")]
 mod oauth;
 #[cfg(feature = "mcp")]
+mod prompts;
+#[cfg(feature = "mcp")]
 mod resources;
 mod session;
 mod tools;

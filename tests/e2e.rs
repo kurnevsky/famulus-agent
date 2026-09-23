@@ -370,7 +370,7 @@ fn answer_to(body: &str) -> String {
 /// requests a client makes of one, answered by hand — and one it makes of the
 /// client, when `book` needs the user to say something. `grow` changes what it
 /// offers, and says so the way the protocol has it. Started with `resources`,
-/// it has a note to read as well.
+/// it has a note to read as well; with `prompts`, two prompts to send.
 #[cfg(feature = "mcp")]
 const MCP_SERVER: &str = r#"
 import json, sys
@@ -443,6 +443,26 @@ DAY = {"uriTemplate": "note://{day}", "name": "day", "description": "The note fo
 LATER = {"uri": "note://tomorrow", "name": "tomorrow", "mimeType": "text/plain"}
 NOTES = [NOTE]
 
+PROMPTS = "prompts" in sys.argv[1:]
+REVIEW = {
+    "name": "review",
+    "description": "Review a change.",
+    "arguments": [{"name": "pr", "required": True}, {"name": "focus"}],
+}
+RECAP = {"name": "recap", "description": "Say where things stand."}
+
+def written(name, arguments):
+    if name == "review":
+        focus = arguments.get("focus") or "everything"
+        text = "Review PR %s, looking at %s." % (arguments.get("pr"), focus)
+        return [{"role": "user", "content": {"type": "text", "text": text}}]
+    return [
+        {"role": "user", "content": {"type": "text", "text": "Where were we?"}},
+        {"role": "assistant", "content": {"type": "text", "text": "On the parser."}},
+        {"role": "user", "content": {"type": "resource", "resource": {
+            "uri": "note://today", "mimeType": "text/plain", "text": "Buy milk."}}},
+    ]
+
 asks = False
 while True:
     message = read()
@@ -454,6 +474,8 @@ while True:
         capabilities = {"tools": {"listChanged": True}}
         if RESOURCES:
             capabilities["resources"] = {}
+        if PROMPTS:
+            capabilities["prompts"] = {}
         result = {
             "protocolVersion": params.get("protocolVersion", "2025-06-18"),
             "capabilities": capabilities,
@@ -461,6 +483,10 @@ while True:
         }
     elif method == "tools/list":
         result = {"tools": TOOLS}
+    elif method == "prompts/list":
+        result = {"prompts": [REVIEW, RECAP]}
+    elif method == "prompts/get":
+        result = {"messages": written(params.get("name"), params.get("arguments") or {})}
     elif method == "resources/list":
         result = {"resources": NOTES}
     elif method == "resources/templates/list":
@@ -2912,6 +2938,99 @@ fn a_server_asks_the_user_in_a_form_and_gets_what_they_answered() {
   assert!(provider.sent(r#"\"action\": \"accept\""#), "accepted");
   assert!(provider.sent(r#"\"seats\": 3"#), "a number");
   assert!(provider.sent(r#"\"window\": true"#), "a boolean");
+  let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A server's prompts are offered by the `/` popup as `/server:name`, with
+/// what they take, and sent as what the server writes out of them: from the
+/// arguments typed after the name, or from a form asking for the required
+/// ones left out. What the server writes may be a conversation of its own,
+/// and it goes to the model as one.
+#[test]
+#[cfg(feature = "mcp")]
+fn a_servers_prompt_is_a_command_sent_as_what_the_server_writes_out() {
+  if !have_tmux() || !have_python() {
+    return;
+  }
+  let dir = scratch("mcp-prompts");
+  let server = dir.join("server.py");
+  std::fs::write(&server, MCP_SERVER).expect("a server to run");
+  let config = dir.join("mcp.toml");
+  std::fs::write(
+    &config,
+    format!(
+      "[notes]\ncommand = \"python3 '{}' prompts\"\ntimeout = 10\ntools = [\"weather\"]\n",
+      server.display()
+    ),
+  )
+  .expect("a config to read");
+
+  // Which turn it is is counted in tool results, and none of these call a
+  // tool: every one is answered the same, and counted on screen.
+  let provider = Provider::start(vec![Turn::Say("Noted.")]);
+  let term = Term::start(
+    "mcp-prompts",
+    &provider,
+    &["--no-session", "--mcp-config", &shell(&config)],
+  );
+  term.wait_for("MCP notes: 2 prompts");
+  let answered = |n: usize| poll(|| (term.screen().matches("Noted.").count() >= n).then(String::new));
+
+  // Offered with the commands, with what it takes and does.
+  term.type_in("/notes:rev");
+  let screen = term.wait_for("/notes:review");
+  assert!(screen.contains("<pr> [focus] Review a change."), "{screen}");
+  term.type_in("Tab");
+  poll(|| (term.typed() == "/notes:review").then(String::new));
+
+  // Its arguments typed after it: a word, and the rest of the line.
+  term.type_in("12 the tests");
+  term.type_in("Enter");
+  answered(1);
+  assert!(provider.sent("Review PR 12, looking at the tests."), "written out");
+  let screen = term.screen();
+  assert!(
+    screen.contains("Review PR 12, looking at the tests."),
+    "drawn as sent: {screen}"
+  );
+
+  // A required one left out is asked for, and the rest may stay blank.
+  term.submit("/notes:review");
+  let screen = term.wait_for("pr (required)");
+  assert!(screen.contains("Review a change."), "{screen}");
+  term.type_in("7");
+  term.type_in("Enter");
+  term.type_in("Enter");
+  term.wait_for("Review your answers");
+  term.type_in("Enter");
+  answered(2);
+  assert!(provider.sent("Review PR 7, looking at everything."), "from the form");
+
+  // A conversation of its own, and a resource carried whole.
+  term.submit("/notes:recap");
+  answered(3);
+  assert!(term.screen().contains("On the parser."), "drawn as the server wrote it");
+  let last = provider.bodies().last().cloned().expect("a request");
+  let request: serde_json::Value = serde_json::from_str(&last).expect("JSON");
+  let said: Vec<(String, String)> = request["messages"]
+    .as_array()
+    .expect("messages")
+    .iter()
+    .map(|m| (m["role"].as_str().unwrap_or("").to_string(), m["content"].to_string()))
+    .collect();
+  let at = said
+    .iter()
+    .position(|(_, content)| content.contains("Where were we?"))
+    .unwrap_or_else(|| panic!("the recap: {said:?}"));
+  assert_eq!(said[at + 1].0, "assistant", "{said:?}");
+  assert!(said[at + 1].1.contains("On the parser."), "{said:?}");
+  assert_eq!(said[at + 2].0, "user", "{said:?}");
+  assert!(
+    said[at + 2]
+      .1
+      .contains("[Resource &notes:note://today — text/plain]\\nBuy milk."),
+    "{said:?}"
+  );
   let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -229,10 +229,15 @@ pub fn load(token: &Token) -> Result<Attached, String> {
 }
 
 /// A prompt on its way to the model: what was typed, and the images its
-/// tokens resolved to.
+/// tokens resolved to — or, for an MCP server's prompt, the messages the
+/// server wrote out from what was typed.
 pub struct Prompt {
   pub text: String,
   pub images: Vec<Attached>,
+  /// What is sent in place of the text, when there is anything: `text` is
+  /// then the `/server:name` line it was written out from, which is what
+  /// waits on screen and what taking it back hands the input box.
+  pub expanded: Vec<Message>,
 }
 
 impl Prompt {
@@ -242,6 +247,24 @@ impl Prompt {
     Self {
       text,
       images: Vec::new(),
+      expanded: Vec::new(),
+    }
+  }
+
+  /// A prompt a server wrote out as `expanded`, from `text`.
+  pub fn expanded(text: String, expanded: Vec<Message>) -> Self {
+    Self {
+      expanded,
+      ..Self::text(text)
+    }
+  }
+
+  /// What the provider is given: the messages a server wrote out, or the
+  /// one message that was typed.
+  pub fn messages(&self) -> Vec<Message> {
+    match self.expanded.is_empty() {
+      true => vec![self.message()],
+      false => self.expanded.clone(),
     }
   }
 
@@ -454,8 +477,8 @@ mod tests {
     png(&dir, "shot.png", 4, 4);
     let found = tokens("what is @shot.png", &dir);
     let prompt = Prompt {
-      text: "what is @shot.png".into(),
       images: vec![load(&found[0]).unwrap()],
+      ..Prompt::text("what is @shot.png".into())
     };
     let Message::User { content } = prompt.message() else {
       panic!("a user message")

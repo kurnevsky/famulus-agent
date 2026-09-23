@@ -56,6 +56,8 @@ pub enum AgentEvent {
     text: String,
     /// Images it attached, for the transcript to draw under it.
     images: Vec<Vec<u8>>,
+    /// What an MCP server wrote out from it, which is what was sent.
+    expanded: Vec<Message>,
   },
   ToolCall {
     name: String,
@@ -112,6 +114,10 @@ pub enum AgentEvent {
   /// server. The modal already knows where its answer goes; dropping it
   /// unfinished is no answer, which is what an aborted run leaves behind.
   Show(Box<dyn Modal>),
+  /// The same, for the UI itself rather than a run: shown whether or not
+  /// one is going.
+  #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+  Ask(Box<dyn Modal>),
   /// The run stopped short of an answer — cancelled, out of room, or after
   /// an `Error`. `messages` holds the same thing `Done` carries: everything
   /// it got through, as it was sent.
@@ -123,6 +129,14 @@ pub enum AgentEvent {
   /// What the provider says it offers, or why it would not say. Sent by the
   /// fetch `/model` starts, which is the only thing that asks.
   Models(Result<Vec<ModelInfo>, String>),
+  /// What sending an MCP server's prompt, typed as `text`, came to: the
+  /// messages the server wrote out, `None` when the user put away the form
+  /// that asked for its arguments, or why it could not be had.
+  #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+  Expanded {
+    text: String,
+    result: Result<Option<Vec<Message>>, String>,
+  },
   /// Something about an MCP server while the session ran — its tools
   /// changed, or what it holds could not be listed: what to say about it.
   #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
@@ -677,12 +691,11 @@ pub fn start_run(
   runtime: Arc<Runtime>,
   control: Control,
   history: Vec<Message>,
-  prompt: Option<Message>,
+  mut made: Vec<Message>,
   tx: mpsc::UnboundedSender<AgentEvent>,
 ) -> JoinHandle<()> {
   tokio::spawn(async move {
     control.begin();
-    let mut made: Vec<Message> = prompt.into_iter().collect();
     let event = match run(&runtime, &control, &history, &mut made, &tx).await {
       None => AgentEvent::Done { messages: made },
       Some(stop) => {
@@ -716,8 +729,9 @@ async fn run(
       let _ = tx.send(AgentEvent::Steered {
         text: prompt.text.clone(),
         images: prompt.preview(),
+        expanded: prompt.expanded.clone(),
       });
-      made.push(prompt.message());
+      made.extend(prompt.messages());
     }
     if control.cancelled() {
       return Some(Stop::Cancelled);
@@ -1171,7 +1185,7 @@ mod tests {
       runtime.clone(),
       Control::default(),
       history,
-      Some(Message::user(prompt)),
+      vec![Message::user(prompt)],
       tx.clone(),
     );
     let mut events = Vec::new();
@@ -1265,7 +1279,7 @@ mod tests {
     at: impl Fn(&AgentEvent) -> bool,
   ) -> Vec<Message> {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let handle = start_run(runtime, control.clone(), Vec::new(), Some(Message::user(prompt)), tx);
+    let handle = start_run(runtime, control.clone(), Vec::new(), vec![Message::user(prompt)], tx);
     let mut cancelled = false;
     loop {
       let event = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
@@ -1419,7 +1433,7 @@ mod tests {
     );
     let control = Control::default();
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let handle = start_run(runtime, control.clone(), Vec::new(), Some(Message::user("start")), tx);
+    let handle = start_run(runtime, control.clone(), Vec::new(), vec![Message::user("start")], tx);
     let mut steered = false;
     let messages = loop {
       let event = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
@@ -1530,8 +1544,9 @@ mod tests {
         AgentEvent::Ended { .. } => "ended".into(),
         AgentEvent::Compacted(_) => "compacted".into(),
         AgentEvent::Models(_) => "models".into(),
-        AgentEvent::Show(_) => "asking".into(),
+        AgentEvent::Show(_) | AgentEvent::Ask(_) => "asking".into(),
         AgentEvent::Mcp(_) => "mcp".into(),
+        AgentEvent::Expanded { .. } => "expanded".into(),
       })
       .collect();
     assert!(names.contains(&"call:bash".to_string()), "{names:?}");

@@ -220,8 +220,13 @@ const PATH_ROWS: usize = 20;
 
 /// One popup row, with the characters the query matched in it picked out.
 enum Match {
-  /// Index into `COMMANDS`.
-  Command { index: usize, highlights: Vec<u32> },
+  /// One of `COMMANDS`, or a prompt an MCP server offers as `server:name`.
+  Command {
+    name: String,
+    description: String,
+    takes_arg: bool,
+    highlights: Vec<u32>,
+  },
   /// What a token is reaching for — a path after `@`, a resource after `&`:
   /// what the token becomes when it is taken, how the row reads, and what
   /// the right-hand column says about it.
@@ -987,9 +992,8 @@ impl App {
           return false;
         };
         match item {
-          Match::Command { index, .. } => {
-            let (name, _, takes_arg) = COMMANDS[*index];
-            self.set_input(&format!("/{name}{}", if takes_arg { " " } else { "" }));
+          Match::Command { name, takes_arg, .. } => {
+            self.set_input(&format!("/{name}{}", if *takes_arg { " " } else { "" }));
             // The completed command is exact; keep the popup closed until
             // the user edits the text again.
             self.completion_dismissed = true;
@@ -1051,7 +1055,10 @@ impl App {
       return;
     }
     let (items, replacing) = match commands {
-      Some(query) => (filter_commands(&mut self.matcher, &query), None),
+      Some(query) => {
+        let prompts = self.catalog.prompt_commands();
+        (filter_commands(&mut self.matcher, &query, &prompts), None)
+      }
       None => match self.completing_token() {
         Some(range) => {
           let text = self.input_text();
@@ -1674,6 +1681,19 @@ impl App {
     self.completion = None;
     self.anchor = None;
 
+    // A server's prompt is sent as what the server writes out of it, which
+    // takes asking for: it comes back as an event, and goes on from there
+    // the way anything typed does.
+    let host = crate::modal::Host::own(self.tx.clone());
+    if let Some(expansion) = self.catalog.expansion(&text, &host, self.cfg.vision) {
+      let tx = self.tx.clone();
+      tokio::spawn(async move {
+        let result = expansion.await;
+        let _ = tx.send(AgentEvent::Expanded { text, result });
+      });
+      return;
+    }
+
     // Read here rather than wherever the prompt is finally sent: the file
     // is what it was when Enter was pressed, not what it becomes while a
     // run works through the queue ahead of it.
@@ -1691,6 +1711,22 @@ impl App {
       return;
     }
     self.dispatch(prompt);
+  }
+
+  /// What a server wrote out of a prompt typed as `text`, sent the way a
+  /// prompt typed at that moment would be.
+  fn expanded(&mut self, text: String, result: Result<Option<Vec<Message>>, String>) {
+    match result {
+      Ok(Some(messages)) => {
+        let prompt = Prompt::expanded(text, messages);
+        match self.run.is_some() {
+          true => self.agents.control.steer(prompt),
+          false => self.start(prompt),
+        }
+      }
+      Ok(None) => self.notify(format!("{text}: not sent.")),
+      Err(err) => self.entries.push(Entry::Error(err)),
+    }
   }
 
   /// Load the images the prompt's `@tokens` name, saying in the transcript
@@ -2127,16 +2163,14 @@ impl App {
   }
 
   fn start(&mut self, prompt: Prompt) {
-    self.entries.push(Entry::User {
-      text: prompt.text.clone(),
-      images: prompt.preview(),
-    });
-    let prompt = prompt.message();
+    self
+      .entries
+      .extend(prompt_entries(prompt.text.clone(), prompt.preview(), &prompt.expanded));
     let handle = start_run(
       self.agents.runtime.clone(),
       self.agents.control.clone(),
       self.session.history.clone(),
-      Some(prompt),
+      prompt.messages(),
       self.tx.clone(),
     );
     self.run = Some(handle);
@@ -2157,7 +2191,7 @@ impl App {
       self.agents.runtime.clone(),
       self.agents.control.clone(),
       self.session.history.clone(),
-      None,
+      Vec::new(),
       self.tx.clone(),
     );
     self.run = Some(handle);
@@ -2235,6 +2269,10 @@ impl App {
       // Nor this: a server's tools can change with or without a run. Said
       // where the servers were first said; the footer counts them afresh.
       AgentEvent::Mcp(note) => self.entries.push(Entry::Info(note)),
+      AgentEvent::Expanded { text, result } => self.expanded(text, result),
+      // Asked for by what was just typed, so nobody has to be called back
+      // to the terminal for it.
+      AgentEvent::Ask(modal) => self.modals.push_back(modal),
       // A stale event from an aborted run.
       _ if self.run.is_none() => {}
       AgentEvent::Text(delta) => match self.entries.last_mut() {
@@ -2244,7 +2282,7 @@ impl App {
       // The run has read one of the messages waiting behind it, so it stops
       // being something on its way and becomes a prompt like any other —
       // drawn where the run reached it, which is where it was sent from.
-      AgentEvent::Steered { text, images } => self.entries.push(Entry::User { text, images }),
+      AgentEvent::Steered { text, images, expanded } => self.entries.extend(prompt_entries(text, images, &expanded)),
       AgentEvent::Reasoning(delta) => match self.entries.last_mut() {
         Some(Entry::Reasoning(text)) => text.push_str(&delta),
         _ => self.entries.push(Entry::Reasoning(delta)),
@@ -2585,7 +2623,18 @@ impl App {
     let Some(c) = &self.completion else { return };
     let rows = area.height as usize;
     let first = c.selected.saturating_sub(rows.saturating_sub(1));
-    let command_width = COMMANDS.iter().map(|(n, ..)| n.len() + 1).max().unwrap_or(0);
+    // The built-in commands keep one column whatever is shown; a server's
+    // prompt, which may be longer, widens it while it is in the list.
+    let command_width = c
+      .items
+      .iter()
+      .filter_map(|m| match m {
+        Match::Command { name, .. } => Some(name.chars().count() + 1),
+        Match::Path { .. } => None,
+      })
+      .chain(COMMANDS.iter().map(|(n, ..)| n.len() + 1))
+      .max()
+      .unwrap_or(0);
     // A file list is as wide as its longest name, so the sizes line up in a
     // column of their own.
     let path_width = c
@@ -2613,17 +2662,19 @@ impl App {
         };
         let mut spans = vec![pointer(selected)];
         let (sigil, name, highlights, trailing, width, right) = match m {
-          Match::Command { index, highlights } => {
-            let (name, description, _) = COMMANDS[*index];
-            (
-              "/",
-              name.to_string(),
-              highlights,
-              String::new(),
-              command_width,
-              description.to_string(),
-            )
-          }
+          Match::Command {
+            name,
+            description,
+            highlights,
+            ..
+          } => (
+            "/",
+            name.clone(),
+            highlights,
+            String::new(),
+            command_width,
+            description.clone(),
+          ),
           Match::Path {
             name,
             highlights,
@@ -3345,8 +3396,8 @@ fn attach_images(text: &str, cwd: &Path, vision: bool) -> (Prompt, Vec<String>) 
   }
   (
     Prompt {
-      text: text.to_string(),
       images,
+      ..Prompt::text(text.to_string())
     },
     notes,
   )
@@ -3373,7 +3424,7 @@ fn as_token(text: &str, cwd: &Path) -> Option<String> {
 /// list is filtered down.
 fn key(item: &Match) -> String {
   match item {
-    Match::Command { index, .. } => COMMANDS[*index].0.to_string(),
+    Match::Command { name, .. } => name.clone(),
     Match::Path { insert, .. } => insert.clone(),
   }
 }
@@ -3417,10 +3468,29 @@ fn point_label(point: &Point) -> String {
   format!("{}{}", "  ".repeat(point.depth), point.label)
 }
 
-fn filter_commands(matcher: &mut Matcher, query: &str) -> Vec<Match> {
-  filter_rows(matcher, COMMANDS.iter().map(|(name, ..)| *name), query)
+/// The commands `query` leaves: fa's own, then the prompts MCP servers
+/// offer, as `prompts` lists them.
+fn filter_commands(matcher: &mut Matcher, query: &str, prompts: &[(String, String, bool)]) -> Vec<Match> {
+  let rows: Vec<(&str, &str, bool)> = COMMANDS
+    .iter()
+    .copied()
+    .chain(
+      prompts
+        .iter()
+        .map(|(name, about, takes)| (name.as_str(), about.as_str(), *takes)),
+    )
+    .collect();
+  filter_rows(matcher, rows.iter().map(|(name, ..)| *name), query)
     .into_iter()
-    .map(|(index, highlights)| Match::Command { index, highlights })
+    .map(|(at, highlights)| {
+      let (name, description, takes_arg) = rows[at];
+      Match::Command {
+        name: name.to_string(),
+        description: description.to_string(),
+        takes_arg,
+        highlights,
+      }
+    })
     .collect()
 }
 
@@ -4185,48 +4255,12 @@ fn entries_from_history(session: &Session) -> Vec<Entry> {
     }
     match message {
       Message::System { .. } => {}
-      Message::User { content } => {
-        // A prompt that attached images is one text part, then a note and an
-        // image for each: the images belong to the prompt, and the notes are
-        // what was said to the model about them rather than anything the
-        // transcript has to repeat.
-        let mut attached: Vec<Vec<u8>> = content
-          .iter()
-          .filter_map(|c| match c {
-            UserContent::Image(image) => crate::images::source_bytes(&image.data),
-            _ => None,
-          })
-          .collect();
-        // Asked before the images are handed to the prompt, which empties
-        // the list: what decides whether a later text part is a note is
-        // that there were images, not that there still are.
-        let attachments = !attached.is_empty();
-        let mut prompt_seen = false;
-        for c in content {
-          match c {
-            UserContent::Text(t) => {
-              if prompt_seen && attachments {
-                continue;
-              }
-              prompt_seen = true;
-              entries.push(Entry::User {
-                text: t.text.clone(),
-                images: std::mem::take(&mut attached),
-              });
-            }
-            // An output nothing claimed — a result whose call is not in this
-            // branch — is still shown, where it was written.
-            UserContent::ToolResult(r) => {
-              if let Some(i) = results.index(crate::session::result_ids(r))
-                && answered.insert(i)
-              {
-                entries.push(results.entry(i, session, now));
-              }
-            }
-            _ => {}
-          }
-        }
-      }
+      Message::User { content } => entries.extend(user_entries(content, |r| {
+        // An output nothing claimed — a result whose call is not in this
+        // branch — is still shown, where it was written.
+        let i = results.index(crate::session::result_ids(r))?;
+        answered.insert(i).then(|| results.entry(i, session, now))
+      })),
       Message::Assistant { content, .. } => {
         for c in content {
           match c {
@@ -4258,6 +4292,66 @@ fn entries_from_history(session: &Session) -> Vec<Entry> {
           }
         }
       }
+    }
+  }
+  entries
+}
+
+/// A user message as the transcript draws it: the prompt, with the images it
+/// attached, and each tool result as `result` makes it.
+fn user_entries(content: &[UserContent], mut result: impl FnMut(&ToolResult) -> Option<Entry>) -> Vec<Entry> {
+  // A prompt that attached images is one text part, then a note and an
+  // image for each: the images belong to the prompt, and the notes are
+  // what was said to the model about them rather than anything the
+  // transcript has to repeat.
+  let mut attached: Vec<Vec<u8>> = content
+    .iter()
+    .filter_map(|c| match c {
+      UserContent::Image(image) => crate::images::source_bytes(&image.data),
+      _ => None,
+    })
+    .collect();
+  // Asked before the images are handed to the prompt, which empties the
+  // list: what decides whether a later text part is a note is that there
+  // were images, not that there still are.
+  let attachments = !attached.is_empty();
+  let mut prompt_seen = false;
+  let mut entries = Vec::new();
+  for c in content {
+    match c {
+      UserContent::Text(t) => {
+        if prompt_seen && attachments {
+          continue;
+        }
+        prompt_seen = true;
+        entries.push(Entry::User {
+          text: t.text.clone(),
+          images: std::mem::take(&mut attached),
+        });
+      }
+      UserContent::ToolResult(r) => entries.extend(result(r)),
+      _ => {}
+    }
+  }
+  entries
+}
+
+/// What a prompt is drawn as: what was typed, with the images it attached —
+/// or, for one an MCP server wrote out, what the server wrote, drawn the way
+/// the session draws it when it is opened again.
+fn prompt_entries(text: String, images: Vec<Vec<u8>>, expanded: &[Message]) -> Vec<Entry> {
+  if expanded.is_empty() {
+    return vec![Entry::User { text, images }];
+  }
+  let mut entries = Vec::new();
+  for message in expanded {
+    match message {
+      Message::User { content } => entries.extend(user_entries(content, |_| None)),
+      Message::Assistant { content, .. } => entries.extend(content.iter().filter_map(|c| match c {
+        AssistantContent::Text(t) => Some(Entry::Assistant(t.text.clone())),
+        _ => None,
+      })),
+      Message::System { .. } => {}
     }
   }
   entries
@@ -4710,11 +4804,11 @@ mod tests {
     assert_eq!(thumb_bounds(track, max_scroll, viewport, middle).0, travel as u16 / 2);
   }
 
-  fn names(matches: &[Match]) -> Vec<&'static str> {
+  fn names(matches: &[Match]) -> Vec<&str> {
     matches
       .iter()
       .map(|m| match m {
-        Match::Command { index, .. } => COMMANDS[*index].0,
+        Match::Command { name, .. } => name.as_str(),
         Match::Path { .. } => "path",
       })
       .collect()
@@ -4923,18 +5017,52 @@ mod tests {
   #[test]
   fn command_filter_is_fuzzy_and_ranked() {
     let mut matcher = Matcher::new(Config::DEFAULT);
-    assert_eq!(filter_commands(&mut matcher, "").len(), COMMANDS.len());
-    assert_eq!(names(&filter_commands(&mut matcher, "res")), ["resume"]);
+    assert_eq!(filter_commands(&mut matcher, "", &[]).len(), COMMANDS.len());
+    assert_eq!(names(&filter_commands(&mut matcher, "res", &[])), ["resume"]);
     // Fuzzy: letters in order, not contiguous.
-    assert_eq!(names(&filter_commands(&mut matcher, "nm")), ["name"]);
+    assert_eq!(names(&filter_commands(&mut matcher, "nm", &[])), ["name"]);
     // Prefix match ranks above a scattered match.
-    assert_eq!(names(&filter_commands(&mut matcher, "se"))[0], "session");
-    assert!(filter_commands(&mut matcher, "zzz").is_empty());
+    assert_eq!(names(&filter_commands(&mut matcher, "se", &[]))[0], "session");
+    assert!(filter_commands(&mut matcher, "zzz", &[]).is_empty());
     // Highlights point at the matched letters: n-a-m-e for "nm".
-    let Match::Command { highlights, .. } = &filter_commands(&mut matcher, "nm")[0] else {
+    let Match::Command { highlights, .. } = &filter_commands(&mut matcher, "nm", &[])[0] else {
       panic!("a command")
     };
     assert_eq!(highlights, &[0, 2]);
+  }
+
+  #[test]
+  fn a_servers_prompts_are_offered_after_the_commands() {
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let prompts = [
+      ("notes:review".to_string(), "<pr> Review a change.".to_string(), true),
+      ("notes:today".to_string(), String::new(), false),
+    ];
+    let all = filter_commands(&mut matcher, "", &prompts);
+    assert_eq!(all.len(), COMMANDS.len() + 2);
+    assert_eq!(names(&all[COMMANDS.len()..]), ["notes:review", "notes:today"]);
+    let Match::Command {
+      description, takes_arg, ..
+    } = &filter_commands(&mut matcher, "notes:rev", &prompts)[0]
+    else {
+      panic!("a command")
+    };
+    assert_eq!((description.as_str(), *takes_arg), ("<pr> Review a change.", true));
+  }
+
+  /// A prompt a server wrote out is drawn as what it wrote, the way opening
+  /// the session again draws it; one typed is drawn as typed.
+  #[test]
+  fn a_written_out_prompt_is_drawn_as_the_server_wrote_it() {
+    let typed = prompt_entries("hi".into(), Vec::new(), &[]);
+    assert!(matches!(typed.as_slice(), [Entry::User { text, .. }] if text == "hi"));
+    let written = [Message::user("Review 12."), Message::assistant("On it.")];
+    let drawn = prompt_entries("/notes:review 12".into(), Vec::new(), &written);
+    assert!(
+      matches!(drawn.as_slice(), [Entry::User { text, .. }, Entry::Assistant(said)] if text == "Review 12." && said == "On it."),
+      "{} entries",
+      drawn.len()
+    );
   }
 
   /// A history of one prompt, a tool call answered, and a final answer.

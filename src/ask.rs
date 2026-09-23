@@ -361,6 +361,23 @@ impl Dialog {
     dialog
   }
 
+  /// Start question `index` off with `text` typed on its free-text row and
+  /// taken as its answer, for a form that already knows part of what it asks.
+  #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+  pub fn fill(&mut self, index: usize, text: &str) {
+    let mut draft = Draft::new(text.lines().map(str::to_string).collect());
+    draft.move_cursor(CursorMove::Bottom);
+    draft.move_cursor(CursorMove::End);
+    self.drafts.insert(index, draft);
+    self.answers.insert(index, Answer::Typed(text.to_string()));
+  }
+
+  /// Show question `index` first, rather than the first one.
+  #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+  pub fn open(&mut self, index: usize) {
+    self.go_to(index.min(self.questions.len()));
+  }
+
   /// More than one question, which is what brings the tab strip and the submit
   /// tab with it.
   fn tabbed(&self) -> bool {
