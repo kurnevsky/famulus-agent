@@ -12,6 +12,8 @@ mod images;
 mod markdown;
 mod mcp;
 mod modal;
+#[cfg(feature = "mcp")]
+mod oauth;
 mod session;
 mod tools;
 mod ui;

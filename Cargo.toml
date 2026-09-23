@@ -16,7 +16,9 @@ default = ["languages", "mcp"]
 # Tools from MCP servers, over stdio or streamable HTTP. Rig speaks the
 # protocol through `rmcp`; this only finds the servers and hands their tools to
 # the agent, so `--no-default-features` leaves the four built-in tools alone.
-mcp = ["dep:rmcp", "dep:http", "rig-agent/rmcp"]
+# A server that wants a login gets one over OAuth, and the tokens it hands
+# back are kept in the system keyring through `oo7`.
+mcp = ["dep:rmcp", "dep:http", "rig-agent/rmcp", "rmcp/auth", "dep:oo7", "dep:async-trait", "dep:reqwest", "dep:url"]
 languages = [
   "lang-bash",
   "lang-c",
@@ -108,6 +110,8 @@ lang-zig = ["syntax", "dep:tree-sitter-zig"]
 
 [dependencies]
 anyhow = "1.0.104"
+# The shape rmcp gives the store an OAuth login is kept in.
+async-trait = { version = "0.1.92", optional = true }
 base64 = "0.23.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
@@ -118,7 +122,13 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 markdown = "1"
 mdstitch = "0.1"
 nucleo-matcher = "0.3.1"
+# The system keyring — Secret Service, or the portal inside a sandbox — which
+# is where an MCP server's OAuth tokens are kept between sessions.
+oo7 = { version = "0.6", optional = true }
 ratatui = "0.30"
+# The client rmcp calls a server with once it is signed in to, and the address
+# the browser comes back to; both already in the tree through rmcp.
+reqwest = { version = "0.13", default-features = false, optional = true }
 ratatui-textarea = "0.9"
 rig-agent = "0.42"
 rig-core = "0.42"
@@ -185,4 +195,5 @@ tree-sitter-yaml = { version = "0.7", optional = true }
 tree-sitter-zig = { version = "1.1", optional = true }
 unicode-normalization = "0.1.25"
 unicode-width = "0.2"
+url = { version = "2", optional = true }
 uuid = { version = "1.26.1", features = ["v4"] }

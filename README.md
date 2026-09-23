@@ -298,7 +298,7 @@ env.TOKEN = "…"
 
 [docs]
 url = "https://example.com/mcp"
-headers-command.Authorization = "echo Bearer $(pass show work/mcp)"
+token-command = "pass show work/mcp"
 timeout = 60
 except = ["delete_page"]
 ```
@@ -312,20 +312,24 @@ A server is a `command` to run, spoken to over its own stdin and stdout, or a
 | `env` | Added to the environment that command inherits |
 | `env-command` | The same, each value the output of a line of shell rather than written out |
 | `url` | Endpoint of a server that speaks streamable HTTP |
-| `headers` | Sent with every request to it, which is where a token goes |
+| `token` | The bearer token to call it with, sent as `Authorization: Bearer …`; no login is started |
+| `token-command` | The same, as the output of a line of shell |
+| `headers` | Sent with every request to it |
 | `headers-command` | The same, each value the output of a line of shell rather than written out |
 | `timeout` | Seconds one of this server's tools may take, `0` to wait forever (default 300) |
 | `tools` | Take only these of the tools it offers |
 | `except` | Take everything but these |
+| `oauth` | How to sign in, for a server that cannot work that out itself — see below |
 
 `tools` and `except` are the same idea as `--tools` and `--no-tools`, for one
 server: a server with thirty tools can be cut to the two worth having without
 naming every tool of every other server.
 
-A token is better kept out of the file it is used from, so `env-command` and
-`headers-command` take the line of shell that produces the value instead of the
-value — `pass show …`, `gh auth token`, `op read …`, `echo Bearer $(…)` to put
-a word in front of it. Each runs once, when its server starts, and what it
+A token is better kept out of the file it is used from, so `env-command`,
+`token-command` and `headers-command` take the line of shell that produces the
+value instead of the value — `pass show …`, `gh auth token`, `op read …`. A
+token is only the token: rmcp puts the `Bearer` in front, and one written with
+it already is taken without. Each runs once, when its server starts, and what it
 printed is the value, without the newline it was printed with. A name given
 both a value and a command is refused rather than resolved by some rule about
 which wins.
@@ -361,6 +365,48 @@ note rather than a failure — the session still has its own five tools, which
 beats refusing to start. A tool named like one of those five is
 left alone: the model is told about `read`, `write`, `edit`, `bash` and `ask`
 in the system prompt, and cannot say which of two it meant.
+
+### Signing in
+
+An endpoint that wants a login answers with a 401, and fa signs in to it with
+[OAuth](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization),
+the way the protocol lays out: it finds where the server signs people in,
+registers with it, and opens your browser there with `xdg-open` (`open` on
+macOS). The address is also printed, for a machine where no browser opens, and
+an opener that fails says so with the reason it gave, while the wait goes on
+for the address to be opened by hand. The browser is sent back to a port on
+`127.0.0.1`, and the session goes on starting once it has been. You have five
+minutes; this all happens before the terminal is taken over, so it is plain
+lines on stderr.
+
+What the sign-in brings back is kept in the system keyring through
+[oo7](https://github.com/linux-credentials/oo7) — the Secret Service, or the
+secret portal inside a Flatpak — under the server's URL, and refreshed when it
+runs out, so the next session starts signed in. A login that can no longer be
+refreshed is dropped and asked for again. With no keyring to be had, the login
+lasts the session and the transcript says so.
+
+A server given a `token` is called with that and nothing else.
+One that does not register clients itself is given the client registered with
+it by hand:
+
+```toml
+[github]
+url = "https://api.githubcopilot.com/mcp/"
+oauth.client-id = "Iv1.0123456789abcdef"
+oauth.client-secret-command = "pass show github/fa-oauth"
+oauth.port = 8765
+```
+
+| Key | Meaning |
+|-----|---------|
+| `oauth.client-id` | A client registered with the server by hand, instead of registering one |
+| `oauth.client-secret` | Its secret, if it has one |
+| `oauth.client-secret-command` | The same, as the output of a line of shell |
+| `oauth.scopes` | What to ask for, instead of what the server says it offers |
+| `oauth.port` | The port the browser comes back to, for a client registered with one (default: any free port) |
+
+The address the browser is sent back to is `http://127.0.0.1:<port>/callback`.
 
 ### A server asking you
 
@@ -924,6 +970,9 @@ comes back to say otherwise.
   for rather than holding, and handing each server's tools to the agent. Rig
   speaks the protocol; this only decides who to speak to. Holding the result is what keeps the servers running, so it
   lives as long as the program does.
+- `src/oauth.rs` – signing in to an MCP endpoint that wants it: the browser
+  sent to the server and the code taken back on a loopback port, and the
+  keyring the tokens are kept in between sessions. rmcp does the protocol.
 - `src/ui.rs` – ratatui app: transcript, input, footer. The transcript is
   wrapped to the width here rather than by the `Paragraph` that draws it, so a
   row on screen is a line of a list: what the mouse points at can be named,

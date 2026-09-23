@@ -30,6 +30,7 @@ use crate::modal::{Component, Host};
 
 /// The client side of one server's connection: what it says it can do, and
 /// what it does when asked.
+#[derive(Clone)]
 pub struct Client {
   /// The server's name in the file, which is who the form says is asking.
   pub server: String,

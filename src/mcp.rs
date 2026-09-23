@@ -14,8 +14,12 @@
 //! directory, nothing beside the project.
 //!
 //! A value that should not sit in a file is written as the line of shell that
-//! produces it, under `env-command` or `headers-command` rather than `env` or
-//! `headers`: run once, when the server starts, with its output for the value.
+//! produces it, under `env-command`, `token-command` or `headers-command`
+//! rather than `env`, `token` or `headers`: run once, when the server starts,
+//! with its output for the value.
+//!
+//! An endpoint that wants a login and is given no token gets one through
+//! `oauth`, in the browser, and keeps it in the system keyring.
 //!
 //! ```toml
 //! [fetch]
@@ -23,7 +27,7 @@
 //!
 //! [docs]
 //! url = "https://example.com/mcp"
-//! headers-command.Authorization = "echo Bearer $(pass show work/mcp)"
+//! token-command = "pass show work/mcp"
 //! timeout = 60
 //! ```
 
@@ -75,11 +79,19 @@ pub struct Server {
   /// The endpoint of a server that speaks streamable HTTP.
   #[serde(default)]
   pub url: Option<String>,
-  /// Sent with every request to that endpoint, which is where a token goes.
+  /// The bearer token that endpoint is called with, which rmcp sends as the
+  /// `Authorization` of every request. A server given one is not signed in
+  /// to any other way.
+  #[serde(default)]
+  pub token: Option<String>,
+  /// The same, for a token that should not sit in a file: a line of shell
+  /// whose output is the token — `pass`, `gh auth token`, `op read`.
+  #[serde(default, rename = "token-command")]
+  pub token_command: Option<String>,
+  /// Sent with every request to that endpoint.
   #[serde(default)]
   pub headers: BTreeMap<String, String>,
-  /// The same, for a token that should not sit in a file: a line of shell
-  /// whose output is the header's value — `pass`, `gh auth token`, `op read`.
+  /// The same, each value the output of a line of shell.
   #[serde(default, rename = "headers-command")]
   pub headers_command: BTreeMap<String, String>,
   /// Seconds one of this server's tools may take before the call comes back
@@ -94,6 +106,10 @@ pub struct Server {
   /// Take everything but these. Named in both lists, a tool is refused.
   #[serde(default)]
   pub except: Vec<String>,
+  /// How to sign in to an endpoint that wants a login, where the server
+  /// cannot work that out for itself.
+  #[serde(default)]
+  pub oauth: crate::oauth::Settings,
 }
 
 /// Where servers are declared, in the order the files are read: the system's
@@ -219,17 +235,10 @@ pub async fn connect(config: Config, host: &crate::modal::Host) -> Servers {
       server: name.clone(),
       host: host.clone(),
     };
-    let started = tokio::time::timeout(START_TIMEOUT, start(&server, client));
-    let running = match started.await {
-      Ok(Ok(running)) => running,
-      Ok(Err(err)) => {
+    let running = match start(&name, &server, client, &mut servers.notes).await {
+      Ok(running) => running,
+      Err(err) => {
         servers.notes.push(format!("MCP {name}: {err:#}"));
-        continue;
-      }
-      Err(_) => {
-        servers
-          .notes
-          .push(format!("MCP {name}: no answer in {}s", START_TIMEOUT.as_secs()));
         continue;
       }
     };
@@ -287,38 +296,114 @@ pub async fn connect(config: Config, host: &crate::modal::Host) -> Servers {
   servers
 }
 
-/// Reach one server, however it is reached.
+/// Reach one server, however it is reached. What it is worth saying about
+/// the way there goes in `notes`.
 #[cfg(feature = "mcp")]
-async fn start(server: &Server, client: crate::elicit::Client) -> anyhow::Result<Service> {
+async fn start(
+  name: &str,
+  server: &Server,
+  client: crate::elicit::Client,
+  notes: &mut Vec<String>,
+) -> anyhow::Result<Service> {
   use anyhow::{Context, bail};
   use rmcp::ServiceExt;
 
   match (&server.command, &server.url) {
     (Some(_), Some(_)) => bail!("declared as both a command and a URL"),
     (Some(command), None) => {
-      let env = values(&server.env, &server.env_command, "env").await?;
-      // A line of shell, run the way the `bash` tool runs one, so a server is
-      // started by the command that starts it in a terminal — quoting, `~`,
-      // `$HOME` and all.
-      let mut process = tokio::process::Command::new("bash");
-      process.arg("-c").arg(command).envs(&env);
-      // A server's own chatter is not this program's to print: the terminal
-      // belongs to the transcript.
-      process.stderr(std::process::Stdio::null());
-      let transport =
-        rmcp::transport::TokioChildProcess::new(process).with_context(|| format!("could not run {command}"))?;
-      Ok(client.serve(transport).await?)
+      within(async {
+        let env = values(&server.env, &server.env_command, "env").await?;
+        // A line of shell, run the way the `bash` tool runs one, so a server is
+        // started by the command that starts it in a terminal — quoting, `~`,
+        // `$HOME` and all.
+        let mut process = tokio::process::Command::new("bash");
+        process.arg("-c").arg(command).envs(&env);
+        // A server's own chatter is not this program's to print: the terminal
+        // belongs to the transcript.
+        process.stderr(std::process::Stdio::null());
+        let transport =
+          rmcp::transport::TokioChildProcess::new(process).with_context(|| format!("could not run {command}"))?;
+        Ok(client.serve(transport).await?)
+      })
+      .await
     }
-    (None, Some(url)) => {
-      let sent = values(&server.headers, &server.headers_command, "header").await?;
-      let mut config =
-        rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(url.as_str());
-      config.custom_headers = headers(&sent)?;
-      let transport = rmcp::transport::StreamableHttpClientTransport::from_config(config);
-      Ok(client.serve(transport).await?)
-    }
+    (None, Some(url)) => endpoint(name, server, url, client, notes).await,
     (None, None) => bail!("declared with neither a command to run nor a URL to call"),
   }
+}
+
+/// Reach a server that speaks streamable HTTP: as the file says to, and
+/// signed in, if that is what it turns out to want.
+#[cfg(feature = "mcp")]
+async fn endpoint(
+  name: &str,
+  server: &Server,
+  url: &str,
+  client: crate::elicit::Client,
+  notes: &mut Vec<String>,
+) -> anyhow::Result<Service> {
+  use rmcp::ServiceExt;
+  use rmcp::transport::StreamableHttpClientTransport;
+  use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+
+  use crate::oauth;
+
+  let config = within(async {
+    let sent = values(&server.headers, &server.headers_command, "header").await?;
+    let mut config = StreamableHttpClientTransportConfig::with_uri(url);
+    config.custom_headers = headers(&sent)?;
+    config.auth_header = one(server.token.as_ref(), server.token_command.as_ref(), "token")
+      .await?
+      .map(|token| bearer(&token).to_string());
+    Ok(config)
+  })
+  .await?;
+  // A token in the file is the one this server is called with: what it
+  // makes of it is its own business, and no login is started over it.
+  if config.auth_header.is_some() {
+    return within(async { Ok(client.serve(StreamableHttpClientTransport::from_config(config)).await?) }).await;
+  }
+
+  let store = oauth::Store::new(url);
+  let signed_in = async |manager| {
+    let transport = StreamableHttpClientTransport::with_client(oauth::client(manager), config.clone());
+    client.clone().serve(transport).await
+  };
+  // Signed in before, and it still holds; or never asked to sign in at all.
+  let first = within(async {
+    Ok(match oauth::resume(url, &server.oauth, &store).await? {
+      Some(manager) => signed_in(manager).await,
+      None => {
+        let transport = StreamableHttpClientTransport::from_config(config.clone());
+        client.clone().serve(transport).await
+      }
+    })
+  })
+  .await?;
+  let running = match first {
+    Ok(running) => Ok(running),
+    Err(err) if oauth::wants_login(&err) => {
+      // A login that no longer holds is not one to be tried again next time.
+      let _ = rmcp::transport::auth::CredentialStore::clear(&store).await;
+      let manager = oauth::login(name, url, &server.oauth, &store).await?;
+      within(async { Ok(signed_in(manager).await?) }).await
+    }
+    Err(err) => Err(err.into()),
+  };
+  if let Some(trouble) = store.trouble() {
+    notes.push(format!("MCP {name}: {trouble}"));
+  }
+  running
+}
+
+/// What `work` comes to, if it comes to anything in the time a server has to
+/// come up. A server that is slower than that is left out, rather than
+/// holding up the session.
+#[cfg(feature = "mcp")]
+async fn within<T>(work: impl Future<Output = anyhow::Result<T>>) -> anyhow::Result<T> {
+  tokio::time::timeout(START_TIMEOUT, work)
+    .await
+    .map_err(|_| anyhow::anyhow!("no answer in {}s", START_TIMEOUT.as_secs()))?
 }
 
 /// One table of values, with the ones written as a command run for.
@@ -349,6 +434,34 @@ async fn values(
   let mut values = literal.clone();
   values.extend(futures::future::try_join_all(run).await?);
   Ok(values)
+}
+
+/// One value, written out or as the line of shell that prints it.
+#[cfg(feature = "mcp")]
+pub async fn one(literal: Option<&String>, command: Option<&String>, what: &str) -> anyhow::Result<Option<String>> {
+  use anyhow::Context;
+
+  match (literal, command) {
+    (Some(_), Some(_)) => anyhow::bail!("{what} is given both a value and a command"),
+    (Some(value), None) => Ok(Some(value.clone())),
+    (None, Some(command)) => Ok(Some(
+      crate::config::value(command)
+        .await
+        .with_context(|| format!("{what}-command"))?,
+    )),
+    (None, None) => Ok(None),
+  }
+}
+
+/// The token itself, for one written the way the header it goes in is:
+/// rmcp puts the scheme in front, and a second would be a token no server
+/// takes.
+#[cfg(feature = "mcp")]
+fn bearer(token: &str) -> &str {
+  match token.split_at_checked(7) {
+    Some((scheme, rest)) if scheme.eq_ignore_ascii_case("bearer ") => rest.trim_start(),
+    _ => token,
+  }
 }
 
 #[cfg(feature = "mcp")]
@@ -420,6 +533,7 @@ mod tests {
 
         [docs]
         url = "https://example.com/mcp"
+        token-command = "pass show work/token"
         headers.Authorization = "Bearer k"
         headers-command.X-Api-Key = "pass show work/mcp"
         timeout = 60
@@ -433,6 +547,7 @@ mod tests {
     assert_eq!(files.timeout, None, "a server says nothing about time by default");
     let docs = &read["docs"];
     assert_eq!(docs.url.as_deref(), Some("https://example.com/mcp"));
+    assert_eq!(docs.token_command.as_deref(), Some("pass show work/token"));
     assert_eq!(docs.headers["Authorization"], "Bearer k");
     assert_eq!(docs.headers_command["X-Api-Key"], "pass show work/mcp");
     assert_eq!(docs.timeout, Some(60));
@@ -504,6 +619,24 @@ mod tests {
     .expect_err("declared twice")
     .to_string();
     assert!(err.contains("header Authorization"), "{err}");
+
+    // A token is one or the other too, and is the token, whatever scheme it
+    // was written with.
+    let token = |value: &str| value.to_string();
+    let read = one(Some(&token("k")), None, "token").await.expect("written");
+    assert_eq!(read.as_deref(), Some("k"));
+    let read = one(None, Some(&token("echo k")), "token").await.expect("printed");
+    assert_eq!(read.as_deref(), Some("k"));
+    let err = one(Some(&token("k")), Some(&token("echo k")), "token")
+      .await
+      .expect_err("twice")
+      .to_string();
+    assert!(err.contains("token is given both"), "{err}");
+    assert_eq!(one(None, None, "token").await.expect("none"), None);
+    assert_eq!(bearer("Bearer k"), "k");
+    assert_eq!(bearer("bearer  k"), "k");
+    assert_eq!(bearer("k"), "k");
+    assert_eq!(bearer("Bearerk"), "Bearerk");
 
     // And a header this file carries is one nothing prints while looking at
     // the request it went out on.
