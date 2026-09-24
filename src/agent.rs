@@ -1116,7 +1116,6 @@ fn default_system_prompt(cwd: &Path, tools: &crate::tools::Rules) -> String {
     "You are an expert coding assistant operating inside a minimal terminal coding agent. \
          You help users by reading files, executing commands, editing code, and writing new files.\n\n\
          <rules>\n\
-         - Use bash for file operations like ls, rg, find\n\
          - Use read to examine files instead of cat or sed.\n\
          - Use edit for precise changes (edits[].oldText must match exactly)\n\
          - When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls\n\
@@ -1125,7 +1124,6 @@ fn default_system_prompt(cwd: &Path, tools: &crate::tools::Rules) -> String {
          - Use write only for new files or complete rewrites.\n\
          - Use ask whenever the request is underspecified and you cannot proceed without a concrete decision; do not ask what the code itself can answer\n\
          - Be concise in your responses\n\
-         - Show file paths clearly when working with files\n\
          </rules>\n",
     tools,
   );
@@ -1784,7 +1782,7 @@ mod tests {
       deny: deny.iter().map(|s| s.to_string()).collect(),
     };
     let all = default_system_prompt(Path::new("/work"), &rules(&[], &[]));
-    for rule in ["Use read", "Use bash", "Use edit", "Use write", "Use ask"] {
+    for rule in ["Use read", "Use edit", "Use write", "Use ask"] {
       assert!(all.contains(rule), "{rule:?} is there by default");
     }
 
@@ -1792,7 +1790,6 @@ mod tests {
     // being refused, instead of using what it does have.
     let reading = default_system_prompt(Path::new("/work"), &rules(&["read"], &[]));
     for gone in [
-      "Use bash for",
       "Use edit for",
       "Use write only",
       // Including where the rules speak of a tool's arguments rather than of
@@ -1813,9 +1810,9 @@ mod tests {
     assert_eq!(default_system_prompt(Path::new("/work"), &rules(&five, &[])), all);
     assert_eq!(default_system_prompt(Path::new("/work"), &rules(&[], &["fetch"])), all);
     // And refusing one is the same as allowing the rest.
-    let no_bash = default_system_prompt(Path::new("/work"), &rules(&[], &["bash"]));
-    assert!(!no_bash.contains("Use bash"), "{no_bash}");
-    assert!(no_bash.contains("Use read"), "{no_bash}");
+    let no_edit = default_system_prompt(Path::new("/work"), &rules(&[], &["edit"]));
+    assert!(!no_edit.contains("edits[]"), "{no_edit}");
+    assert!(no_edit.contains("Use read"), "{no_edit}");
   }
 
   #[test]
