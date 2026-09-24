@@ -127,8 +127,8 @@ it cannot take, is an error naming the file and the line, and fa does not start
 — unlike a broken `mcp.toml`, which is only a note, since a session on the
 wrong model or endpoint is worse than none.
 
-The agent works in the current directory. If `AGENTS.md` (or `CLAUDE.md`)
-exists there, it is appended to the system prompt.
+The agent works in the current directory. If `AGENTS.md` exists there, it is
+appended to the system prompt.
 
 ## Which model
 

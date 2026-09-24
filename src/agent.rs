@@ -1130,11 +1130,8 @@ fn default_system_prompt(cwd: &Path, tools: &crate::tools::Rules) -> String {
     tools,
   );
 
-  let context = ["AGENTS.md", "CLAUDE.md"].iter().find_map(|name| {
-    let path = cwd.join(name);
-    std::fs::read_to_string(&path).ok().map(|content| (path, content))
-  });
-  if let Some((path, content)) = context {
+  let path = cwd.join("AGENTS.md");
+  if let Ok(content) = std::fs::read_to_string(&path) {
     prompt.push_str(&format!(
       "\n<project_context>\nProject-specific instructions and guidelines:\n\n\
        <project_instructions path=\"{}\">\n{content}\n</project_instructions>\n\
