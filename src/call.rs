@@ -121,7 +121,7 @@ fn said(note: &ProgressNotificationParam) -> String {
   let message = note
     .message
     .as_deref()
-    .map(|m| m.split_whitespace().collect::<Vec<_>>().join(" "))
+    .map(crate::resources::one_line)
     .filter(|m| !m.is_empty());
   let amount = match note.total {
     Some(total) if total > 0.0 => {

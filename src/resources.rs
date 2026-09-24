@@ -222,43 +222,50 @@ fn listing(held: &BTreeMap<String, ServerResources>, named: Option<&str>) -> Res
           out.push("  as listed before:".to_string());
         }
         out.extend(listed.resources.iter().map(|r| {
-          line(
+          let named = line(
             &r.uri,
             r.title.as_deref().unwrap_or(&r.name),
             r.mime_type.as_deref(),
             r.description.as_deref(),
-          )
+          );
+          format!("  {named}")
         }))
       }
     }
     if !listed.templates.is_empty() {
       out.push("  templates (fill in the {…} parts to make a URI):".to_string());
       out.extend(listed.templates.iter().map(|t| {
-        line(
+        let named = line(
           &t.uri_template,
           t.title.as_deref().unwrap_or(&t.name),
           t.mime_type.as_deref(),
           t.description.as_deref(),
-        )
+        );
+        format!("  {named}")
       }));
     }
   }
   Ok(out.join("\n"))
 }
 
-/// One resource or template as a line of the listing.
-fn line(uri: &str, name: &str, mime: Option<&str>, description: Option<&str>) -> String {
-  let mut line = format!("  {uri} — {name}");
+/// One resource or template in a line: the listing's, and a link to one in
+/// what a server writes out.
+pub fn line(uri: &str, name: &str, mime: Option<&str>, description: Option<&str>) -> String {
+  let mut line = format!("{uri} — {name}");
   if let Some(mime) = mime {
     line.push_str(&format!(" ({mime})"));
   }
-  // One line, however the server wrote it.
-  let description = description.map(|d| d.split_whitespace().collect::<Vec<_>>().join(" "));
-  if let Some(description) = description.filter(|d| !d.is_empty()) {
+  if let Some(description) = description.map(one_line).filter(|d| !d.is_empty()) {
     line.push_str(": ");
     line.push_str(&description);
   }
   line
+}
+
+/// `text` on one line, however the server wrote it: its words, a space
+/// between each.
+pub fn one_line(text: &str) -> String {
+  text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 // ---------------------------------------------------------------- read
@@ -415,9 +422,9 @@ mod tests {
   fn a_listing_is_a_line_a_resource() {
     assert_eq!(
       line("file:///a.md", "A", Some("text/markdown"), Some(" The\n  first\tone ")),
-      "  file:///a.md — A (text/markdown): The first one"
+      "file:///a.md — A (text/markdown): The first one"
     );
-    assert_eq!(line("x://y", "Y", None, Some("   ")), "  x://y — Y");
+    assert_eq!(line("x://y", "Y", None, Some("   ")), "x://y — Y");
   }
 
   #[test]

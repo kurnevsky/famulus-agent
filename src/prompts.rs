@@ -17,14 +17,16 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use rig_core::completion::Message;
 use rig_core::message::{AssistantContent, UserContent};
-use rmcp::model::{ContentBlock, GetPromptRequestParams, Prompt, PromptMessage, ResourceContents, Role};
+use rmcp::model::{
+  ContentBlock, GetPromptRequestParams, Prompt, PromptArgument, PromptMessage, ResourceContents, Role,
+};
 use rmcp::service::ServerSink;
 use serde_json::{Map, Value};
 use std::time::Duration;
 
 use crate::elicit::Form;
 use crate::modal::Host;
-use crate::resources::bounded;
+use crate::resources::{bounded, line, one_line};
 
 /// Ask a server for its prompts, every page of them, given up on after
 /// `timeout`.
@@ -46,10 +48,8 @@ pub fn described(prompt: &Prompt) -> String {
         false => format!("[{}]", argument.name),
       });
   let about = prompt.description.as_deref().or(prompt.title.as_deref());
-  // One line, however the server wrote it.
-  let about = about.map(|d| d.split_whitespace().collect::<Vec<_>>().join(" "));
   arguments
-    .chain(about.filter(|d| !d.is_empty()))
+    .chain(about.map(one_line).filter(|d| !d.is_empty()))
     .collect::<Vec<_>>()
     .join(" ")
 }
@@ -112,7 +112,7 @@ impl Asking {
 /// word each, in order, and the last one given the rest of the line. A word
 /// in quotes may have spaces in it, and so may the rest, which is taken as
 /// it is — quotes kept, unless they are around the whole of it.
-fn arguments(declared: &[rmcp::model::PromptArgument], rest: &str) -> Result<Map<String, Value>, String> {
+fn arguments(declared: &[PromptArgument], rest: &str) -> Result<Map<String, Value>, String> {
   if declared.is_empty() && !rest.trim().is_empty() {
     return Err("takes no arguments".to_string());
   }
@@ -180,20 +180,23 @@ fn word(text: &str) -> (&str, usize, bool) {
 }
 
 /// The argument being typed at the end of `before` — what was typed after
-/// a prompt's name, up to the cursor — of the `count` the prompt takes.
+/// a prompt's name, up to the cursor — of the ones the prompt `declared`.
 pub struct Typing {
-  /// Which of them it is.
-  pub index: usize,
+  /// Its name, which is what the server is asked to complete.
+  pub name: String,
   /// Where it is in `before`: what a value taken for it goes in place of.
   pub range: (usize, usize),
   pub value: String,
   /// Those before it, as they were typed.
-  pub earlier: Vec<String>,
+  pub earlier: Vec<(String, String)>,
+  /// Whether it is the last, which takes the rest of the line.
+  pub last: bool,
 }
 
 /// Which argument `before` ends in, when it ends in one: the last one typed
 /// while it is still being typed, and the next when a space has ended it.
-pub fn typing(count: usize, before: &str) -> Option<Typing> {
+pub fn typing(declared: &[PromptArgument], before: &str) -> Option<Typing> {
+  let count = declared.len();
   // Right after the name is still the name.
   if count == 0 || !before.starts_with(char::is_whitespace) {
     return None;
@@ -209,10 +212,13 @@ pub fn typing(count: usize, before: &str) -> Option<Typing> {
     false => (typed[index].range, typed[index].value),
   };
   Some(Typing {
-    index,
+    name: declared[index].name.clone(),
     range,
     value: value.to_string(),
-    earlier: typed[..index].iter().map(|t| t.value.to_string()).collect(),
+    earlier: (declared.iter().zip(&typed[..index]))
+      .map(|(argument, t)| (argument.name.clone(), t.value.to_string()))
+      .collect(),
+    last: index + 1 == count,
   })
 }
 
@@ -318,16 +324,13 @@ fn said(block: ContentBlock, server: &str) -> String {
       _ => format!("[A resource from {server} of a kind fa cannot read]"),
     },
     ContentBlock::ResourceLink(link) => {
-      let mut line = format!("[Resource {} — {}", reference(server, &link.uri), link.name);
-      if let Some(mime) = &link.mime_type {
-        line.push_str(&format!(" ({mime})"));
-      }
-      line.push(']');
-      if let Some(description) = link.description.as_deref().filter(|d| !d.trim().is_empty()) {
-        line.push_str(": ");
-        line.push_str(&description.split_whitespace().collect::<Vec<_>>().join(" "));
-      }
-      line
+      let named = line(
+        &reference(server, &link.uri),
+        &link.name,
+        link.mime_type.as_deref(),
+        link.description.as_deref(),
+      );
+      format!("[Resource {named}]")
     }
     // A kind of block newer than this client.
     _ => format!("[Something from {server} fa cannot read]"),
@@ -337,7 +340,6 @@ fn said(block: ContentBlock, server: &str) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use rmcp::model::PromptArgument;
 
   fn declared(names: &[(&str, bool)]) -> Vec<PromptArgument> {
     names
@@ -386,30 +388,37 @@ mod tests {
     assert!(arguments(&none, "stray").is_err());
   }
 
-  /// Which argument the line ends in, where, what it says, and the ones
-  /// before it.
-  type At = (usize, (usize, usize), String, Vec<String>);
+  /// Which argument the line ends in, where, what it says, the ones before
+  /// it, and whether it is the last — of the first `count` of `a`, `b`, `c`.
+  type At = (String, (usize, usize), String, Vec<(String, String)>, bool);
 
   fn at(count: usize, before: &str) -> Option<At> {
-    typing(count, before).map(|t| (t.index, t.range, t.value, t.earlier))
+    let declared = declared(&[("a", true), ("b", false), ("c", false)][..count]);
+    typing(&declared, before).map(|t| (t.name, t.range, t.value, t.earlier, t.last))
   }
 
   #[test]
   fn the_argument_being_typed_is_the_one_the_line_ends_in() {
-    let strings = |s: &[&str]| s.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let a = |value: &str| vec![("a".to_string(), value.to_string())];
     // Still the name.
     assert_eq!(at(2, ""), None);
     assert_eq!(at(0, " x"), None);
-    assert_eq!(at(2, " "), Some((0, (1, 1), String::new(), vec![])));
-    assert_eq!(at(2, " ab"), Some((0, (1, 3), "ab".into(), vec![])));
+    assert_eq!(at(2, " "), Some(("a".into(), (1, 1), String::new(), vec![], false)));
+    assert_eq!(at(2, " ab"), Some(("a".into(), (1, 3), "ab".into(), vec![], false)));
     // A space ends one and starts the next.
-    assert_eq!(at(2, " ab "), Some((1, (4, 4), String::new(), strings(&["ab"]))));
-    assert_eq!(at(2, " ab c"), Some((1, (4, 5), "c".into(), strings(&["ab"]))));
+    assert_eq!(at(2, " ab "), Some(("b".into(), (4, 4), String::new(), a("ab"), true)));
+    assert_eq!(at(2, " ab c"), Some(("b".into(), (4, 5), "c".into(), a("ab"), true)));
     // Unless it is in a quote still open.
-    assert_eq!(at(2, " \"a b"), Some((0, (1, 5), "a b".into(), vec![])));
-    assert_eq!(at(3, " \"a b\" c"), Some((1, (7, 8), "c".into(), strings(&["a b"]))));
+    assert_eq!(at(2, " \"a b"), Some(("a".into(), (1, 5), "a b".into(), vec![], false)));
+    assert_eq!(
+      at(3, " \"a b\" c"),
+      Some(("b".into(), (7, 8), "c".into(), a("a b"), false))
+    );
     // The last takes the rest, spaces and all.
-    assert_eq!(at(2, " ab c d"), Some((1, (4, 7), "c d".into(), strings(&["ab"]))));
+    assert_eq!(
+      at(2, " ab c d"),
+      Some(("b".into(), (4, 7), "c d".into(), a("ab"), true))
+    );
   }
 
   #[test]

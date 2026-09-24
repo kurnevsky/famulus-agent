@@ -232,8 +232,18 @@ struct Offer {
   /// What it has to read, for a server that said it has resources as it came
   /// up — whether or not it could list them then.
   resources: Option<crate::resources::ServerResources>,
-  /// What it has written out for the user to send, as it last said.
-  prompts: Vec<rmcp::model::Prompt>,
+  /// What it has written out for the user to send, as it last said —
+  /// `None` until it has said.
+  prompts: Option<Vec<rmcp::model::Prompt>>,
+}
+
+#[cfg(feature = "mcp")]
+impl Offer {
+  /// What `named` — `server:rest` — names on this server: the rest, when
+  /// the server is this one.
+  fn under<'a>(&self, named: &'a str) -> Option<&'a str> {
+    named.strip_prefix(self.server.as_str())?.strip_prefix(':')
+  }
 }
 
 /// How long a call to a server may take, from the seconds its table says:
@@ -340,7 +350,7 @@ impl Catalog {
       .offers()
       .iter()
       .flat_map(|offer| {
-        offer.prompts.iter().map(|prompt| {
+        offer.prompts.iter().flatten().map(|prompt| {
           let takes = prompt.arguments.as_ref().is_some_and(|a| !a.is_empty());
           (
             format!("{}:{}", offer.server, prompt.name),
@@ -379,9 +389,8 @@ impl Catalog {
   #[cfg(feature = "mcp")]
   fn prompt(&self, named: &str) -> Option<crate::prompts::Asking> {
     self.offers().iter().find_map(|offer| {
-      let (server, name) = named.split_at_checked(offer.server.len())?;
-      let name = name.strip_prefix(':').filter(|_| server == offer.server)?;
-      let prompt = offer.prompts.iter().find(|prompt| prompt.name == name)?;
+      let name = offer.under(named)?;
+      let prompt = offer.prompts.iter().flatten().find(|prompt| prompt.name == name)?;
       Some(crate::prompts::Asking {
         server: offer.server.clone(),
         prompt: prompt.clone(),
@@ -405,24 +414,17 @@ impl Catalog {
         return None;
       }
       let declared = asking.prompt.arguments.as_deref().unwrap_or_default();
-      let typing = crate::prompts::typing(declared.len(), &text[start..cursor])?;
-      let context = declared
-        .iter()
-        .map(|argument| argument.name.clone())
-        .zip(typing.earlier)
-        .collect();
+      let typing = crate::prompts::typing(declared, &text[start..cursor])?;
       Some(Completion {
         asking: Completing {
           server: asking.server,
           of: Of::Prompt(asking.prompt.name),
-          argument: declared[typing.index].name.clone(),
+          argument: typing.name,
           value: typing.value,
-          context,
+          context: typing.earlier,
         },
         range: (start + typing.range.0, start + typing.range.1),
-        shape: Shape::Argument {
-          last: typing.index + 1 == declared.len(),
-        },
+        shape: Shape::Argument { last: typing.last },
       })
     }
     #[cfg(not(feature = "mcp"))]
@@ -438,7 +440,7 @@ impl Catalog {
   pub fn template_completion(&self, range: (usize, usize), typed: &str) -> Option<Completion> {
     #[cfg(feature = "mcp")]
     return self.offers().iter().find_map(|offer| {
-      let uri = typed.strip_prefix(offer.server.as_str())?.strip_prefix(':')?;
+      let uri = offer.under(typed)?;
       if !completes(&offer.peer) {
         return None;
       }
@@ -474,9 +476,9 @@ impl Catalog {
   pub fn template_opening(&self, named: &str) -> Option<String> {
     #[cfg(feature = "mcp")]
     return self.offers().iter().find_map(|offer| {
-      let template = named.strip_prefix(offer.server.as_str())?.strip_prefix(':')?;
-      let listed = offer.resources.as_ref()?.templates.iter();
-      if !completes(&offer.peer) || !listed.into_iter().any(|t| t.uri_template == template) {
+      let template = offer.under(named)?;
+      let listed = &offer.resources.as_ref()?.templates;
+      if !completes(&offer.peer) || !listed.iter().any(|t| t.uri_template == template) {
         return None;
       }
       let opening = &template[..template.find('{')?];
@@ -620,7 +622,7 @@ impl Catalog {
             timeout,
             progress,
             resources: None,
-            prompts: Vec::new(),
+            prompts: None,
           });
           None
         }
@@ -634,15 +636,13 @@ impl Catalog {
   }
 
   /// Put the prompts `server` offers in place of the ones it had, and the
-  /// names of those it had.
+  /// names of those it had — `None` the first time it says.
   #[cfg(feature = "mcp")]
-  fn shelve(&self, server: &str, prompts: Vec<rmcp::model::Prompt>) -> Vec<String> {
+  fn shelve(&self, server: &str, prompts: Vec<rmcp::model::Prompt>) -> Option<Vec<String>> {
     let mut offers = self.offers();
-    let Some(offer) = offers.iter_mut().find(|offer| offer.server == server) else {
-      return Vec::new();
-    };
-    let before = std::mem::replace(&mut offer.prompts, prompts);
-    before.into_iter().map(|prompt| prompt.name).collect()
+    let offer = offers.iter_mut().find(|offer| offer.server == server)?;
+    let before = offer.prompts.replace(prompts)?;
+    Some(before.into_iter().map(|prompt| prompt.name).collect())
   }
 
   /// Put what `server` has to read in place of what it had. A list that
@@ -730,12 +730,11 @@ pub struct Suggestions {
 }
 
 /// Asking a server what a value could be.
-pub type Suggesting = std::pin::Pin<Box<dyn Future<Output = Result<Suggestions, String>> + Send>>;
+pub type Suggesting = futures::future::BoxFuture<'static, Result<Suggestions, String>>;
 
 /// What sending an MCP prompt comes to: the messages the server wrote out,
 /// or `None` when the user put away the form that asked for its arguments.
-pub type Expansion =
-  std::pin::Pin<Box<dyn Future<Output = Result<Option<Vec<rig_core::completion::Message>>, String>> + Send>>;
+pub type Expansion = futures::future::BoxFuture<'static, Result<Option<Vec<rig_core::completion::Message>>, String>>;
 
 /// What a server offers, narrowed to what its table asks of it and to the
 /// names nothing else has taken.
@@ -856,7 +855,7 @@ impl Watch {
   /// which came and went — they are commands the user types, and one that
   /// appears without a word is one nobody knows to type.
   pub async fn prompts_changed(&self, peer: &rmcp::service::ServerSink) {
-    if let Some(note) = self.stock_prompts(peer, true).await {
+    if let Some(note) = self.stock_prompts(peer).await {
       self.host.tell(crate::agent::AgentEvent::Mcp(note));
     }
   }
@@ -915,7 +914,7 @@ impl Watch {
   /// Ask a server that said it has prompts what they are, for the `/` popup
   /// to offer, and what to say about it: how many there are the first time,
   /// what changed after, and why it could not say, if it could not.
-  async fn stock_prompts(&self, peer: &rmcp::service::ServerSink, again: bool) -> Option<String> {
+  async fn stock_prompts(&self, peer: &rmcp::service::ServerSink) -> Option<String> {
     if !has_prompts(peer) {
       return None;
     }
@@ -926,11 +925,10 @@ impl Watch {
       Err(err) => return Some(format!("MCP {name}: could not list prompts: {err}")),
     };
     let now: Vec<String> = prompts.iter().map(|prompt| prompt.name.clone()).collect();
-    let before = self.catalog.shelve(name, prompts);
-    match again {
-      false if now.is_empty() => None,
-      false => Some(format!("MCP {name}: {}", counted(now.len(), "prompt"))),
-      true => Some(format!(
+    match self.catalog.shelve(name, prompts) {
+      None if now.is_empty() => None,
+      None => Some(format!("MCP {name}: {}", counted(now.len(), "prompt"))),
+      Some(before) => Some(format!(
         "MCP {name}: now {}{}",
         counted(now.len(), "prompt"),
         changes(&before, &now)
@@ -983,7 +981,7 @@ pub async fn connect(config: Config, host: &crate::modal::Host) -> Servers {
       }
     }
     servers.notes.extend(watch.stock_resources(running.peer()).await);
-    servers.notes.extend(watch.stock_prompts(running.peer(), false).await);
+    servers.notes.extend(watch.stock_prompts(running.peer()).await);
     servers.running.push(running);
   }
   servers
