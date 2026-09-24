@@ -24,8 +24,7 @@ use tokio::io::AsyncReadExt;
 const MAX_LINES: usize = 2000;
 const MAX_BYTES: usize = 50 * 1024;
 
-/// The names the agent's own tools answer to, in the order the system prompt
-/// introduces them.
+/// The names the agent's own tools answer to.
 pub const BUILT_IN: [&str; 5] = [
   ReadTool::NAME,
   BashTool::NAME,

@@ -1115,13 +1115,6 @@ fn default_system_prompt(cwd: &Path, tools: &crate::tools::Rules) -> String {
   let mut prompt = for_tools(
     "You are an expert coding assistant operating inside a minimal terminal coding agent. \
          You help users by reading files, executing commands, editing code, and writing new files.\n\n\
-         <tools>\n\
-         - read: Read file contents\n\
-         - bash: Execute bash commands (ls, grep, find, etc.)\n\
-         - edit: Make precise file edits with exact text replacement, including multiple disjoint edits in one call\n\
-         - write: Create or overwrite files\n\
-         - ask: Ask the user up to 4 structured questions (2-4 options each) when requirements are ambiguous\n\
-         </tools>\n\n\
          <rules>\n\
          - Use bash for file operations like ls, rg, find\n\
          - Use read to examine files instead of cat or sed.\n\
@@ -1794,18 +1787,14 @@ mod tests {
       deny: deny.iter().map(|s| s.to_string()).collect(),
     };
     let all = default_system_prompt(Path::new("/work"), &rules(&[], &[]));
-    for tool in crate::tools::BUILT_IN {
-      assert!(all.contains(&format!("- {tool}:")), "{tool} is introduced by default");
+    for rule in ["Use read", "Use bash", "Use edit", "Use write", "Use ask"] {
+      assert!(all.contains(rule), "{rule:?} is there by default");
     }
 
     // A model told about `bash` and then refused it tries anyway and reports
     // being refused, instead of using what it does have.
     let reading = default_system_prompt(Path::new("/work"), &rules(&["read"], &[]));
-    assert!(reading.contains("- read: Read file contents"));
     for gone in [
-      "- bash:",
-      "- edit:",
-      "- write:",
       "Use bash for",
       "Use edit for",
       "Use write only",
@@ -1828,8 +1817,8 @@ mod tests {
     assert_eq!(default_system_prompt(Path::new("/work"), &rules(&[], &["fetch"])), all);
     // And refusing one is the same as allowing the rest.
     let no_bash = default_system_prompt(Path::new("/work"), &rules(&[], &["bash"]));
-    assert!(!no_bash.contains("- bash:"), "{no_bash}");
-    assert!(no_bash.contains("- read:"), "{no_bash}");
+    assert!(!no_bash.contains("Use bash"), "{no_bash}");
+    assert!(no_bash.contains("Use read"), "{no_bash}");
   }
 
   #[test]
