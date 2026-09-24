@@ -807,7 +807,10 @@ impl App {
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
-      terminal.draw(|f| self.draw(f))?;
+      terminal.draw(|f| {
+        self.draw(f);
+        crate::cells::guard(f.buffer_mut());
+      })?;
       tokio::select! {
           Some(ev) = input_rx.recv() => {
               self.handle_terminal(ev);
@@ -3131,27 +3134,34 @@ impl App {
           // What the tool has to show. A write shows the file it wrote, an
           // edit what it changed, and anything else what it said — and a
           // diff of nothing is not worth a block of nothing.
+          //
+          // All of it is text written for a terminal, which is not the
+          // terminal it is drawn on: its escapes and control characters are
+          // settled first.
           let diff = diff.as_deref().filter(|diff| !diff.trim().is_empty());
           let wrote = wrote_by(&self.entries[..at], call);
           let (body, cap, from_end) = match (wrote, diff) {
             (Some((path, content)), _) => {
               // A file's last newline ends its last line; it does not start
               // another.
-              let content = content.strip_suffix('\n').unwrap_or(content);
-              (file_lines(path, content), TOOL_OUTPUT_LINES, false)
+              let content = crate::markdown::printable(content.strip_suffix('\n').unwrap_or(content));
+              (file_lines(path, &content), TOOL_OUTPUT_LINES, false)
             }
             (None, Some(diff)) => (
-              diff_lines(edited_by(&self.entries[..at], call), diff),
+              diff_lines(edited_by(&self.entries[..at], call), &crate::markdown::printable(diff)),
               DIFF_LINES,
               false,
             ),
             // Structure a tool answered with is worth reading as structure.
-            (None, None) => match structured(name, output) {
-              Some(lines) => (lines, TOOL_OUTPUT_LINES, false),
-              // A command's output is most useful at its end and a file's at
-              // its start, so each keeps the end that matters.
-              None => (marked_lines(output, false), TOOL_OUTPUT_LINES, name == "bash"),
-            },
+            (None, None) => {
+              let output = crate::markdown::printable(output);
+              match structured(name, &output) {
+                Some(lines) => (lines, TOOL_OUTPUT_LINES, false),
+                // A command's output is most useful at its end and a file's
+                // at its start, so each keeps the end that matters.
+                None => (marked_lines(&output, false), TOOL_OUTPUT_LINES, name == "bash"),
+              }
+            }
           };
           let stripe = gutter(*running, *is_error);
           // A tool that answered with a picture and nothing else gets no
@@ -3969,25 +3979,38 @@ impl Preview {
       return;
     }
     let hidden = fold.hidden(body.len(), cap);
-    let row = |line: Vec<Span<'static>>, tip: bool| {
-      let mut spans = vec![Span::raw("  "), gutter.clone()];
+    let row = |line: Vec<Span<'static>>, tip: bool| -> Vec<Line<'static>> {
+      // The two columns of indent, the gutter, and the cursor when there is
+      // one, are the room the text does not have.
+      let room = width.saturating_sub(3 + usize::from(tip));
       // Folded, a line is a row: one that wraps spends rows the fold was
       // counting, so a block held to ten lines could still fill the screen.
-      // Unfolding shows the rest — of a long line as much as of a long block.
-      spans.extend(match fold == Fold::Full {
-        true => line,
-        // The two columns of indent, the gutter, and the cursor when there is
-        // one, are the room the text does not have.
-        false => clip(line, width.saturating_sub(3 + usize::from(tip))),
-      });
-      if tip {
-        spans.push(Span::styled("▌", Style::default().fg(Color::Yellow)));
-      }
-      Line::from(spans)
+      // Unfolding shows the rest — of a long line as much as of a long block,
+      // wrapped inside the block, so every row of it is under the gutter.
+      let pieces: Vec<Vec<Span<'static>>> = match fold == Fold::Full {
+        true => crate::markdown::wrap_line(Line::from(line), room.try_into().unwrap_or(u16::MAX))
+          .into_iter()
+          .map(|line| line.spans)
+          .collect(),
+        false => vec![clip(line, room)],
+      };
+      let last = pieces.len().saturating_sub(1);
+      pieces
+        .into_iter()
+        .enumerate()
+        .map(|(i, piece)| {
+          let mut spans = vec![Span::raw("  "), gutter.clone()];
+          spans.extend(piece);
+          if tip && i == last {
+            spans.push(Span::styled("▌", Style::default().fg(Color::Yellow)));
+          }
+          Line::from(spans)
+        })
+        .collect()
     };
     let note = vec![Span::styled(fold_note(hidden, from_end), mark_style(None))];
     if hidden > 0 && from_end {
-      out.push(row(note.clone(), false));
+      out.extend(row(note.clone(), false));
     }
     let kept: Vec<Vec<Span<'static>>> = match from_end {
       true => body.into_iter().skip(hidden).collect(),
@@ -3998,10 +4021,10 @@ impl Preview {
     };
     let last = kept.len().saturating_sub(1);
     for (i, line) in kept.into_iter().enumerate() {
-      out.push(row(line, cursor && i == last));
+      out.extend(row(line, cursor && i == last));
     }
     if hidden > 0 && !from_end {
-      out.push(row(note, false));
+      out.extend(row(note, false));
     }
   }
 }
@@ -5532,9 +5555,11 @@ mod tests {
     // and gutter included.
     let folded = drawn(&block(Fold::Preview));
     assert_eq!(folded, ["   ".to_string() + &"x".repeat(16) + "…"]);
-    // Unfolded, it is whole, over as many rows as the wrap takes.
     assert_eq!(folded[0].chars().count(), 20);
-    assert_eq!(drawn(&block(Fold::Full)), [format!("   {long}")]);
+    // Unfolded, it is whole, over as many rows as the wrap takes — each of
+    // them under the gutter, rather than only the first.
+    let row = |n| "   ".to_string() + &"x".repeat(n);
+    assert_eq!(drawn(&block(Fold::Full)), [row(17), row(17), row(6)]);
     // Collapsed, nothing at all.
     assert!(block(Fold::Collapsed).is_empty());
   }

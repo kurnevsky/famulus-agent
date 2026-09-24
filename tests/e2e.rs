@@ -3918,3 +3918,353 @@ fn nothing_is_listed_until_model_asks_for_it() {
   term.wait_for("Esc cancel");
   assert_eq!(provider.listings(), 1, "asked once, when asked to");
 }
+
+#[test]
+fn a_binary_file_read_as_text_does_not_break_the_screen() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "",
+      tool: "read",
+      args: serde_json::json!({ "path": "blob.pdf" }),
+    },
+    Turn::Say("Done reading."),
+  ]);
+  let term = Term::start("binary", &provider, &["--no-session"]);
+  // A PDF is a few lines of text around compressed streams, and compressed
+  // is as good as random: every control, every script and combining mark
+  // there is, once it has been decoded as UTF-8, and some of them a width
+  // tmux and fa disagree on.
+  let mut state = 7_u64;
+  let mut bytes = b"%PDF-1.7\nstream\n".to_vec();
+  bytes.extend((0..4000).map(|_| {
+    state = state
+      .wrapping_mul(6364136223846793005)
+      .wrapping_add(1442695040888963407);
+    (state >> 33) as u8
+  }));
+  bytes.extend(b"\nendstream\n");
+  std::fs::write(term.dir.join("blob.pdf"), bytes).expect("a file to read");
+  term.submit("read blob.pdf");
+  term.wait_for("Done reading.");
+
+  // Unfolded as well as folded: a row drawn at the wrong width is left
+  // behind by the redraw, so the second screen is where a stray one shows.
+  for unfold in [false, true] {
+    if unfold {
+      term.type_in("C-o");
+      term.wait_for("Tool output expanded");
+    }
+    let shown = term.settled();
+    assert_eq!(shown, term.redrawn(), "the screen is not what a redraw draws");
+  }
+}
+
+#[test]
+fn text_a_terminal_might_draw_at_another_width_does_not_move_the_screen() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "",
+      tool: "read",
+      args: serde_json::json!({ "path": "risky.txt" }),
+    },
+    Turn::Say("Done reading."),
+  ]);
+  let term = Term::start("risky", &provider, &["--no-session"]);
+  // Nothing binary about it — a syllable with a vowel sign tmux draws as no
+  // columns and ratatui as one, a joined emoji, a skin-tone base tmux draws
+  // as two, and an ideograph newer than tmux's tables — each followed by a
+  // marker whose column says whether anything before it moved.
+  let risky = "\u{915}\u{93e}|1 \u{1f468}\u{200d}\u{1f4bb}|2 \u{261d}|3 \u{30edd}|4\n";
+  std::fs::write(term.dir.join("risky.txt"), risky.repeat(3)).expect("a file to read");
+  term.submit("read risky.txt");
+  term.wait_for("Done reading.");
+  term.type_in("C-o");
+  let screen = term.wait_for("Tool output expanded");
+  let rows: Vec<&str> = screen.lines().filter(|line| line.contains("|4")).collect();
+  assert_eq!(rows.len(), 3, "{screen}");
+  for row in rows {
+    assert_eq!(row, "    \u{fffd} |1 \u{fffd} |2 \u{fffd}|3 \u{fffd} |4", "{screen}");
+  }
+}
+
+// ------------------------------------------------------------ fuzzing
+
+/// A small deterministic generator, so a failing case can be run again from
+/// its seed alone.
+struct Rng(u64);
+
+impl Rng {
+  fn next(&mut self) -> u64 {
+    self.0 = self
+      .0
+      .wrapping_mul(6364136223846793005)
+      .wrapping_add(1442695040888963407);
+    self.0 >> 33
+  }
+
+  fn below(&mut self, n: u64) -> u64 {
+    self.next() % n
+  }
+
+  fn pick<'a>(&mut self, of: &[&'a str]) -> &'a str {
+    of[self.below(of.len() as u64) as usize]
+  }
+}
+
+/// A page the way tools hand them back: indented markup, a minified line or
+/// two, inline data, and text in whatever script the page was written in.
+fn page(rng: &mut Rng) -> String {
+  const WORDS: &[&str] = &[
+    "lorem",
+    "ipsum",
+    "&nbsp;",
+    "&amp;",
+    "caf\u{e9}",
+    "na\u{ef}ve",
+    "\u{41f}\u{440}\u{438}\u{432}\u{435}\u{442}",
+    "\u{65e5}\u{672c}\u{8a9e}",
+    "\u{d55c}\u{ae00}",
+    "\u{5e9}\u{5dc}\u{5d5}\u{5dd}",
+    "\u{645}\u{631}\u{62d}\u{628}\u{627}",
+    "\u{915}\u{94d}\u{937}\u{93f}",
+    "\u{e2a}\u{e27}\u{e31}\u{e2a}",
+    "e\u{301}",
+    "\u{1f680}",
+    "\u{2705}",
+    "\u{1f468}\u{200d}\u{1f4bb}",
+    "\u{2764}\u{fe0f}",
+    "\u{1f1fa}\u{1f1e6}",
+    "\u{ad}",
+    "\u{200b}",
+    "\u{202e}rtl",
+    "\u{fffd}",
+    "\u{2014}",
+    "\u{2026}",
+    "\t",
+    "  ",
+    "\u{a0}",
+  ];
+  const TAGS: &[&str] = &["div", "span", "p", "a", "li", "td", "script", "style", "pre"];
+  let mut out = String::from("<!DOCTYPE html>\n<html>\n");
+  let newline = if rng.below(4) == 0 { "\r\n" } else { "\n" };
+  for _ in 0..rng.below(120) + 20 {
+    let depth = rng.below(8) as usize;
+    let indent = if rng.below(2) == 0 {
+      "\t".repeat(depth)
+    } else {
+      "  ".repeat(depth)
+    };
+    let tag = rng.pick(TAGS);
+    let mut line = format!("{indent}<{tag} class=\"c{}\">", rng.below(1000));
+    let words = match rng.below(10) {
+      // A minified line, or one holding a picture inline.
+      0 => 400 + rng.below(1200),
+      1 => {
+        line.push_str("<img src=\"data:image/png;base64,");
+        for _ in 0..rng.below(2000) + 200 {
+          line
+            .push(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"[rng.below(64) as usize] as char);
+        }
+        line.push_str("\">");
+        0
+      }
+      _ => rng.below(20),
+    };
+    for _ in 0..words {
+      if rng.below(3) == 0 {
+        line.push_str(rng.pick(WORDS));
+      } else {
+        for _ in 0..rng.below(12) + 1 {
+          line.push((b'a' + rng.below(26) as u8) as char);
+        }
+      }
+      line.push(' ');
+    }
+    // Now and then what a program meant for a terminal rather than a page.
+    match rng.below(30) {
+      0 => line.push_str("\u{1b}[31mred\u{1b}[0m"),
+      1 => line.push_str("10%\r55%\r100%"),
+      2 => line.push('\u{7}'),
+      3 => line.push_str("x\u{8}y"),
+      _ => {}
+    }
+    line.push_str(&format!("</{tag}>"));
+    out.push_str(&line);
+    out.push_str(newline);
+  }
+  out.push_str("</html>");
+  out
+}
+
+impl Term {
+  /// The screen once it has stopped changing — a toast gone, a scrollbar
+  /// faded — so two of them can be compared for what is drawn rather than
+  /// for when.
+  ///
+  /// Still for longer than either of those sits unchanged before it goes: a
+  /// scrollbar is shown for a second, and a toast for as long as it takes to
+  /// read.
+  fn settled(&self) -> String {
+    let still = Duration::from_millis(2500);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut last = self.screen();
+    let mut since = Instant::now();
+    loop {
+      std::thread::sleep(Duration::from_millis(250));
+      let now = self.screen();
+      if now != last {
+        (last, since) = (now, Instant::now());
+      } else if since.elapsed() >= still || Instant::now() > deadline {
+        return now;
+      }
+    }
+  }
+
+  fn resize(&self, width: u16, height: u16) {
+    let (width, height) = (width.to_string(), height.to_string());
+    let done = tmux(
+      &self.name,
+      &["resize-window", "-t", &self.name, "-x", &width, "-y", &height],
+    )
+    .status()
+    .expect("tmux resizes");
+    assert!(done.success(), "tmux could not resize");
+  }
+
+  /// What the screen would be drawn as from nothing: a change of size makes
+  /// ratatui clear the terminal and draw every cell again, rather than only
+  /// the ones it believes have changed. Only the height changes, so nothing is
+  /// wrapped differently and a transcript scrolled back is scrolled back to
+  /// the same place.
+  fn redrawn(&self) -> String {
+    self.resize(80, 31);
+    self.settled();
+    self.resize(80, 30);
+    self.settled()
+  }
+}
+
+#[test]
+fn what_is_on_screen_is_what_a_full_redraw_would_draw() {
+  if !have_tmux() {
+    return;
+  }
+  let seed: u64 = std::env::var("FUZZ_SEED")
+    .ok()
+    .and_then(|s| s.parse().ok())
+    .unwrap_or(1);
+  // A few cases by default, each of them slow — every step waits for the
+  // screen to settle twice. `FUZZ_CASES` and `FUZZ_SEED` go further.
+  let cases: u64 = std::env::var("FUZZ_CASES")
+    .ok()
+    .and_then(|s| s.parse().ok())
+    .unwrap_or(2);
+  for case in seed..seed + cases {
+    let mut rng = Rng(case);
+    let text = page(&mut rng);
+    // The page the way each kind of text reaches the transcript: a file
+    // read, a command's output streaming in a line at a time, and the
+    // model's own answer, which is rendered as markdown.
+    let how = ["read", "bash", "reply"][(case % 3) as usize];
+    let script = match how {
+      "read" => vec![
+        Turn::Call {
+          say: "",
+          tool: "read",
+          args: serde_json::json!({ "path": "page.html" }),
+        },
+        Turn::Say("Done reading."),
+      ],
+      "bash" => vec![
+        Turn::Call {
+          say: "",
+          tool: "bash",
+          args: serde_json::json!({
+            "command": "while IFS= read -r l; do printf '%s\\n' \"$l\"; sleep 0.005; done < page.html"
+          }),
+        },
+        Turn::Say("Done reading."),
+      ],
+      _ => vec![Turn::Say(Box::leak(
+        format!("{text}\n\nDone reading.").into_boxed_str(),
+      ))],
+    };
+    let provider = Provider::start(script);
+    // A scrollbar that hides a second after the last scroll could be there
+    // for one screen and gone for the other, so it is there for both.
+    let term = Term::start(
+      &format!("fuzz-{case}"),
+      &provider,
+      &["--no-session", "--scrollbar", "always"],
+    );
+    std::fs::write(term.dir.join("page.html"), &text).expect("a page to read");
+    term.submit("read page.html");
+    term.wait_for("Done reading.");
+    let mut done = vec![how];
+    for _ in 0..4 {
+      let key = rng.pick(&["C-o", "PageUp", "PageUp", "PageDown", "WheelUp", "WheelDown"]);
+      match key {
+        // SGR mouse reports, over the middle of the transcript.
+        "WheelUp" => term.send_raw("\u{1b}[<64;40;10M"),
+        "WheelDown" => term.send_raw("\u{1b}[<65;40;10M"),
+        key => term.type_in(key),
+      }
+      done.push(key);
+      let shown = term.settled();
+      let redrawn = term.redrawn();
+      if shown != redrawn {
+        let diff: Vec<String> = shown
+          .lines()
+          .zip(redrawn.lines())
+          .enumerate()
+          .filter(|(_, (a, b))| a != b)
+          .map(|(row, (a, b))| format!("row {row}\n  shown:   {a:?}\n  redrawn: {b:?}"))
+          .collect();
+        panic!(
+          "case {case} after {done:?}: the screen is not what a redraw draws\n{}\n--- shown\n{shown}\n--- redrawn\n{redrawn}",
+          diff.join("\n")
+        );
+      }
+    }
+  }
+}
+
+#[test]
+fn an_unfolded_line_too_long_for_the_screen_wraps_inside_its_block() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "",
+      tool: "read",
+      args: serde_json::json!({ "path": "flat.json" }),
+    },
+    Turn::Say("Done reading."),
+  ]);
+  let term = Term::start("unfolded-wrap", &provider, &["--no-session"]);
+  // A page's text as a server hands it back: one string, many screens long.
+  let words: Vec<String> = (0..120).map(|i| format!("word{i}")).collect();
+  std::fs::write(term.dir.join("flat.json"), format!("\"{}\"", words.join(" "))).expect("a file to read");
+  term.submit("read flat.json");
+  term.wait_for("Done reading.");
+  term.type_in("C-o");
+  let screen = term.wait_for("word119");
+  let rows: Vec<&str> = screen
+    .lines()
+    .skip_while(|line| !line.starts_with("⚙ read"))
+    .skip(1)
+    .take_while(|line| !line.is_empty())
+    .collect();
+  assert!(rows.len() > 1, "the line wraps:\n{screen}");
+  assert!(
+    rows.iter().all(|row| row.starts_with("   ")),
+    "every row of it is under the gutter:\n{screen}"
+  );
+}

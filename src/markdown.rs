@@ -216,6 +216,126 @@ fn expand_tabs(text: &str) -> String {
   text.replace('\t', "    ")
 }
 
+/// Text a program wrote for a terminal, as the terminal would have left it.
+///
+/// A control character is never drawn, but `unicode-width` still counts it
+/// as a column, so a line carrying one is laid out wider than it is drawn.
+/// An escape sequence is one unit, a colour or a cursor move, and goes as a
+/// whole: dropping only its escape byte would leave `[31m` in the text. A
+/// carriage return starts its line again, so a progress bar keeps its last
+/// state rather than every state it passed through, and a backspace takes
+/// back the character before it. Every other control character goes, except
+/// the newlines and tabs that are laid out later, and so do the invisible
+/// characters terminals do not agree on the width of.
+pub fn printable(text: &str) -> Cow<'_, str> {
+  if !text
+    .chars()
+    .any(|c| (c.is_control() && c != '\n' && c != '\t') || invisible(c))
+  {
+    return Cow::Borrowed(text);
+  }
+  let mut out = String::with_capacity(text.len());
+  for (i, line) in text.split('\n').enumerate() {
+    if i > 0 {
+      out.push('\n');
+    }
+    settle(line, &mut out);
+  }
+  Cow::Owned(out)
+}
+
+/// Invisible characters `unicode-width` and terminals measure differently: a
+/// soft hyphen it counts as nothing and they draw, marks that prefix a number
+/// it counts as part of the digit after them, separators it counts as a column,
+/// and the directional controls a terminal that lays out right-to-left text
+/// would reorder the rest of the line by. Joiners are not among them, since
+/// emoji and whole scripts are spelled with them.
+fn invisible(c: char) -> bool {
+  matches!(
+    c,
+    '\u{ad}'
+      | '\u{600}'..='\u{605}'
+      | '\u{61c}'
+      | '\u{6dd}'
+      | '\u{70f}'
+      | '\u{890}'..='\u{891}'
+      | '\u{8e2}'
+      | '\u{180e}'
+      | '\u{200b}'
+      | '\u{200e}'..='\u{200f}'
+      | '\u{2028}'..='\u{202e}'
+      | '\u{2060}'..='\u{206f}'
+      | '\u{feff}'
+      | '\u{fff9}'..='\u{fffb}'
+      | '\u{110bd}'
+      | '\u{110cd}'
+      | '\u{13430}'..='\u{1343f}'
+      | '\u{1bca0}'..='\u{1bca3}'
+      | '\u{1d173}'..='\u{1d17a}'
+      | '\u{e0001}'
+      | '\u{e0020}'..='\u{e007f}'
+  )
+}
+
+/// One line of terminal output onto the end of `out`, as it was left: its
+/// escapes and controls acted on, or dropped where acting on them means
+/// nothing to a transcript.
+fn settle(line: &str, out: &mut String) {
+  // Where the line starts in `out`, and whether a carriage return has sent
+  // the cursor back to it: the next character written clears the line, and a
+  // line ending before one arrives keeps what was there.
+  let start = out.len();
+  let mut returned = false;
+  let mut chars = line.chars().peekable();
+  while let Some(c) = chars.next() {
+    match c {
+      '\r' => returned = true,
+      '\u{8}' => {
+        if !returned && out.len() > start {
+          out.pop();
+        }
+      }
+      '\u{1b}' => {
+        if chars.next_if_eq(&'[').is_some() {
+          skip_csi(&mut chars);
+        } else if chars.next_if(|c| matches!(c, ']' | 'P' | 'X' | '^' | '_')).is_some() {
+          // Operating system commands, device controls and the rest of the
+          // string-carrying sequences, which run to a string terminator — or
+          // a bell, which xterm takes for one.
+          while let Some(c) = chars.next() {
+            if c == '\u{7}' || c == '\u{9c}' || (c == '\u{1b}' && chars.next_if_eq(&'\\').is_some()) {
+              break;
+            }
+          }
+        } else {
+          // Everything else is its intermediates and a final character. An
+          // escape followed by neither is a stray, and whatever it was
+          // followed by is text.
+          while chars.next_if(|c| ('\u{20}'..='\u{2f}').contains(c)).is_some() {}
+          chars.next_if(|c| ('\u{30}'..='\u{7e}').contains(c));
+        }
+      }
+      '\u{9b}' => skip_csi(&mut chars),
+      c if (c.is_control() && c != '\t') || invisible(c) => {}
+      c => {
+        if returned {
+          out.truncate(start);
+          returned = false;
+        }
+        out.push(c);
+      }
+    }
+  }
+}
+
+/// The rest of a control sequence: parameters and intermediates, up to the
+/// final character that ends it. One cut short ends where it stops looking
+/// like a sequence, so the text after it is kept.
+fn skip_csi(chars: &mut std::iter::Peekable<impl Iterator<Item = char>>) {
+  while chars.next_if(|c| ('\u{20}'..='\u{3f}').contains(c)).is_some() {}
+  chars.next_if(|c| ('\u{40}'..='\u{7e}').contains(c));
+}
+
 /// What a message's body refers to but does not carry inline: footnotes and
 /// link definitions. Both are written as their own blocks, so both have to be
 /// resolved up front and held back from the flow.
@@ -1063,5 +1183,57 @@ mod tests {
         assert!(line.width() <= width as usize, "{width}: {line:?}");
       }
     }
+  }
+
+  #[test]
+  fn text_with_nothing_to_settle_is_not_copied() {
+    assert!(matches!(printable("plain\n\tindented"), Cow::Borrowed(_)));
+  }
+
+  #[test]
+  fn escape_sequences_go_whole() {
+    assert_eq!(
+      printable("\x1b[1;31mred\x1b[0m and \x1b[2K\x1b[Gplain"),
+      "red and plain"
+    );
+    assert_eq!(
+      printable("\x1b]0;title\x07\x1b]8;;https://a.b\x1b\\link\x1b]8;;\x1b\\"),
+      "link"
+    );
+    assert_eq!(printable("\x1b(Bcharset \x1b=keypad \u{9b}31mC1"), "charset keypad C1");
+    // Cut short, a sequence gives back the text it was about to swallow.
+    assert_eq!(printable("stray\x1b\nnext \x1b[12\nline"), "stray\nnext \nline");
+  }
+
+  #[test]
+  fn a_carriage_return_leaves_what_was_written_last() {
+    assert_eq!(printable(" 10%\r 55%\r100%\ndone"), "100%\ndone");
+    assert_eq!(printable("kept\r\nnext\r"), "kept\nnext");
+  }
+
+  #[test]
+  fn a_backspace_takes_back_a_character() {
+    assert_eq!(printable("_\x08Bo\x08old"), "Bold");
+    assert_eq!(printable("a\n\x08b"), "a\nb");
+  }
+
+  #[test]
+  fn other_controls_are_not_counted_as_columns() {
+    let text = printable("bell\x07 nul\0 del\x7f nel\u{85} bad\u{fffd}");
+    assert_eq!(text, "bell nul del nel bad\u{fffd}");
+    assert_eq!(text.width(), text.chars().count());
+  }
+
+  #[test]
+  fn invisibles_terminals_measure_their_own_way_go() {
+    assert_eq!(
+      printable("soft\u{ad}hyphen \u{202e}rtl\u{202c} \u{600}12 a\u{2028}b"),
+      "softhyphen rtl 12 ab"
+    );
+    // A joiner is part of how an emoji is spelled, and stays.
+    assert_eq!(
+      printable("\u{1f468}\u{200d}\u{1f4bb}\u{ad}"),
+      "\u{1f468}\u{200d}\u{1f4bb}"
+    );
   }
 }

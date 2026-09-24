@@ -233,11 +233,14 @@ async fn call(
 /// instead, rather than in front of it.
 fn answer(result: &CallToolResult) -> Result<ToolOutput, ToolExecutionError> {
   let structured = result.structured_content.as_ref();
-  let written = structured.map(serde_json::Value::to_string);
-  let copy = result
-    .content
-    .iter()
-    .position(|block| matches!(block, ContentBlock::Text(text) if Some(&text.text) == written.as_ref()));
+  // Written out however the server likes to write JSON — flat, or indented
+  // for whoever reads it — so it is the value that is compared, not the text.
+  let copy = structured.and_then(|structured| {
+    result.content.iter().position(|block| match block {
+      ContentBlock::Text(text) => serde_json::from_str::<serde_json::Value>(&text.text).is_ok_and(|v| &v == structured),
+      _ => false,
+    })
+  });
   let mut content = result
     .content
     .iter()
@@ -370,6 +373,10 @@ mod tests {
     let value = serde_json::json!({"n": 1});
     let structured = CallToolResult::structured(value.clone());
     assert_eq!(texts(&answer(&structured).unwrap()), [format!("json {value}")]);
+    // However it was written out: indented is as much a copy as flat.
+    let mut pretty = CallToolResult::success(vec![text("{\n  \"n\": 1\n}")]);
+    pretty.structured_content = Some(value.clone());
+    assert_eq!(texts(&answer(&pretty).unwrap()), [format!("json {value}")]);
     // Other text is the server's own, and stays, after the structured content.
     let mut both = CallToolResult::success(vec![text("note")]);
     both.structured_content = Some(value.clone());
