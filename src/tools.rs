@@ -14,7 +14,7 @@ use rustix::process::{Pid, Signal, kill_process_group};
 
 use crate::ask::{self, Dialog, Question};
 use crate::modal::Host;
-use crate::{edit, images};
+use crate::{edit, images, pdf};
 use schemars::generate::SchemaSettings;
 use schemars::transform::RecursiveTransform;
 use schemars::{JsonSchema, Schema};
@@ -226,8 +226,9 @@ impl Tool for ReadTool {
 
   fn description(&self) -> String {
     format!(
-      "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). \
-             Images are sent as attachments; other binary files are refused. For text files, output is truncated to {MAX_LINES} lines \
+      "Read the contents of a file. Supports text files, images (jpg, png, gif, webp, bmp) and PDFs. \
+             Images are sent as attachments, PDFs as the Markdown of their text; other binary files are refused. \
+             For text files and PDFs, output is truncated to {MAX_LINES} lines \
              or {}KB (whichever is hit first). Use offset/limit for large files. When you need the \
              full file, continue with offset until complete.",
       MAX_BYTES / 1024
@@ -243,6 +244,9 @@ impl Tool for ReadTool {
     if let Some(format) = images::detect(&bytes) {
       return Ok(read_image(&bytes, format, self.vision));
     }
+    if pdf::detect(&bytes) {
+      return read_pdf(bytes, &path, &args).await;
+    }
     if is_binary(&bytes) {
       return Err(ToolError(format!(
         "{}: binary file ({}), not text. Use bash to inspect it (e.g. file, xxd, strings).",
@@ -251,47 +255,83 @@ impl Tool for ReadTool {
       )));
     }
 
-    // Decode leniently and count lines with a plain split, so a trailing
-    // newline yields one final empty line.
+    // Decode leniently, so a stray byte in some other encoding is shown as
+    // a replacement character rather than refusing the file.
     let text = String::from_utf8_lossy(&bytes);
-    let all_lines: Vec<&str> = text.split('\n').collect();
-    let total_lines = all_lines.len();
-    let start = args.offset.map_or(0, |o| o.saturating_sub(1));
-    let start_display = start + 1;
-    // Only an offset can start past the end: there is always a first line.
-    if start >= total_lines {
-      return Err(ToolError(format!(
-        "Offset {start_display} is beyond end of file ({total_lines} lines total)"
-      )));
-    }
-    let end = args.limit.map_or(total_lines, |limit| (start + limit).min(total_lines));
-    let selected = all_lines[start..end].join("\n");
-
-    let cut = keep(&selected, false);
-    let output = if cut.partial() {
-      format!(
-        "[Line {start_display} is {}, exceeds {} limit. Use bash: sed -n '{start_display}p' {} | head -c {MAX_BYTES}]",
-        format_size(all_lines[start].len()),
-        format_size(MAX_BYTES),
-        args.path
-      )
-    } else if let Some(by) = cut.by {
-      let end_display = start_display + cut.kept.len() - 1;
-      let next = end_display + 1;
-      format!(
-        "{}\n\n[Showing lines {start_display}-{end_display} of {total_lines}{}. Use offset={next} to continue.]",
-        cut.text(),
-        by.limit()
-      )
-    } else if end < total_lines {
-      let remaining = total_lines - end;
-      let next = end + 1;
-      format!("{selected}\n\n[{remaining} more lines in file. Use offset={next} to continue.]")
-    } else {
-      selected
-    };
+    let output = window(&text, args.offset, args.limit, |line| {
+      format!("Use bash: sed -n '{line}p' {} | head -c {MAX_BYTES}", args.path)
+    })?;
     Ok(vec![ToolResultContent::text(output)])
   }
+}
+
+/// The lines of `text` from `offset` (1-indexed) on, at most `limit` of them
+/// and within `MAX_LINES` and `MAX_BYTES`, with a note saying where to go on
+/// from when that is not the end. Lines are counted with a plain split, so a
+/// trailing newline yields one final empty line. `wide` says how else to get
+/// at a first line too long to show any of.
+fn window(
+  text: &str,
+  offset: Option<usize>,
+  limit: Option<usize>,
+  wide: impl FnOnce(usize) -> String,
+) -> Result<String, ToolError> {
+  let all_lines: Vec<&str> = text.split('\n').collect();
+  let total_lines = all_lines.len();
+  let start = offset.map_or(0, |o| o.saturating_sub(1));
+  let start_display = start + 1;
+  // Only an offset can start past the end: there is always a first line.
+  if start >= total_lines {
+    return Err(ToolError(format!(
+      "Offset {start_display} is beyond end of file ({total_lines} lines total)"
+    )));
+  }
+  let end = limit.map_or(total_lines, |limit| (start + limit).min(total_lines));
+  let selected = all_lines[start..end].join("\n");
+
+  let cut = keep(&selected, false);
+  Ok(if cut.partial() {
+    format!(
+      "[Line {start_display} is {}, exceeds {} limit. {}]",
+      format_size(all_lines[start].len()),
+      format_size(MAX_BYTES),
+      wide(start_display)
+    )
+  } else if let Some(by) = cut.by {
+    let end_display = start_display + cut.kept.len() - 1;
+    let next = end_display + 1;
+    format!(
+      "{}\n\n[Showing lines {start_display}-{end_display} of {total_lines}{}. Use offset={next} to continue.]",
+      cut.text(),
+      by.limit()
+    )
+  } else if end < total_lines {
+    let remaining = total_lines - end;
+    let next = end + 1;
+    format!("{selected}\n\n[{remaining} more lines in file. Use offset={next} to continue.]")
+  } else {
+    selected
+  })
+}
+
+/// A PDF comes back as the Markdown of its text layer, paged through by line
+/// like any text file, with a note for the pages that did not come through
+/// whole.
+async fn read_pdf(bytes: Vec<u8>, path: &Path, args: &ReadArgs) -> Result<Vec<ToolResultContent>, ToolError> {
+  let pdf = pdf::extract(bytes)
+    .await
+    .map_err(|e| ToolError(format!("{}: {e}", path.display())))?;
+  let note = pdf.note();
+  if pdf.markdown.trim().is_empty() {
+    return Ok(vec![ToolResultContent::text(note.unwrap_or_default())]);
+  }
+  let output = window(&pdf.markdown, args.offset, args.limit, |_| {
+    "Use bash to extract the text (e.g. pdftotext).".to_string()
+  })?;
+  Ok(vec![ToolResultContent::text(match note {
+    Some(note) => format!("{output}\n\n{note}"),
+    None => output,
+  })])
 }
 
 /// How much of the start of a file is looked at to tell whether it is text.
@@ -707,6 +747,69 @@ mod read_tests {
     assert_eq!(
       read(&dir, "colour.txt", None, None).await.unwrap(),
       "\x1b[1mbold\x1b[0m\x0c\r\n"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+  }
+
+  /// A PDF of one page per string in `pages`, each drawn in Helvetica.
+  fn pdf(pages: &[&str]) -> Vec<u8> {
+    let n = pages.len();
+    let kids: Vec<String> = (0..n).map(|i| format!("{} 0 R", 4 + 2 * i)).collect();
+    let mut objects = vec![
+      "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+      format!("<< /Type /Pages /Kids [{}] /Count {n} >>", kids.join(" ")),
+      "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+    ];
+    for (i, text) in pages.iter().enumerate() {
+      objects.push(format!(
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents {} 0 R >>",
+        5 + 2 * i
+      ));
+      let stream = format!("BT /F1 12 Tf 72 720 Td ({text}) Tj ET");
+      objects.push(format!("<< /Length {} >>\nstream\n{stream}\nendstream", stream.len()));
+    }
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, object) in objects.iter().enumerate() {
+      offsets.push(out.len());
+      out.extend(format!("{} 0 obj\n{object}\nendobj\n", i + 1).bytes());
+    }
+    let xref = out.len();
+    out.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).bytes());
+    for offset in offsets {
+      out.extend(format!("{offset:010} 00000 n \n").bytes());
+    }
+    out.extend(
+      format!(
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+        objects.len() + 1
+      )
+      .bytes(),
+    );
+    out
+  }
+
+  #[tokio::test]
+  async fn a_pdf_is_read_as_markdown_and_paged_like_text() {
+    let dir = dir("pdf");
+    std::fs::write(dir.join("doc.pdf"), pdf(&["Hello from page one", "And page two"])).unwrap();
+    let out = read(&dir, "doc.pdf", None, None).await.unwrap();
+    assert_eq!(
+      out,
+      "<!-- Page 1 -->\n\n## Hello from page one\n\n<!-- Page 2 -->\n\n## And page two\n"
+    );
+    assert_eq!(
+      read(&dir, "doc.pdf", Some(3), Some(1)).await.unwrap(),
+      "## Hello from page one\n\n[5 more lines in file. Use offset=4 to continue.]"
+    );
+
+    // Nothing but the header is not a document.
+    std::fs::write(dir.join("broken.pdf"), "%PDF-1.7\nnot really\n").unwrap();
+    let err = read(&dir, "broken.pdf", None, None).await.unwrap_err();
+    assert!(
+      err.0.starts_with(&format!("{}: ", dir.join("broken.pdf").display())),
+      "{}",
+      err.0
     );
     std::fs::remove_dir_all(dir).unwrap();
   }

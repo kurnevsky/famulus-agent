@@ -19,6 +19,7 @@ mod mcp;
 mod modal;
 #[cfg(feature = "mcp")]
 mod oauth;
+mod pdf;
 #[cfg(feature = "mcp")]
 mod prompts;
 #[cfg(feature = "mcp")]

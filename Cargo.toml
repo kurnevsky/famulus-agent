@@ -125,6 +125,9 @@ nucleo-matcher = "0.3.1"
 # The system keyring — Secret Service, or the portal inside a sandbox — which
 # is where an MCP server's OAuth tokens are kept between sessions.
 oo7 = { version = "0.6", optional = true }
+# PDFs `read` is given, turned into Markdown. Without its OCR features: a
+# scanned page is reported as having no text rather than read from pixels.
+pdf-inspector = "1.24"
 ratatui = "0.30"
 # The client rmcp calls a server with once it is signed in to, and the address
 # the browser comes back to; both already in the tree through rmcp.
