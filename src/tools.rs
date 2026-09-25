@@ -227,7 +227,7 @@ impl Tool for ReadTool {
   fn description(&self) -> String {
     format!(
       "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). \
-             Images are sent as attachments. For text files, output is truncated to {MAX_LINES} lines \
+             Images are sent as attachments; other binary files are refused. For text files, output is truncated to {MAX_LINES} lines \
              or {}KB (whichever is hit first). Use offset/limit for large files. When you need the \
              full file, continue with offset until complete.",
       MAX_BYTES / 1024
@@ -242,6 +242,13 @@ impl Tool for ReadTool {
 
     if let Some(format) = images::detect(&bytes) {
       return Ok(read_image(&bytes, format, self.vision));
+    }
+    if is_binary(&bytes) {
+      return Err(ToolError(format!(
+        "{}: binary file ({}), not text. Use bash to inspect it (e.g. file, xxd, strings).",
+        path.display(),
+        format_size(bytes.len())
+      )));
     }
 
     // Decode leniently and count lines with a plain split, so a trailing
@@ -285,6 +292,35 @@ impl Tool for ReadTool {
     };
     Ok(vec![ToolResultContent::text(output)])
   }
+}
+
+/// How much of the start of a file is looked at to tell whether it is text.
+const SNIFF_BYTES: usize = 8 * 1024;
+
+/// Whether a file's bytes look like something other than text: a NUL in its
+/// first few kilobytes, or there more than one character in ten that no text
+/// would hold — a control other than whitespace and escape, or a byte that is
+/// not UTF-8. A stray byte in a file in some other encoding is let through,
+/// to be decoded leniently.
+fn is_binary(bytes: &[u8]) -> bool {
+  let sample = &bytes[..bytes.len().min(SNIFF_BYTES)];
+  if sample.contains(&0) {
+    return true;
+  }
+  let (mut chars, mut odd) = (0, 0);
+  for chunk in sample.utf8_chunks() {
+    for c in chunk.valid().chars() {
+      chars += 1;
+      if c.is_control() && !matches!(c, '\t' | '\n' | '\r' | '\x0c' | '\x1b') {
+        odd += 1;
+      }
+    }
+    if !chunk.invalid().is_empty() {
+      chars += 1;
+      odd += 1;
+    }
+  }
+  odd * 10 > chars
 }
 
 /// What of some output fits in `MAX_LINES` lines and `MAX_BYTES` bytes.
@@ -650,10 +686,39 @@ mod read_tests {
   }
 
   #[tokio::test]
-  async fn binary_is_decoded_leniently_and_paths_are_normalized() {
+  async fn binary_is_refused() {
+    let dir = dir("binary");
+    std::fs::write(dir.join("nul.dat"), b"text\0more text").unwrap();
+    let err = read(&dir, "nul.dat", None, None).await.unwrap_err();
+    assert_eq!(
+      err.0,
+      format!(
+        "{}: binary file (14B), not text. Use bash to inspect it (e.g. file, xxd, strings).",
+        dir.join("nul.dat").display()
+      )
+    );
+    // No NUL, but mostly bytes that are not UTF-8 and controls.
+    std::fs::write(dir.join("noise.dat"), [0xff, 0xfe, 0x01, 0x02, b'o', b'k']).unwrap();
+    assert!(read(&dir, "noise.dat", None, None).await.is_err());
+    std::fs::write(dir.join("empty.txt"), "").unwrap();
+    assert_eq!(read(&dir, "empty.txt", None, None).await.unwrap(), "");
+    // Escapes and form feeds are what text written for a terminal holds.
+    std::fs::write(dir.join("colour.txt"), "\x1b[1mbold\x1b[0m\x0c\r\n").unwrap();
+    assert_eq!(
+      read(&dir, "colour.txt", None, None).await.unwrap(),
+      "\x1b[1mbold\x1b[0m\x0c\r\n"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+  }
+
+  #[tokio::test]
+  async fn stray_bytes_are_decoded_leniently_and_paths_are_normalized() {
     let dir = dir("paths");
-    std::fs::write(dir.join("bin.dat"), [0xff, 0xfe, b'o', b'k']).unwrap();
-    assert_eq!(read(&dir, "@bin.dat", None, None).await.unwrap(), "\u{FFFD}\u{FFFD}ok");
+    std::fs::write(dir.join("latin1.txt"), b"caf\xe9 au lait").unwrap();
+    assert_eq!(
+      read(&dir, "@latin1.txt", None, None).await.unwrap(),
+      "caf\u{FFFD} au lait"
+    );
     // Curly apostrophe fallback, for macOS-named files.
     std::fs::write(dir.join("it\u{2019}s.txt"), "curly").unwrap();
     assert_eq!(read(&dir, "it's.txt", None, None).await.unwrap(), "curly");

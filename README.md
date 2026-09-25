@@ -1060,7 +1060,9 @@ comes back to say otherwise.
   limits (2000 lines / 50 KB), continuation notes, and error messages. Paths
   are resolved like pi (`~`, leading `@`, `file://`, Unicode spaces; reads also
   try NFD and curly-apostrophe name variants). `read` returns images (jpg,
-  png, gif, webp, bmp) as attachments and decodes text leniently. `bash`
+  png, gif, webp, bmp) as attachments, refuses other binary files (a NUL, or
+  a tenth of the first 8 KB controls and bytes that are not UTF-8), and
+  decodes text leniently. `bash`
   follows pi's executor: stdout and stderr interleaved, live output streamed
   to the UI, the last 2000 lines / 50 KB kept with the full output spilled to
   a temp file, the whole process group killed on timeout or abort, and pi's

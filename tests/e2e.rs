@@ -3920,15 +3920,16 @@ fn nothing_is_listed_until_model_asks_for_it() {
 }
 
 #[test]
-fn a_binary_file_read_as_text_does_not_break_the_screen() {
+fn a_binary_file_printed_as_text_does_not_break_the_screen() {
   if !have_tmux() {
     return;
   }
+  // `read` refuses a binary file, but a command can still print one.
   let provider = Provider::start(vec![
     Turn::Call {
       say: "",
-      tool: "read",
-      args: serde_json::json!({ "path": "blob.pdf" }),
+      tool: "bash",
+      args: serde_json::json!({ "command": "cat blob.pdf" }),
     },
     Turn::Say("Done reading."),
   ]);
