@@ -2820,7 +2820,8 @@ fn a_resource_is_completed_after_an_ampersand_and_sent_as_a_reference() {
 /// A server that says its tools have changed has them fetched again and put
 /// in place of the ones it had: the next request offers the new ones and not
 /// the old, the transcript says what changed, and the footer counts them.
-/// What the session was told about tools holds for the new ones too.
+/// What the server's table says about its tools holds for the new ones too,
+/// and `--tools` and `--no-tools` leave them alone.
 #[test]
 #[cfg(feature = "mcp")]
 fn a_server_that_changes_its_tools_has_the_new_ones_offered() {
@@ -2834,7 +2835,7 @@ fn a_server_that_changes_its_tools_has_the_new_ones_offered() {
   std::fs::write(
     &config,
     format!(
-      "[weather]\ncommand = \"python3 '{}'\"\ntimeout = 10\ntools = [\"weather\", \"grow\", \"radar\", \"tide\"]\n",
+      "[weather]\ncommand = \"python3 '{}'\"\ntimeout = 10\ntools = [\"weather\", \"grow\", \"radar\", \"tide\"]\nexcept = [\"tide\"]\n",
       server.display()
     ),
   )
@@ -2854,18 +2855,20 @@ fn a_server_that_changes_its_tools_has_the_new_ones_offered() {
     Turn::Say("Rain in Oslo."),
   ]);
   // `radar` and `tide` are not there yet when the session starts, and the
-  // rule against `tide` is still a rule when they are.
+  // rule against `tide` is still a rule when they are. `--no-tools` is for
+  // fa's own tools, so naming one of the server's with it keeps nothing out.
   let term = Term::start(
     "mcp-changed",
     &provider,
-    &["--no-session", "--mcp-config", &shell(&config), "--no-tools", "tide"],
+    &["--no-session", "--mcp-config", &shell(&config), "--no-tools", "weather"],
   );
   term.wait_for("MCP weather: 2 tools");
+  term.wait_for("--tools and --no-tools are for fa's own tools, not weather");
   term.wait_for("1 mcp, 2 tools");
   term.submit("grow, then look for rain");
   term.wait_for("Rain in Oslo.");
-  term.wait_for("MCP weather: now 3 tools, new: radar, tide, gone: grow");
-  term.wait_for("1 mcp, 3 tools");
+  term.wait_for("MCP weather: now 2 tools, new: radar, gone: grow");
+  term.wait_for("1 mcp, 2 tools");
   // What the last request offered, apart from the calls its history holds.
   let body = provider.bodies().last().cloned().expect("a request");
   let request: serde_json::Value = serde_json::from_str(&body).expect("JSON");
@@ -2884,11 +2887,11 @@ fn a_server_that_changes_its_tools_has_the_new_ones_offered() {
     !last.contains(r#""name":"grow""#),
     "the one it took back is not: {last}"
   );
+  assert!(!last.contains(r#""name":"tide""#), "nor one its table refused: {last}");
   assert!(
-    !last.contains(r#""name":"tide""#),
-    "nor one the session refused: {last}"
+    last.contains(r#""name":"weather""#),
+    "and the rest stay, whatever --no-tools said: {last}"
   );
-  assert!(last.contains(r#""name":"weather""#), "and the rest stay: {last}");
   let screen = term.screen();
   let call = screen.find("⚙ radar").expect("called like any other");
   assert!(screen[call..].contains("Oslo"), "and answered: {screen}");
@@ -3198,13 +3201,12 @@ fn a_session_can_be_held_to_some_of_its_tools() {
     &provider,
     &["--no-session", "--no-tools", "write,edit,bash"],
   );
-  // Asking is not changing anything, so a read-only session keeps it.
-  let screen = term.wait_for("Tools this session: read, ask.");
-  // And nothing about MCP in the footer of a session that has no servers.
-  assert!(!screen.contains("mcp"), "no servers, nothing said:\n{screen}");
   term.submit("what is here");
-  term.wait_for("Answer to what is here.");
+  let screen = term.wait_for("Answer to what is here.");
+  // Nothing about MCP in the footer of a session that has no servers.
+  assert!(!screen.contains("mcp"), "no servers, nothing said:\n{screen}");
 
+  // Asking is not changing anything, so a read-only session keeps it.
   let request = provider.request("what is here");
   assert!(
     request.contains(r#""name":"read""#) && request.contains(r#""name":"ask""#),

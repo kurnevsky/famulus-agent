@@ -753,13 +753,10 @@ fn pick(server: &Server, tools: Vec<rmcp::model::Tool>, taken: &[String]) -> Pic
   // and a typo in a list like this is a tool quietly left in or out.
   let offered: Vec<String> = tools.iter().map(|tool| tool.name.to_string()).collect();
   let (wanted, unknown) = crate::tools::choose(&offered, &server.tools, &server.except);
-  let tools: Vec<_> = match &wanted {
-    Some(wanted) => tools
-      .into_iter()
-      .filter(|tool| wanted.iter().any(|name| *name == tool.name))
-      .collect(),
-    None => tools,
-  };
+  let tools: Vec<_> = tools
+    .into_iter()
+    .filter(|tool| wanted.iter().any(|name| *name == tool.name))
+    .collect();
   // A tool cannot be had twice under one name: the model would have no way
   // to say which it meant, and the five the system prompt describes are the
   // ones it was told about.

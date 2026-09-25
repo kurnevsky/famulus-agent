@@ -1777,18 +1777,17 @@ mod tests {
 
   #[test]
   fn the_prompt_stops_speaking_for_a_tool_the_session_does_not_have() {
-    let rules = |allow: &[&str], deny: &[&str]| crate::tools::Rules {
-      allow: allow.iter().map(|s| s.to_string()).collect(),
-      deny: deny.iter().map(|s| s.to_string()).collect(),
+    let rules = |refused: &[&str]| crate::tools::Rules {
+      refused: refused.iter().map(|s| s.to_string()).collect(),
     };
-    let all = default_system_prompt(Path::new("/work"), &rules(&[], &[]));
+    let all = default_system_prompt(Path::new("/work"), &rules(&[]));
     for rule in ["Use read", "Use edit", "Use write", "Use ask"] {
       assert!(all.contains(rule), "{rule:?} is there by default");
     }
 
     // A model told about `bash` and then refused it tries anyway and reports
     // being refused, instead of using what it does have.
-    let reading = default_system_prompt(Path::new("/work"), &rules(&["read"], &[]));
+    let reading = default_system_prompt(Path::new("/work"), &rules(&["bash", "edit", "write", "ask"]));
     for gone in [
       "Use edit for",
       "Use write only",
@@ -1803,14 +1802,10 @@ mod tests {
     assert!(reading.contains("Use read to examine files"));
     assert!(reading.contains("<cwd>\n/work\n</cwd>"));
 
-    // A list that leaves the built-in five alone changes nothing, however
-    // many other tools it names.
-    let mut five = crate::tools::BUILT_IN.to_vec();
-    five.push("fetch");
-    assert_eq!(default_system_prompt(Path::new("/work"), &rules(&five, &[])), all);
-    assert_eq!(default_system_prompt(Path::new("/work"), &rules(&[], &["fetch"])), all);
-    // And refusing one is the same as allowing the rest.
-    let no_edit = default_system_prompt(Path::new("/work"), &rules(&[], &["edit"]));
+    // Refusing a tool the prompt does not speak for changes nothing.
+    assert_eq!(default_system_prompt(Path::new("/work"), &rules(&["fetch"])), all);
+    // And refusing one leaves the rest.
+    let no_edit = default_system_prompt(Path::new("/work"), &rules(&["edit"]));
     assert!(!no_edit.contains("edits[]"), "{no_edit}");
     assert!(no_edit.contains("Use read"), "{no_edit}");
   }

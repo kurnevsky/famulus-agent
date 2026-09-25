@@ -88,8 +88,8 @@ allows — or 2048 for a model rig does not recognise, which is when
 | `--no-bell` | `FA_NO_BELL` | | Do not ring the terminal when `ask` puts a question up |
 | `--mcp-config` | `FA_MCP_CONFIG` | XDG search path | Read MCP servers from this file instead |
 | `--no-mcp` | | | Start no MCP servers this session |
-| `--tools` | `FA_TOOLS` | all of them | Offer the model only these tools, by name |
-| `--no-tools` | `FA_NO_TOOLS` | | Keep these tools from the model, by name |
+| `--tools` | `FA_TOOLS` | all of them | Offer the model only these of fa's own tools, by name |
+| `--no-tools` | `FA_NO_TOOLS` | | Keep these of fa's own tools from the model, by name |
 
 Everything but the session flags (`-c`, `-r`, `--session`) can be kept in
 `config.toml` instead, under the flag's own name:
@@ -182,25 +182,25 @@ them, so `/model` on one of those says so without a request going out, and
 
 ## Which tools
 
-`--tools` and `--no-tools` name what the model is offered, out of the five
-built-in ones and whatever the MCP servers brought — one list, since the model
-is offered them as one:
+`--tools` and `--no-tools` name which of fa's own tools the model is offered:
+the five built-in ones, and `list_resources` and `read_resource` when a server
+has resources. What an MCP server brings is narrowed in its own table instead,
+with [`tools` and `except`](#mcp), and these two leave it alone:
 
 ```sh
 # Read-only: it can look and answer, and change nothing
 fa -m gpt-5.2 --no-tools write,edit,bash
 
-# Only these, whatever else is there
-fa -m gpt-5.2 --tools read,weather
+# Only reading, with every tool the servers brought
+fa -m gpt-5.2 --tools read
 ```
 
 An allow-list is the first word and a deny-list the last, so a tool named in
 both is refused — the narrower intent wins, which is the safe way round for a
-list whose point is usually to keep something away from the model. Saying
-nothing is everything, which is not the same as allowing everything by name: a
-tool that arrives later is kept by the one and not by the other. A name nothing
+list whose point is usually to keep something away from the model. A name nothing
 answers to is said in the transcript, since a typo in a list like this is a
-tool quietly left in or out.
+tool quietly left in or out — and so is the name of a server's tool, with where
+to narrow it instead.
 
 Tools are all registered either way; the list is what each request advertises,
 and rig refuses a call to anything left out of it. The system prompt follows:
@@ -323,8 +323,10 @@ A server is a `command` to run, spoken to over its own stdin and stdout, or a
 | `oauth` | How to sign in, for a server that cannot work that out itself — see below |
 
 `tools` and `except` are the same idea as `--tools` and `--no-tools`, for one
-server: a server with thirty tools can be cut to the two worth having without
-naming every tool of every other server.
+server's tools, which those two do not touch: a server with thirty tools can be
+cut to the two worth having without naming every tool of every other server.
+Saying nothing is everything, which is not the same as allowing everything by
+name: a tool the server offers later is kept by the one and not by the other.
 
 A token is better kept out of the file it is used from, so `env-command`,
 `token-command` and `headers-command` take the line of shell that produces the
@@ -389,8 +391,8 @@ in the system prompt, and cannot say which of two it meant.
 
 A server can say its tools have changed while the session runs
 (`notifications/tools/list_changed`), and they are asked for again and put in
-place of the ones it had — held to its `tools` and `except`, and to
-`--tools` and `--no-tools`, the way the first list was. The transcript says
+place of the ones it had — held to its `tools` and `except`, the way the first
+list was. The transcript says
 what changed — `MCP weather: now 3 tools, new: radar, tide, gone: grow` — and
 the footer counts them. The model is offered the new set from its next request
 on, even in the middle of a run. A new tool named like one already taken is
@@ -460,8 +462,8 @@ and `read_resource` asks the server, so a URI that is not listed — one a
 template makes, or one a tool's answer points at instead of carrying it — is
 still read.
 
-They are tools like any other as far as the session is concerned: `--tools`
-and `--no-tools` name them, and what they read is cut to size the way a
+They are fa's own rather than any one server's, so `--tools` and `--no-tools`
+name them rather than a server's table, and what they read is cut to size the way a
 server's own answer is. No server's tool may take either name.
 
 #### In a prompt

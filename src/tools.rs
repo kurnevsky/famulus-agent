@@ -33,55 +33,51 @@ pub const BUILT_IN: [&str; 5] = [
   AskTool::NAME,
 ];
 
-/// What a session was told about which tools to offer: `--tools` and
-/// `--no-tools`, kept as they were said rather than as the names they came
-/// to when the session started, so a tool an MCP server offers later is held
-/// to them too.
+/// Whether `name` is one of fa's own tools — the five built in, and the two
+/// that read what MCP servers hold, since those are no one server's to
+/// narrow. These are what `--tools` and `--no-tools` speak of; a server's
+/// tools are narrowed in its own table instead.
+pub fn own(name: &str) -> bool {
+  #[cfg(feature = "mcp")]
+  if crate::resources::NAMES.contains(&name) {
+    return true;
+  }
+  BUILT_IN.contains(&name)
+}
+
+/// Which of fa's own tools a session keeps from the model: what `--tools` and
+/// `--no-tools` came to as it started, which is when all of them are there.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Rules {
-  pub allow: Vec<String>,
-  pub deny: Vec<String>,
+  pub refused: Vec<String>,
 }
 
 impl Rules {
-  /// Whether `name` is offered: allowed, if there is an allow-list, and not
-  /// refused.
   pub fn permits(&self, name: &str) -> bool {
-    permitted(&self.allow, &self.deny, name)
+    !self.refused.iter().any(|n| n == name)
   }
 }
 
-/// The one rule both `Rules` and `choose` hold a name to.
-fn permitted(allow: &[String], deny: &[String], name: &str) -> bool {
-  (allow.is_empty() || allow.iter().any(|n| n == name)) && !deny.iter().any(|n| n == name)
-}
-
 /// Which of `available` to offer the model, given what was allowed and what
-/// was refused, with the names asked for that nothing answers to.
-///
-/// `None` is everything: a session that said nothing about tools is offered
-/// all of them, which is not the same as one that allowed all of them by name
-/// and would lose a tool that arrived later.
+/// was refused, with the names asked for that nothing answers to. Nothing
+/// asked for is everything offered.
 ///
 /// An allow-list is the first word and a deny-list the last, so naming a tool
 /// in both refuses it — the narrower intent wins, which is the safe way round
 /// for a list whose point is usually to keep something away from the model.
-pub fn choose(available: &[String], allow: &[String], deny: &[String]) -> (Option<Vec<String>>, Vec<String>) {
+pub fn choose(available: &[String], allow: &[String], deny: &[String]) -> (Vec<String>, Vec<String>) {
   let unknown: Vec<String> = allow
     .iter()
     .chain(deny)
     .filter(|name| !available.contains(name))
     .cloned()
     .collect();
-  if allow.is_empty() && deny.is_empty() {
-    return (None, unknown);
-  }
   let chosen = available
     .iter()
-    .filter(|name| permitted(allow, deny, name))
+    .filter(|name| (allow.is_empty() || allow.contains(name)) && !deny.contains(name))
     .cloned()
     .collect();
-  (Some(chosen), unknown)
+  (chosen, unknown)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -990,34 +986,28 @@ mod choosing_tests {
     let there = names(&["read", "write", "edit", "bash", "weather"]);
     let none: Vec<String> = Vec::new();
 
-    // Nothing asked for is everything offered, and says so as `None` rather
-    // than by listing what there happens to be today.
-    assert_eq!(choose(&there, &none, &none), (None, none.clone()));
+    // Nothing asked for is everything offered.
+    assert_eq!(choose(&there, &none, &none), (there.clone(), none.clone()));
 
     // Only these.
     let (chosen, unknown) = choose(&there, &names(&["read", "weather"]), &none);
-    assert_eq!(chosen.as_deref(), Some(&names(&["read", "weather"])[..]));
+    assert_eq!(chosen, names(&["read", "weather"]));
     assert!(unknown.is_empty());
 
     // Everything but these — which is how a session goes read-only.
     let (chosen, _) = choose(&there, &none, &names(&["write", "edit", "bash"]));
-    assert_eq!(chosen.as_deref(), Some(&names(&["read", "weather"])[..]));
+    assert_eq!(chosen, names(&["read", "weather"]));
 
     // Named in both, a tool is refused: the narrower intent wins, which is
     // the safe way round for a list meant to keep something away.
     let (chosen, _) = choose(&there, &names(&["read", "bash"]), &names(&["bash"]));
-    assert_eq!(chosen.as_deref(), Some(&names(&["read"])[..]));
-
-    // Refusing everything is a session that can only answer, not a session
-    // with no list at all.
-    let (chosen, _) = choose(&there, &none, &there);
-    assert_eq!(chosen, Some(Vec::new()));
+    assert_eq!(chosen, names(&["read"]));
 
     // A name nothing answers to is handed back, since a typo in a list like
     // this is a tool quietly left in or out.
     let (chosen, unknown) = choose(&there, &names(&["reed"]), &names(&["bahs"]));
     assert_eq!(unknown, names(&["reed", "bahs"]));
-    assert_eq!(chosen, Some(Vec::new()), "a misspelled allow-list allows nothing");
+    assert!(chosen.is_empty(), "a misspelled allow-list allows nothing");
   }
 }
 
