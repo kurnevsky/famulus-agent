@@ -543,6 +543,10 @@ while True:
             answer = "\n".join("line %d" % i for i in range(1, arguments["lines"] + 1))
         else:
             city = arguments.get("city", "nowhere")
+            # Logged as it goes, the way servers do, to a stream that is not
+            # the one it answers on.
+            sys.stderr.write("INFO: looked up the weather in %s\n" % city)
+            sys.stderr.flush()
             # Structure, as one long line — which is how a server answers.
             answer = json.dumps({"city": city, "rain": True, "hours": [1, 2]})
         result = {"content": [{"type": "text", "text": answer}], "isError": False}
@@ -2610,6 +2614,11 @@ fn a_tool_from_an_mcp_server_is_offered_called_and_drawn_like_any_other() {
   // And it reads in the transcript like any other tool: the call, then what
   // came back under it.
   let screen = term.screen();
+  // What the server logged is not written over the transcript.
+  assert!(
+    !screen.contains("looked up the weather"),
+    "the server's log on screen:\n{screen}"
+  );
   let lines: Vec<&str> = screen.lines().map(str::trim_end).filter(|l| !l.is_empty()).collect();
   let call = lines
     .iter()

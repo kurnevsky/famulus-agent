@@ -1005,10 +1005,13 @@ async fn start(name: &str, server: &Server, client: Watch, notes: &mut Vec<Strin
         let mut process = tokio::process::Command::new("bash");
         process.arg("-c").arg(command).envs(&env);
         // A server's own chatter is not this program's to print: the terminal
-        // belongs to the transcript.
-        process.stderr(std::process::Stdio::null());
-        let transport =
-          rmcp::transport::TokioChildProcess::new(process).with_context(|| format!("could not run {command}"))?;
+        // belongs to the transcript. It is the transport that sets up the
+        // child's streams, and it would hand the server the terminal unless
+        // told otherwise — whatever the command itself was told.
+        let (transport, _) = rmcp::transport::TokioChildProcess::builder(process)
+          .stderr(std::process::Stdio::null())
+          .spawn()
+          .with_context(|| format!("could not run {command}"))?;
         Ok(client.serve(transport).await?)
       })
       .await
