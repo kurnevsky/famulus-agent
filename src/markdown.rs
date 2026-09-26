@@ -9,6 +9,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 // `::markdown` is the crate; this module shares its name.
 use ::markdown::ParseOptions;
@@ -480,23 +481,164 @@ impl<'a> Refs<'a> {
 
 /// Renders a run of block nodes, blank-separated.
 fn blocks(nodes: &[Node], width: usize, refs: &Refs, out: &mut Vec<Line<'static>>) {
-  // Definitions carry no visible text of their own: footnotes are listed at
-  // the end and link labels are resolved where they are used. They must not
-  // count as siblings either, or one sitting between two paragraphs would
-  // leave its blank line behind in the body.
-  let nodes: Vec<&Node> = nodes
+  run(&shown(nodes), width, refs, out);
+}
+
+/// The blocks that are drawn where they stand. Definitions carry no visible
+/// text of their own: footnotes are listed at the end and link labels are
+/// resolved where they are used. They must not count as siblings either, or
+/// one sitting between two paragraphs would leave its blank line behind in
+/// the body.
+fn shown(nodes: &[Node]) -> Vec<&Node> {
+  nodes
     .iter()
     .filter(|node| !matches!(node, Node::FootnoteDefinition(_) | Node::Definition(_)))
-    .collect();
+    .collect()
+}
+
+fn run(nodes: &[&Node], width: usize, refs: &Refs, out: &mut Vec<Line<'static>>) {
   for (i, node) in nodes.iter().enumerate() {
     block(node, width, refs, out);
-    // A list stays tight against the paragraph that introduces it.
-    let next_is_list = matches!(nodes.get(i + 1), Some(Node::List(_)));
-    let intro = matches!(node, Node::Paragraph(_)) && next_is_list;
-    if i + 1 < nodes.len() && !intro {
+    if nodes
+      .get(i + 1)
+      .is_some_and(|next| gap(matches!(node, Node::Paragraph(_)), next))
+    {
       out.push(Line::default());
     }
   }
+}
+
+/// Whether a blank line goes above `next`: everywhere but between a list and
+/// the paragraph that introduces it, which it stays tight against.
+fn gap(after_paragraph: bool, next: &Node) -> bool {
+  !(after_paragraph && matches!(next, Node::List(_)))
+}
+
+/// A message still arriving, laid out a block at a time.
+///
+/// Once a top-level block has another after it, it is closed: nothing written
+/// later can reopen it or change what it is. So each block is parsed and laid
+/// out once, when the next one starts, and a frame costs the block still
+/// being written rather than the whole message so far. The finished message is
+/// laid out afresh by [`render`], which is what reads it as the spec does.
+#[derive(Default)]
+pub struct Stream {
+  width: usize,
+  /// How much of the text is laid out for good, always the start of a line.
+  settled: usize,
+  /// Of the text up to `settled`, to tell a message carried on from another.
+  digest: u64,
+  /// The blocks laid out for good, shared with whoever draws them: a frame
+  /// hands them on rather than copying them out.
+  lines: Arc<Vec<Line<'static>>>,
+  /// Whether the last block laid out is a paragraph, or `None` before there
+  /// is one: the blank line under it depends on what comes next.
+  paragraph: Option<bool>,
+}
+
+impl Stream {
+  /// What [`render`] makes of `md` mid-stream: the blocks already laid out,
+  /// and then the rest, which is the block still being written.
+  pub fn render(&mut self, md: &str, width: u16) -> (Arc<Vec<Line<'static>>>, Vec<Line<'static>>) {
+    // A link's label, or a footnote's number, can be settled by text that has
+    // not arrived yet; a message that has either is read whole every time.
+    if references(md) {
+      return (Arc::default(), render(md, width, true));
+    }
+    let width_ = (width as usize).max(1);
+    let same = md.get(..self.settled).is_some_and(|done| digest(done) == self.digest);
+    if self.width != width_ || !same {
+      *self = Stream {
+        width: width_,
+        ..Stream::default()
+      };
+    }
+    let tail = &md[self.settled..];
+    let stitched = stitch(tail, &StitchOptions::default());
+    let Ok(root) = ::markdown::to_mdast(&stitched, &ParseOptions::gfm()) else {
+      return (Arc::default(), render(md, width, true));
+    };
+    let mut nodes = shown(children(&root));
+    // Everything before the last block is closed. Where it ends is the start
+    // of the last block's line, which is the same in the stitched text as in
+    // the one that arrived as long as stitching left it alone.
+    if let [_, .., last] = nodes[..]
+      && !unfinished_marker(last, &stitched)
+      && let Some(start) = last.position().map(|at| at.start.offset)
+    {
+      let cut = stitched[..start].rfind('\n').map_or(0, |at| at + 1);
+      if cut > 0 && tail.as_bytes().get(..cut) == Some(&stitched.as_bytes()[..cut]) {
+        self.settle(&tail[..cut]);
+        self.settled += cut;
+        self.digest = digest(&md[..self.settled]);
+        nodes = vec![last];
+      }
+    }
+    let refs = Refs::collect(&root);
+    let mut rest = Vec::new();
+    if let (Some(paragraph), Some(first)) = (self.paragraph, nodes.first())
+      && gap(paragraph, first)
+    {
+      rest.push(Line::default());
+    }
+    run(&nodes, self.width, &refs, &mut rest);
+    trim_blank(&mut rest);
+    (Arc::clone(&self.lines), rest)
+  }
+
+  /// Lays out `text`, which holds only closed blocks, after the ones before it.
+  fn settle(&mut self, text: &str) {
+    // Copied only if the last frame's rows still hold them, and then once a
+    // block rather than once a frame.
+    let lines = Arc::make_mut(&mut self.lines);
+    // Parsed as written, without stitching: nothing in it is unfinished, and
+    // it is then laid out just as the finished message will be.
+    let Ok(root) = ::markdown::to_mdast(text, &ParseOptions::gfm()) else {
+      lines.extend(text.lines().map(|l| Line::raw(expand_tabs(l))));
+      self.paragraph = Some(false);
+      return;
+    };
+    let nodes = shown(children(&root));
+    let (Some(first), Some(last)) = (nodes.first(), nodes.last()) else {
+      return;
+    };
+    if self.paragraph.is_some_and(|paragraph| gap(paragraph, first)) {
+      lines.push(Line::default());
+    }
+    // Handed on as rows, so wrapped here the way the transcript wraps
+    // everything else — once, as they are laid out.
+    let mut laid = Vec::new();
+    run(&nodes, self.width, &Refs::collect(&root), &mut laid);
+    lines.extend(laid.into_iter().flat_map(|line| fold(line, self.width)));
+    self.paragraph = Some(matches!(last, Node::Paragraph(_)));
+  }
+}
+
+/// Whether `md` defines a link label or mentions a footnote, either of which
+/// changes how text far from it is read.
+fn references(md: &str) -> bool {
+  md.contains("[^")
+    || md.lines().any(|line| {
+      let line = line.trim_start();
+      line.starts_with('[') && line.contains("]:")
+    })
+}
+
+/// A paragraph that is nothing but a number, which is an ordered list's next
+/// marker cut off before its `.` — and would carry on the list above it.
+fn unfinished_marker(node: &Node, text: &str) -> bool {
+  let Some(at) = node.position().filter(|_| matches!(node, Node::Paragraph(_))) else {
+    return false;
+  };
+  let line = text[at.start.offset..].lines().next().unwrap_or_default().trim_end();
+  (1..=9).contains(&line.len()) && line.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn digest(text: &str) -> u64 {
+  use std::hash::{DefaultHasher, Hash, Hasher};
+  let mut hasher = DefaultHasher::new();
+  text.hash(&mut hasher);
+  hasher.finish()
 }
 
 fn block(node: &Node, width: usize, refs: &Refs, out: &mut Vec<Line<'static>>) {
@@ -1346,5 +1488,62 @@ mod tests {
       printable("\u{1f468}\u{200d}\u{1f4bb}\u{ad}"),
       "\u{1f468}\u{200d}\u{1f4bb}"
     );
+  }
+
+  /// All of what a stream shows of `md`, settled and not.
+  fn whole(stream: &mut Stream, md: &str, width: u16) -> Vec<Line<'static>> {
+    let (settled, rest) = stream.render(md, width);
+    settled.iter().cloned().chain(rest).collect()
+  }
+
+  /// Every prefix of `md` a character at a time, as a stream would show it.
+  fn streamed(md: &str, width: u16) -> Vec<(usize, Vec<Line<'static>>, Vec<Line<'static>>)> {
+    let mut stream = Stream::default();
+    md.char_indices()
+      .map(|(at, c)| at + c.len_utf8())
+      .map(|end| {
+        (
+          end,
+          whole(&mut stream, &md[..end], width),
+          render(&md[..end], width, true),
+        )
+      })
+      .collect()
+  }
+
+  #[test]
+  fn a_message_laid_out_as_it_arrives_matches_one_laid_out_at_once() {
+    let md = "# Title\n\nSome text that wraps around.\nIntro:\n- one\n- two\n\n\
+              1. first\n2. second\n\n```rust\nfn main() {}\n```\n\n> quoted\n\n\
+              | a | b |\n|---|---|\n| 1 | 2 |\n\n---\n\nThe end.\n";
+    for (end, got, want) in streamed(md, 20) {
+      assert_eq!(plain(&got), plain(&want), "after {:?}", &md[..end]);
+    }
+    let mut stream = Stream::default();
+    stream.render(md, 20);
+    assert!(stream.settled > 0, "nothing was laid out for good");
+  }
+
+  #[test]
+  fn a_number_that_may_be_the_next_marker_holds_the_list_open() {
+    let mut stream = Stream::default();
+    stream.render("1. a\n\n2", 20);
+    assert_eq!(plain(&whole(&mut stream, "1. a\n\n2. b", 20)), ["1. a", "2. b"]);
+  }
+
+  #[test]
+  fn a_message_is_laid_out_again_at_a_new_width() {
+    let md = "alpha beta gamma\n\ndelta epsilon\n\nzeta";
+    let mut stream = Stream::default();
+    stream.render(md, 80);
+    assert_eq!(plain(&whole(&mut stream, md, 6)), plain(&render(md, 6, true)));
+  }
+
+  #[test]
+  fn a_footnote_is_numbered_from_the_whole_message() {
+    let md = "a[^x]\n\nb\n\n[^x]: note";
+    for (end, got, want) in streamed(md, 20) {
+      assert_eq!(plain(&got), plain(&want), "after {:?}", &md[..end]);
+    }
   }
 }

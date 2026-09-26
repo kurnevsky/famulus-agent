@@ -11,10 +11,18 @@
 //! left unstyled rather than given a colour of their own — the code's default
 //! foreground is the one colour guaranteed to be readable.
 
+use std::sync::Arc;
+
 use ratatui::text::Span;
 
 #[cfg(feature = "syntax")]
-use std::sync::OnceLock;
+use std::collections::HashMap;
+#[cfg(feature = "syntax")]
+use std::hash::{DefaultHasher, Hash, Hasher};
+#[cfg(feature = "syntax")]
+use std::sync::{LazyLock, Mutex, OnceLock};
+#[cfg(feature = "syntax")]
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "syntax")]
 use ratatui::style::{Color, Modifier, Style};
@@ -153,11 +161,281 @@ const SQL_NUMBERS: &str = r#"
 /// code mid-stream parses into error nodes and still highlights whatever it
 /// could make sense of.
 #[cfg(feature = "syntax")]
-pub fn highlight(lang: &str, source: &str) -> Option<Vec<Vec<Span<'static>>>> {
+pub fn highlight(lang: &str, source: &str) -> Option<Highlighted> {
   if source.len() > MAX_SOURCE {
     return None;
   }
-  let config = grammar(&lang.trim().to_lowercase())?;
+  let lang = lang.trim().to_lowercase();
+  let config = grammar(&lang)?;
+  memoized(&lang, source, || match source.len() < CHUNK {
+    true => parse(config, source).map(Highlighted::whole),
+    false => pieces(&lang, config, source),
+  })
+}
+
+/// What [`highlight`] made of a source: the spans of each of its lines.
+///
+/// Held as the pieces it was highlighted in, each shared with the memo, so
+/// that asking again for a block already on the screen copies none of it.
+#[derive(Clone, Debug)]
+pub struct Highlighted {
+  /// Each piece's first line, its lines, and how many of them are its own:
+  /// a piece that ends in a newline leaves the empty line after it to the
+  /// next.
+  pieces: Vec<(usize, Arc<Lines>, usize)>,
+}
+
+type Lines = Vec<Vec<Span<'static>>>;
+
+impl Highlighted {
+  #[cfg(feature = "syntax")]
+  fn whole(lines: Lines) -> Self {
+    let count = lines.len();
+    Highlighted {
+      pieces: vec![(0, Arc::new(lines), count)],
+    }
+  }
+
+  /// The spans of line `line`, counted as `source.split('\n')` counts them.
+  pub fn get(&self, line: usize) -> Option<&Vec<Span<'static>>> {
+    let at = self
+      .pieces
+      .partition_point(|(first, ..)| *first <= line)
+      .checked_sub(1)?;
+    let (first, lines, count) = &self.pieces[at];
+    lines.get(line - first).filter(|_| line - first < *count)
+  }
+
+  #[cfg(all(test, feature = "syntax"))]
+  pub fn iter(&self) -> impl Iterator<Item = &Vec<Span<'static>>> {
+    self
+      .pieces
+      .iter()
+      .flat_map(|(_, lines, count)| lines.iter().take(*count))
+  }
+}
+
+/// Code shorter than this is highlighted in one go; anything longer a few
+/// of its top-level items at a time.
+#[cfg(feature = "syntax")]
+const CHUNK: usize = 4 * 1024;
+
+/// Highlights `source` in pieces cut between its top-level items, each piece
+/// on its own, and puts the lines back together.
+///
+/// A file arriving from the model grows at its end, so every piece but the
+/// last is one the memo already holds, and what is parsed again is only the
+/// item still being written rather than the whole file from its start. Once
+/// an item is followed by another nothing after it changes how it reads —
+/// except a name bound in one item and used in the next, which the grammars
+/// that track scopes then colour as any other name.
+#[cfg(feature = "syntax")]
+fn pieces(lang: &str, config: &HighlightConfiguration, source: &str) -> Option<Highlighted> {
+  let cuts = cuts(&tree(lang, config, source)?, source);
+  let mut pieces = Vec::with_capacity(cuts.len() + 1);
+  let (mut from, mut line) = (0, 0);
+  for cut in cuts.into_iter().chain([source.len()]) {
+    let piece = &source[from..cut];
+    let part = memoized(lang, piece, || parse(config, piece).map(Highlighted::whole))?;
+    let (_, lines, mut count) = part.pieces.into_iter().next()?;
+    // A piece ends with the newline before the next, and the empty line after
+    // that newline is where the next piece's first line goes.
+    if cut < source.len() {
+      count -= 1;
+    }
+    pieces.push((line, lines, count));
+    line += count;
+    from = cut;
+  }
+  Some(Highlighted { pieces })
+}
+
+/// Where `source` can be cut into pieces of at least [`CHUNK`]: at the start
+/// of a line, between two top-level items, with nothing broken before it.
+///
+/// Only between top-level items: a piece is highlighted on its own, and
+/// inside an item what a node is coloured as can depend on what encloses it.
+/// Worked out the same way from the start every time, so the pieces of a
+/// file that has only grown are the pieces it had before.
+#[cfg(feature = "syntax")]
+fn cuts(tree: &tree_sitter::Tree, source: &str) -> Vec<usize> {
+  let root = tree.root_node();
+  let mut cursor = root.walk();
+  let items: Vec<tree_sitter::Node> = root.children(&mut cursor).collect();
+  let mut cuts = Vec::new();
+  let mut from = 0;
+  for pair in items.windows(2) {
+    let (item, next) = (pair[0], pair[1]);
+    // An item the parser could not make sense of may yet turn out to be the
+    // start of something bigger, and so may everything after it.
+    if item.has_error() {
+      break;
+    }
+    let end = item.end_byte();
+    let cut = match source[..end].ends_with('\n') {
+      true => end,
+      false => match source[end..].find('\n') {
+        Some(newline) => end + newline + 1,
+        None => break,
+      },
+    };
+    if next.start_byte() >= cut && cut - from >= CHUNK {
+      cuts.push(cut);
+      from = cut;
+    }
+  }
+  cuts
+}
+
+/// A source parsed lately, kept so the same source grown longer is parsed
+/// again only where it grew.
+#[cfg(feature = "syntax")]
+struct Parsed {
+  lang: String,
+  source: String,
+  tree: tree_sitter::Tree,
+  /// When the source last grew, or was first parsed.
+  grown: Instant,
+}
+
+/// How long a source may go without growing before its tree is let go.
+///
+/// A finished block is asked for every frame just as one still being
+/// written is, so being asked for says nothing; growing is what only a live
+/// one does. A stream that stalls for longer is parsed once more from its
+/// start when it carries on.
+#[cfg(feature = "syntax")]
+const GROWING: Duration = Duration::from_secs(5);
+
+/// As many sources as are ever growing at once, and a few to spare.
+#[cfg(feature = "syntax")]
+const PARSED: usize = 4;
+
+#[cfg(feature = "syntax")]
+static TREES: Mutex<Vec<Parsed>> = Mutex::new(Vec::new());
+
+/// The syntax tree of `source`, built on the tree of the longest source seen
+/// lately that it carries on from, if there is one.
+#[cfg(feature = "syntax")]
+fn tree(lang: &str, config: &HighlightConfiguration, source: &str) -> Option<tree_sitter::Tree> {
+  let mut trees = TREES.lock().expect("trees nobody panicked holding");
+  let before = trees
+    .iter()
+    .enumerate()
+    .filter(|(_, parsed)| parsed.lang == lang && source.starts_with(&parsed.source))
+    .max_by_key(|(_, parsed)| parsed.source.len())
+    .map(|(at, _)| at);
+  let before = before.map(|at| trees.remove(at));
+  let mut parser = tree_sitter::Parser::new();
+  parser.set_language(&config.language).ok()?;
+  let mut grown = Instant::now();
+  let tree = match before {
+    Some(before) if before.source.len() == source.len() => {
+      grown = before.grown;
+      before.tree
+    }
+    Some(mut before) => {
+      let (old, new) = (end_of(&before.source), end_of(source));
+      before.tree.edit(&tree_sitter::InputEdit {
+        start_byte: before.source.len(),
+        old_end_byte: before.source.len(),
+        new_end_byte: source.len(),
+        start_position: old,
+        old_end_position: old,
+        new_end_position: new,
+      });
+      parser.parse(source, Some(&before.tree))?
+    }
+    None => parser.parse(source, None)?,
+  };
+  trees.insert(
+    0,
+    Parsed {
+      lang: lang.to_string(),
+      source: source.to_string(),
+      tree: tree.clone(),
+      grown,
+    },
+  );
+  trees.truncate(PARSED);
+  Some(tree)
+}
+
+/// Where `text` ends, as a row and a byte column.
+#[cfg(feature = "syntax")]
+fn end_of(text: &str) -> tree_sitter::Point {
+  let row = text.bytes().filter(|&b| b == b'\n').count();
+  let column = text.len() - text.rfind('\n').map_or(0, |at| at + 1);
+  tree_sitter::Point { row, column }
+}
+
+#[cfg(feature = "syntax")]
+type Found = Option<Highlighted>;
+
+/// What `work` makes of `source`, from the memo when it holds it. The memo is
+/// not held while working, since highlighting in pieces comes back to it.
+#[cfg(feature = "syntax")]
+fn memoized(lang: &str, source: &str, work: impl FnOnce() -> Found) -> Found {
+  let mut hasher = DefaultHasher::new();
+  (lang, source).hash(&mut hasher);
+  let key = hasher.finish();
+  {
+    let mut memo = MEMO.lock().expect("a memo nobody panicked holding");
+    if let Some(found) = memo.fresh.get(&key) {
+      return found.clone();
+    }
+    if let Some(found) = memo.stale.remove(&key) {
+      memo.fresh.insert(key, found.clone());
+      return found;
+    }
+  }
+  let found = work();
+  MEMO
+    .lock()
+    .expect("a memo nobody panicked holding")
+    .fresh
+    .insert(key, found.clone());
+  found
+}
+
+/// What was highlighted since the last [`sweep`], and what was before it.
+#[cfg(feature = "syntax")]
+struct Memo {
+  fresh: HashMap<u64, Found>,
+  stale: HashMap<u64, Found>,
+}
+
+/// Every frame asks for the same blocks again — a file a write put down, the
+/// two sides of a diff, the code in a finished paragraph of a message still
+/// arriving — and parsing a long one takes longer than a frame has. So each
+/// answer is kept for as long as it keeps being asked for.
+#[cfg(feature = "syntax")]
+static MEMO: LazyLock<Mutex<Memo>> = LazyLock::new(|| {
+  Mutex::new(Memo {
+    fresh: HashMap::new(),
+    stale: HashMap::new(),
+  })
+});
+
+/// Forgets whatever was not asked for since the last sweep, and the trees of
+/// sources that have stopped growing. Called once a frame, so what is kept is
+/// what is on its way to the screen, and a block that is still being written
+/// leaves only its latest version behind.
+#[cfg(feature = "syntax")]
+pub fn sweep() {
+  let mut memo = MEMO.lock().expect("a memo nobody panicked holding");
+  memo.stale = std::mem::take(&mut memo.fresh);
+  TREES
+    .lock()
+    .expect("trees nobody panicked holding")
+    .retain(|parsed| parsed.grown.elapsed() < GROWING);
+}
+
+#[cfg(not(feature = "syntax"))]
+pub fn sweep() {}
+
+#[cfg(feature = "syntax")]
+fn parse(config: &HighlightConfiguration, source: &str) -> Option<Lines> {
   let mut highlighter = Highlighter::new();
   // The same lookup answers the injection callback, so a nested grammar is
   // found exactly when its own feature is on.
@@ -196,7 +474,7 @@ pub fn highlight(lang: &str, source: &str) -> Option<Vec<Vec<Span<'static>>>> {
 }
 
 #[cfg(not(feature = "syntax"))]
-pub fn highlight(_lang: &str, _source: &str) -> Option<Vec<Vec<Span<'static>>>> {
+pub fn highlight(_lang: &str, _source: &str) -> Option<Highlighted> {
   None
 }
 
@@ -568,7 +846,7 @@ mod tests {
   }
 
   /// The style the first span whose text is `needle` was given.
-  fn style_of(lines: &[Vec<Span<'static>>], needle: &str) -> Option<Style> {
+  fn style_of(lines: &Highlighted, needle: &str) -> Option<Style> {
     lines
       .iter()
       .flatten()
@@ -632,8 +910,8 @@ mod tests {
   #[cfg(feature = "lang-rust")]
   fn an_alias_finds_the_same_grammar() {
     assert_eq!(
-      highlight("rs", "fn f() {}").map(|l| l.len()),
-      highlight("RUST", "fn f() {}").map(|l| l.len())
+      highlight("rs", "fn f() {}").map(|l| l.iter().count()),
+      highlight("RUST", "fn f() {}").map(|l| l.iter().count())
     );
   }
 
@@ -793,5 +1071,33 @@ mod tests {
     // The `<script>` body is JavaScript, reached through the injection query.
     let lines = highlight("html", "<script>let x = 1;</script>").unwrap();
     assert_eq!(style_of(&lines, "let").unwrap().fg, Some(Color::Magenta));
+  }
+
+  /// Enough small functions to be cut into several pieces.
+  fn long_source() -> String {
+    (0..300)
+      .map(|i| format!("/// Number {i}.\nfn f{i}(x: u32) -> u32 {{\n  x + {i} // \"{i}\"\n}}\n\n"))
+      .collect()
+  }
+
+  #[test]
+  fn a_long_source_is_highlighted_in_pieces_as_it_would_be_whole() {
+    let source = long_source();
+    let config = grammar("rust").unwrap();
+    assert!(cuts(&tree("rust", config, &source).unwrap(), &source).len() > 1);
+    let pieced: Vec<_> = pieces("rust", config, &source).unwrap().iter().cloned().collect();
+    assert_eq!(pieced, parse(config, &source).unwrap());
+  }
+
+  #[test]
+  fn a_source_that_grows_is_highlighted_as_it_would_be_from_scratch() {
+    let source = long_source();
+    let config = grammar("rust").unwrap();
+    let ends: Vec<usize> = (1..).map(|i| i * 97).take_while(|&end| end < source.len()).collect();
+    for end in ends.into_iter().chain([source.len()]) {
+      sweep();
+      let grown: Vec<_> = highlight("rust", &source[..end]).unwrap().iter().cloned().collect();
+      assert_eq!(grown, parse(config, &source[..end]).unwrap(), "at {end}");
+    }
   }
 }

@@ -5,6 +5,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -51,11 +52,8 @@ const IMAGE_LINES: usize = 16;
 const IMAGE_MAX_LINES: u16 = 80;
 /// Reasoning text is indented under its `· thinking…` header.
 const REASONING_INDENT: &str = "  ";
-/// Cache tags, so two entry kinds holding the same text stay apart.
-const ASSISTANT_KIND: u8 = 0;
-const REASONING_KIND: u8 = 1;
+/// Cache tag for a drawn picture.
 const IMAGE_KIND: u8 = 2;
-const SUMMARY_KIND: u8 = 3;
 /// Transcript lines moved per mouse wheel notch.
 const WHEEL_LINES: usize = 3;
 /// How long the `auto` scrollbar stays visible after the last scroll.
@@ -67,6 +65,8 @@ const TOAST_PER_CHAR: Duration = Duration::from_millis(40);
 const TOAST_MAX_DELAY: Duration = Duration::from_millis(5000);
 /// How close together two `Esc` presses count as one double press, as in pi.
 const DOUBLE_ESC: Duration = Duration::from_millis(500);
+/// The shortest time between two frames drawn for what the model sent.
+const FRAME: Duration = Duration::from_millis(33);
 /// What a tool call the user stopped is answered with, so the model knows it
 /// did not simply go unheard.
 /// Rows an overlay list moves per `PageUp`/`PageDown`.
@@ -436,6 +436,7 @@ struct Writing {
   args: String,
 }
 
+#[derive(Hash)]
 enum Entry {
   User {
     text: String,
@@ -664,7 +665,7 @@ pub struct App {
   /// The transcript as the last draw wrapped it, one line per row on screen.
   /// What is on screen is a window onto this, and what the mouse points at is
   /// a cell of it.
-  rendered: Vec<Line<'static>>,
+  rendered: Rows,
   /// Where the last draw put that window, for the mouse to be mapped back
   /// into the text under it.
   content: Rect,
@@ -678,10 +679,17 @@ pub struct App {
   tools_fold: Fold,
   /// How much of a context summary to show, cycled by Ctrl+S.
   summary_fold: Fold,
-  /// Rendered markdown, keyed by message text and width rather than by entry,
-  /// so reloading a session or compacting cannot serve another entry's lines.
+  /// Drawn pictures, keyed by their bytes and width rather than by entry, so
+  /// reloading a session or compacting cannot serve another entry's lines.
   /// Rebuilt each draw by moving live entries across, which evicts the rest.
-  markdown: RenderCache,
+  /// Kept apart from `drawn`: a fold that draws an entry again does not
+  /// scale its pictures again.
+  pictures: RenderCache,
+  /// The rows each entry was drawn as, by [`App::block_key`]. Rebuilt each
+  /// draw the way `pictures` is.
+  drawn: HashMap<u64, Drawn>,
+  /// The message still arriving, laid out so far.
+  stream: crate::markdown::Stream,
   usage: Usage,
   /// Size of the last completion request, for the footer. `None` until a
   /// call has come back, and again after a compaction: what that call was
@@ -755,13 +763,15 @@ impl App {
       thumb: None,
       dragging: None,
       starts: Vec::new(),
-      rendered: Vec::new(),
+      rendered: Rows::default(),
       content: Rect::ZERO,
       selection: None,
       thinking_fold: Fold::Preview,
       tools_fold: Fold::Preview,
       summary_fold: Fold::Preview,
-      markdown: HashMap::new(),
+      pictures: HashMap::new(),
+      drawn: HashMap::new(),
+      stream: crate::markdown::Stream::default(),
       usage: Usage::new(),
       context_tokens: None,
       tick: 0,
@@ -806,26 +816,42 @@ impl App {
     // spinner races through it before settling into its real cadence.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // A model streams far more often than anyone can read, and each frame
+    // lays the whole transcript out again, so what it sends is drawn at most
+    // once a `FRAME`. A key is drawn the moment it is pressed: that is the
+    // one change somebody is waiting to see.
+    let mut changed = true;
+    let mut drawn: Option<Instant> = None;
     loop {
-      terminal.draw(|f| {
-        self.draw(f);
-        crate::cells::guard(f.buffer_mut());
-      })?;
+      let due = drawn.map_or_else(Instant::now, |at| at + FRAME);
+      if changed && Instant::now() >= due {
+        terminal.draw(|f| {
+          self.draw(f);
+          crate::cells::guard(f.buffer_mut());
+        })?;
+        drawn = Some(Instant::now());
+        changed = false;
+      }
       tokio::select! {
           Some(ev) = input_rx.recv() => {
               self.handle_terminal(ev);
               while let Ok(ev) = input_rx.try_recv() {
                   self.handle_terminal(ev);
               }
+              changed = true;
+              drawn = None;
           }
           Some(ev) = rx.recv() => {
               self.handle_agent(ev);
               while let Ok(ev) = rx.try_recv() {
                   self.handle_agent(ev);
               }
+              changed = true;
           }
+          _ = tokio::time::sleep_until(due.into()), if changed => {}
           _ = ticker.tick(), if self.run.is_some() || self.scrollbar_fading() || self.toast.is_some() => {
               self.tick = self.tick.wrapping_add(1);
+              changed = true;
           }
       }
       if self.quit {
@@ -1693,7 +1719,7 @@ impl App {
 
   /// What a selection covers, as the text it is drawn from.
   fn selected_text(&self, selection: Selection) -> String {
-    copied(&self.rendered, selection)
+    copied(self.rendered.starting_at(0), selection)
   }
 
   /// A left press on the scrollbar. On the thumb it takes hold of it; on the
@@ -2684,8 +2710,8 @@ impl App {
     // Wrapped here rather than by the `Paragraph`, which wraps as it draws
     // and keeps where each line landed to itself: a row on screen is a line
     // of this list, which is what lets the mouse be told what it points at.
-    let lines = self.transcript_lines(content_area.width);
-    let total = lines.len();
+    let rows = self.transcript_lines(content_area.width);
+    let total = rows.len();
     let viewport = content_area.height as usize;
     let max_scroll = total.saturating_sub(viewport);
     if self.anchor.is_some_and(|a| a >= max_scroll) {
@@ -2693,18 +2719,17 @@ impl App {
     }
     let offset = self.anchor.unwrap_or(max_scroll);
     self.view = (offset, max_scroll);
-    let visible: Vec<Line<'static>> = lines
-      .iter()
-      .enumerate()
-      .skip(offset)
+    let visible: Vec<Line<'static>> = rows
+      .starting_at(offset)
       .take(viewport)
-      .map(|(at, line)| match self.selection.and_then(|s| s.columns(at)) {
+      .zip(offset..)
+      .map(|(line, at)| match self.selection.and_then(|s| s.columns(at)) {
         Some((from, to)) => highlight(line, from, to),
         None => line.clone(),
       })
       .collect();
     f.render_widget(Paragraph::new(visible), content_area);
-    self.rendered = lines;
+    self.rendered = rows;
     self.content = content_area;
     let overflows = total > viewport;
     let show_scrollbar = match self.scrollbar {
@@ -3023,21 +3048,65 @@ impl App {
   ///
   /// Assistant text is the only markdown here: tool output, diffs and
   /// reasoning are literal, and parsing them as markdown would mangle them.
-  fn transcript_lines(&mut self, width: u16) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line<'static>> = Vec::new();
+  fn transcript_lines(&mut self, width: u16) -> Rows {
     let dim = Style::default().add_modifier(Modifier::DIM);
     // Thinking is grey and italic rather than dimmed: grey on top of dim
     // reads as noise on terminals that render faint text very faint. Bright
     // black is the palette's own grey, so it tracks the terminal's theme.
     let thinking = Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
-    let mut cached = std::mem::take(&mut self.markdown);
-    let mut live = HashMap::with_capacity(cached.len());
+    let mut cached = std::mem::take(&mut self.pictures);
+    let mut kept = HashMap::with_capacity(cached.len());
+    let mut drawn = std::mem::take(&mut self.drawn);
+    let mut redrawn: HashMap<u64, Drawn> = HashMap::with_capacity(drawn.len());
+    crate::highlight::sweep();
     // Only the last entry can still be growing, and only while a turn is in
     // flight. Everything else is final, and is parsed as written.
     let streaming = self.run.is_some().then(|| self.entries.len().saturating_sub(1));
+    let mut rows = Rows::default();
     let mut starts = Vec::with_capacity(self.entries.len());
+    // The call each result answers, as far down the transcript as it has got.
+    let mut calls: HashMap<&str, &Entry> = HashMap::new();
     for (at, entry) in self.entries.iter().enumerate() {
-      starts.push(lines.len());
+      starts.push(rows.len());
+      if let Entry::ToolCall { call, .. } = entry {
+        calls.insert(call, entry);
+      }
+      // The message still arriving: what of it is laid out for good is handed
+      // on as the stream holds it, and only the block being written is new.
+      if let (true, Entry::Assistant(text)) = (streaming == Some(at), entry) {
+        let (settled, rest) = self.stream.render(text, width);
+        rows.push(Arc::new(vec![Line::default()]));
+        rows.push(settled);
+        rows.push(Arc::new(wrapped(rest, width)));
+        continue;
+      }
+      // An entry that has not changed since the last frame, at the same width
+      // and folded the same way, is the rows it was drawn as then — along with
+      // whatever pictures they were drawn from, which are still wanted for the
+      // next time they are not.
+      //
+      // Looked for among this frame's too, since two entries can say the same.
+      let key = (streaming != Some(at))
+        .then(|| self.block_key(entry, &calls, width))
+        .flatten();
+      if let Some(key) = key {
+        if let Some(block) = redrawn.get(&key) {
+          rows.push(Arc::clone(&block.rows));
+          continue;
+        }
+        if let Some(block) = drawn.remove(&key) {
+          for used in &block.uses {
+            if let Some(value) = cached.remove(used) {
+              kept.insert(*used, value);
+            }
+          }
+          rows.push(Arc::clone(&block.rows));
+          redrawn.insert(key, block);
+          continue;
+        }
+      }
+      let mut lines = Vec::new();
+      let mut live = RenderCache::new();
       match entry {
         Entry::User { text, images } => {
           lines.push(Line::default());
@@ -3065,19 +3134,7 @@ impl App {
         }
         Entry::Assistant(text) => {
           lines.push(Line::default());
-          // Only the streaming entry changes between frames; the rest come
-          // back from the cache untouched, so a long transcript costs one
-          // parse per message rather than one per draw. `streaming` is part
-          // of the key so the completed text is not served its mid-stream
-          // rendering, which closes tokens this one should leave literal.
-          let streaming = streaming == Some(at);
-          let key = (hash(ASSISTANT_KIND, text), width, streaming);
-          let rendered = match cached.remove(&key) {
-            Some(rendered) => rendered,
-            None => crate::markdown::render(text, width, streaming),
-          };
-          lines.extend(rendered.iter().cloned());
-          live.insert(key, rendered);
+          lines.extend(crate::markdown::render(text, width, false));
         }
         Entry::Reasoning(text) => {
           lines.push(Line::default());
@@ -3085,11 +3142,7 @@ impl App {
           // them: a reasoning summary arrives as one long paragraph, which
           // would otherwise count as a single line and never collapse.
           let body = width.saturating_sub(REASONING_INDENT.len() as u16);
-          let key = (hash(REASONING_KIND, text), body, false);
-          let wrapped = match cached.remove(&key) {
-            Some(wrapped) => wrapped,
-            None => crate::markdown::wrap_text(text, body, thinking),
-          };
+          let wrapped = crate::markdown::wrap_text(text, body, thinking);
           let hidden = self.thinking_fold.hidden(wrapped.len(), REASONING_LINES);
           // Collapsed, the header stands for the whole block and says nothing
           // about its size.
@@ -3099,10 +3152,9 @@ impl App {
             (_, n) => format!("· thinking… ({n} earlier lines hidden)"),
           };
           lines.push(Line::styled(header, thinking));
-          for line in &wrapped[hidden..] {
-            lines.push(prefix(REASONING_INDENT, line.clone()));
+          for line in wrapped.into_iter().skip(hidden) {
+            lines.push(prefix(REASONING_INDENT, line));
           }
-          live.insert(key, wrapped);
         }
         Entry::ToolCall { name, summary, .. } => {
           lines.push(Line::default());
@@ -3217,15 +3269,12 @@ impl App {
           // Counted in lines as drawn, as a reasoning block is, so a long
           // paragraph cannot slip past the fold as one line.
           let body = width.saturating_sub(2);
-          let key = (hash(SUMMARY_KIND, text), body, false);
-          let wrapped = match cached.remove(&key) {
-            Some(wrapped) => wrapped,
-            None => crate::markdown::wrap_text(text, body, dim),
-          };
+          let wrapped = crate::markdown::wrap_text(text, body, dim);
           // The summary opens with the goal, so a preview keeps its start.
           let hidden = self.summary_fold.hidden(wrapped.len(), SUMMARY_LINES);
-          for line in &wrapped[..wrapped.len() - hidden] {
-            lines.push(prefix("  ", line.clone()));
+          let shown = wrapped.len() - hidden;
+          for line in wrapped.into_iter().take(shown) {
+            lines.push(prefix("  ", line));
           }
           if hidden > 0 && self.summary_fold == Fold::Preview {
             let note = match hidden {
@@ -3234,12 +3283,22 @@ impl App {
             };
             lines.push(Line::styled(note, mark_style(None)));
           }
-          live.insert(key, wrapped);
         }
+      }
+      let block = Drawn {
+        rows: Arc::new(wrapped(lines, width)),
+        uses: live.keys().copied().collect(),
+      };
+      kept.extend(live);
+      rows.push(block.rows.clone());
+      if let Some(key) = key {
+        redrawn.insert(key, block);
       }
     }
     // Calls the model is still writing, drawn like the entry each will
-    // become so that nothing moves when it does.
+    // become so that nothing moves when it does. Along with anything queued,
+    // they are drawn afresh every frame, as the block after the last entry.
+    let mut lines = Vec::new();
     for writing in &self.writing {
       lines.push(Line::default());
       let summary = writing_summary(&writing.name, &writing.args);
@@ -3308,14 +3367,84 @@ impl App {
       }
     }
     self.starts = starts;
-    self.markdown = live;
-    // Every entry that renders itself has already wrapped to the width; this
-    // is for the ones shown as they were written — a prompt, an error, a
-    // block unfolded — and it is what makes the list a list of rows.
-    lines
-      .into_iter()
-      .flat_map(|line| crate::markdown::wrap_line(line, width))
-      .collect()
+    rows.push(Arc::new(wrapped(lines, width)));
+    self.pictures = kept;
+    self.drawn = redrawn;
+    rows
+  }
+
+  /// What the rows `entry` is drawn as depend on, which is the entry itself,
+  /// the width, and whichever fold it answers to — or `None` for a result
+  /// still running, whose clock is counting on every frame.
+  fn block_key(&self, entry: &Entry, calls: &HashMap<&str, &Entry>, width: u16) -> Option<u64> {
+    let mut hasher = DefaultHasher::new();
+    (entry, width).hash(&mut hasher);
+    match entry {
+      Entry::ToolResult { running: true, .. } => return None,
+      // A result is drawn from its call as well: the file a write put down,
+      // the path an edit's diff is highlighted by.
+      Entry::ToolResult { call, .. } => (self.tools_fold, calls.get(call.as_str())).hash(&mut hasher),
+      Entry::User { .. } | Entry::ToolCall { .. } => self.tools_fold.hash(&mut hasher),
+      Entry::Reasoning(_) => self.thinking_fold.hash(&mut hasher),
+      Entry::Summary(_) => self.summary_fold.hash(&mut hasher),
+      Entry::Assistant(_) | Entry::Error(_) | Entry::Info(_) => {}
+    }
+    Some(hasher.finish())
+  }
+}
+
+/// Every entry that renders itself has already wrapped to the width; this is
+/// for the ones shown as they were written — a prompt, an error, a block
+/// unfolded — and it is what makes the list a list of rows.
+fn wrapped(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
+  lines
+    .into_iter()
+    .flat_map(|line| crate::markdown::wrap_line(line, width))
+    .collect()
+}
+
+/// The rows an entry was drawn as, kept from one frame to the next.
+struct Drawn {
+  rows: Arc<Vec<Line<'static>>>,
+  /// The pictures they were drawn from, kept for as long as they are: a fold
+  /// they are not kept for draws them again from those.
+  uses: Vec<RenderKey>,
+}
+
+/// The transcript as last drawn, a row at a time: one block of rows for each
+/// entry, shared with the cache it was drawn into rather than copied out of
+/// it, and one more for what is still being written.
+#[derive(Default)]
+struct Rows {
+  blocks: Vec<Arc<Vec<Line<'static>>>>,
+  /// The row each block starts at.
+  starts: Vec<usize>,
+  len: usize,
+}
+
+impl Rows {
+  fn push(&mut self, block: Arc<Vec<Line<'static>>>) {
+    self.starts.push(self.len);
+    self.len += block.len();
+    self.blocks.push(block);
+  }
+
+  fn len(&self) -> usize {
+    self.len
+  }
+
+  fn is_empty(&self) -> bool {
+    self.len == 0
+  }
+
+  /// Every row from `row` on.
+  fn starting_at(&self, row: usize) -> impl Iterator<Item = &Line<'static>> {
+    let at = self.starts.partition_point(|&start| start <= row).saturating_sub(1);
+    let skip = self.starts.get(at).map_or(0, |&start| row.saturating_sub(start));
+    self.blocks[at.min(self.blocks.len())..]
+      .iter()
+      .flat_map(|block| block.iter())
+      .skip(skip)
   }
 }
 
@@ -3354,8 +3483,10 @@ fn picked_out(text: &str, highlights: &[u32], base: Style) -> Vec<Span<'static>>
     .collect()
 }
 
-/// Rendered text and pictures, by what they were drawn from and at what width.
-type RenderCache = HashMap<(u64, u16, bool), Vec<Line<'static>>>;
+/// Drawn pictures, by what they were drawn from and at what width.
+type RenderCache = HashMap<RenderKey, Vec<Line<'static>>>;
+
+type RenderKey = (u64, u16, bool);
 
 /// An image in the transcript, under `gutter`, folded like any other block.
 /// Its drawing is taken from last frame's cache when it is there, and kept for
@@ -3883,7 +4014,7 @@ fn mark_style(mark: Option<char>) -> Style {
 
 /// How much of a folding block is shown: nothing, the first or last few lines
 /// of it, or all of it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Fold {
   Collapsed,
   Preview,
@@ -4070,10 +4201,10 @@ fn cut(line: &Line<'static>, from: usize, to: usize) -> (Vec<Span<'static>>, Vec
 /// as the one line it was, without the indent a list or a quote hangs its
 /// wrapped rows under — while a code block still stays the lines it was
 /// written on.
-fn copied(rows: &[Line<'static>], selection: Selection) -> String {
+fn copied<'a>(rows: impl IntoIterator<Item = &'a Line<'static>>, selection: Selection) -> String {
   let ((first, _), (last, _)) = selection.ends();
   let mut text = String::new();
-  for (at, row) in rows.iter().enumerate().take(last + 1).skip(first) {
+  for (at, row) in rows.into_iter().enumerate().take(last + 1).skip(first) {
     let Some((from, to)) = selection.columns(at) else {
       continue;
     };
@@ -4953,6 +5084,20 @@ mod tests {
       .render(area, &mut buf, &mut state);
     let rows: Vec<u16> = (0..track).filter(|&y| buf[(0, y)].symbol() == "┃").collect();
     (rows[0], rows.len() as u16)
+  }
+
+  #[test]
+  fn the_rows_of_every_block_follow_on_from_one_another() {
+    let block = |texts: &[&str]| Arc::new(texts.iter().map(|t| Line::raw(t.to_string())).collect::<Vec<_>>());
+    let mut rows = Rows::default();
+    rows.push(block(&["a", "b"]));
+    rows.push(block(&[]));
+    rows.push(block(&["c", "d", "e"]));
+    assert_eq!(rows.len(), 5);
+    for from in 0..=5 {
+      let texts: Vec<String> = rows.starting_at(from).map(|line| line.to_string()).collect();
+      assert_eq!(texts, ["a", "b", "c", "d", "e"][from..], "from {from}");
+    }
   }
 
   #[test]
