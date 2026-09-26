@@ -97,9 +97,61 @@ pub fn render(md: &str, width: u16, streaming: bool) -> Vec<Line<'static>> {
 /// written — a prompt, an error, an unfolded block — can still be too long.
 ///
 /// The indent a line starts with is part of it and is kept; the space a break
-/// falls on belongs to neither side and is dropped, as `wrap` drops it.
+/// falls on belongs to neither side and is dropped, as `wrap` drops it. Every
+/// row after the first carries a mark saying it is the same line carried on,
+/// which is what [`joint`] reads back.
 pub fn wrap_line(line: Line<'static>, width: u16) -> Vec<Line<'static>> {
   fold(line, width.into())
+}
+
+/// Where `line` carries on the row above it rather than starting a line of
+/// its own: the column its text resumes at, past whatever was put in front of
+/// it for the row to sit under its block, and what the break took out from
+/// between the two — a space, or nothing where a word was cut in half.
+///
+/// `None` for a row that starts a line of its own, which is every row the
+/// text itself broke.
+pub fn joint(line: &Line<'_>) -> Option<(usize, &'static str)> {
+  let mut at = 0;
+  for span in &line.spans {
+    if let Some(with) = joined_with(span) {
+      return Some((at, with));
+    }
+    at += span.width();
+  }
+  None
+}
+
+/// The mark a wrapped row starts with, `space` saying whether the break fell
+/// on whitespace.
+///
+/// A span with nothing in it draws nothing and measures nothing, so the mark
+/// rides along in the row without changing how it looks or what fits. What
+/// tells it apart is modifiers taken away that nothing here ever takes away,
+/// which survive the styles a block lays over its lines — a quote's, say — as
+/// patching only adds to what a span takes away.
+fn mark(space: bool) -> Span<'static> {
+  let kind = match space {
+    true => Modifier::SLOW_BLINK,
+    false => Modifier::RAPID_BLINK,
+  };
+  Span::styled("", Style::new().remove_modifier(Modifier::HIDDEN | kind))
+}
+
+/// What a break put `span` in place of, if it is the mark of one.
+fn joined_with(span: &Span<'_>) -> Option<&'static str> {
+  let removed = span.style.sub_modifier;
+  if !span.content.is_empty() || !removed.contains(Modifier::HIDDEN) {
+    return None;
+  }
+  match (
+    removed.contains(Modifier::SLOW_BLINK),
+    removed.contains(Modifier::RAPID_BLINK),
+  ) {
+    (true, false) => Some(" "),
+    (false, true) => Some(""),
+    _ => None,
+  }
 }
 
 /// `wrap_line` to any width, a width of none leaving the line as it is.
@@ -118,20 +170,31 @@ fn fold(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
   // Until the first word of the line, its spaces are the indent it was
   // written with rather than the debris of a break.
   let mut indent = true;
+  // The mark for the row a break has just started, held back until there is
+  // something on it: a break with nothing after it made no row to carry on.
+  let mut join: Option<Span<'static>> = None;
 
-  let mut push_line = |current: &mut Vec<Span<'static>>, used: &mut usize| {
+  // Whether the row ended in whitespace, which the break then took.
+  let mut push_line = |current: &mut Vec<Span<'static>>, used: &mut usize| -> bool {
+    let mut dropped = false;
     // The space a break falls on is drawn on neither line. A line of nothing
     // but spaces is an indent that never got its word, and keeps them.
     if current.iter().any(|span| !span.content.trim().is_empty()) {
       while current.last().is_some_and(|span| span.content.trim().is_empty()) {
-        current.pop();
+        dropped |= current.pop().is_some_and(|span| !span.content.is_empty());
       }
     }
     lines.push(Line::from(std::mem::take(current)).style(style));
     *used = 0;
+    dropped
   };
 
   for span in line.spans {
+    // A row that was wrapped once already keeps saying so.
+    if joined_with(&span).is_some() {
+      current.push(span);
+      continue;
+    }
     // A carriage return is not a column and not a break; what it meant was
     // for the terminal to draw over what it had already drawn, which a
     // transcript that scrolls has no way of honouring.
@@ -142,6 +205,7 @@ fn fold(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
         // all — it is a line as written, not the remains of one.
         push_line(&mut current, &mut used);
         indent = true;
+        join = None;
       }
       for word in words(chunk) {
         let blank = word.trim().is_empty();
@@ -156,26 +220,31 @@ fn fold(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
           for ch in word.chars() {
             if used + ch.width().unwrap_or(0) > width {
               if !piece.is_empty() {
+                current.extend(join.take());
                 current.push(Span::styled(std::mem::take(&mut piece), span.style));
               }
-              push_line(&mut current, &mut used);
+              let dropped = push_line(&mut current, &mut used);
+              join = Some(mark(dropped));
             }
             used += ch.width().unwrap_or(0);
             piece.push(ch);
           }
           if !piece.is_empty() {
+            current.extend(join.take());
             current.push(Span::styled(piece, span.style));
           }
           indent = false;
           continue;
         }
         if used + w > width && used > 0 {
-          push_line(&mut current, &mut used);
+          let dropped = push_line(&mut current, &mut used);
           indent = false;
+          join = Some(mark(dropped || blank));
           if blank {
             continue;
           }
         }
+        current.extend(join.take());
         current.push(Span::styled(word.to_string(), span.style));
         used += w;
         indent &= blank;
@@ -626,7 +695,9 @@ fn table_block(rows: &[Node], align: &[AlignKind], width: usize, refs: &Refs, ou
           _ => (0, pad),
         };
         spans.push(Span::raw(" ".repeat(before + 1)));
-        spans.extend(content.spans);
+        // A cell's rows carry on each other, not the cells beside them, so a
+        // row across the table is a line of its own.
+        spans.extend(content.spans.into_iter().filter(|span| joined_with(span).is_none()));
         spans.push(Span::raw(" ".repeat(after + 1)));
         spans.push(Span::styled("│", style::BORDER));
       }
@@ -1134,7 +1205,47 @@ mod tests {
     assert_eq!(plain(&wrapped), ["alpha beta", "gamma delta"]);
     // Each piece is still the colour of the span it came out of.
     assert_eq!(wrapped[0].spans[0].style.fg, Some(Color::Red));
-    assert_eq!(wrapped[1].spans[0].style.fg, Some(Color::Blue));
+    assert_eq!(wrapped[1].spans[1].style.fg, Some(Color::Blue));
+  }
+
+  #[test]
+  fn a_row_the_wrap_started_says_it_carries_on_the_one_above() {
+    let wrapped = wrap_line(Line::raw("alpha beta gamma"), 10);
+    assert_eq!(plain(&wrapped), ["alpha beta", "gamma"]);
+    assert_eq!(joint(&wrapped[0]), None);
+    // The break took the space between the words.
+    assert_eq!(joint(&wrapped[1]), Some((0, " ")));
+    // A word cut in half lost nothing to the break.
+    let cut = wrap_line(Line::raw("0123456789"), 6);
+    assert_eq!(joint(&cut[1]), Some((0, "")));
+    // Nor did spans that meet without a space between them.
+    let styled = Line::from(vec![Span::raw("abc"), Span::styled("def", Style::new().bold())]);
+    assert_eq!(joint(&wrap_line(styled, 4)[1]), Some((0, "")));
+    // A break the text asked for is a line of its own.
+    let written = wrap_line(Line::from(Span::raw("one\ntwo")), 20);
+    assert_eq!(joint(&written[1]), None);
+    // And the mark stays through a row being rebuilt, as one with a tab is.
+    let mut tabbed = wrapped[1].clone();
+    tabbed.spans.push(Span::raw("\tx"));
+    assert_eq!(joint(&wrap_line(tabbed, 20)[0]), Some((0, " ")));
+  }
+
+  #[test]
+  fn a_wrapped_row_resumes_past_what_its_block_hangs_it_under() {
+    let quoted = render("> alpha beta gamma", 12, false);
+    assert_eq!(plain(&quoted), ["│ alpha beta", "│ gamma"]);
+    assert_eq!(joint(&quoted[1]), Some((2, " ")));
+    let listed = render("- alpha beta gamma", 12, false);
+    assert_eq!(plain(&listed), ["- alpha beta", "  gamma"]);
+    assert_eq!(joint(&listed[1]), Some((2, " ")));
+  }
+
+  #[test]
+  fn a_table_row_does_not_carry_on_the_row_above() {
+    let table = render("| a | b |\n|---|---|\n| alpha beta gamma | x |", 20, false);
+    // The cell did wrap, over two rows of the table.
+    assert_eq!(table.len(), 6);
+    assert!(table.iter().all(|line| joint(line).is_none()));
   }
 
   #[test]

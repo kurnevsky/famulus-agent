@@ -1691,21 +1691,9 @@ impl App {
     Some((line, column as usize))
   }
 
-  /// What a selection covers, as the text it is drawn from: the lines it
-  /// touches, each cut to the columns of it that are in the selection.
-  ///
-  /// Line by line as they are on screen, so a wrapped paragraph comes back
-  /// wrapped — what was copied is what was pointed at, and a code block
-  /// stays the lines it was written on.
+  /// What a selection covers, as the text it is drawn from.
   fn selected_text(&self, selection: Selection) -> String {
-    let ((first, _), (last, _)) = selection.ends();
-    (first..=last.min(self.rendered.len().saturating_sub(1)))
-      .filter_map(|at| {
-        let (from, to) = selection.columns(at)?;
-        Some(selected(&self.rendered[at], from, to))
-      })
-      .collect::<Vec<_>>()
-      .join("\n")
+    copied(&self.rendered, selection)
   }
 
   /// A left press on the scrollbar. On the thumb it takes hold of it; on the
@@ -4074,6 +4062,42 @@ fn cut(line: &Line<'static>, from: usize, to: usize) -> (Vec<Span<'static>>, Vec
   (before, inside, after)
 }
 
+/// What `selection` covers of `rows`: the rows it touches, each cut to the
+/// columns of it that are in the selection.
+///
+/// Line by line as they were written rather than as they are on screen: a
+/// row the wrap started carries on the one above, so a paragraph comes back
+/// as the one line it was, without the indent a list or a quote hangs its
+/// wrapped rows under — while a code block still stays the lines it was
+/// written on.
+fn copied(rows: &[Line<'static>], selection: Selection) -> String {
+  let ((first, _), (last, _)) = selection.ends();
+  let mut text = String::new();
+  for (at, row) in rows.iter().enumerate().take(last + 1).skip(first) {
+    let Some((from, to)) = selection.columns(at) else {
+      continue;
+    };
+    let joint = crate::markdown::joint(row);
+    // What is in front of a carried-on row is the block it sits under, not
+    // text, wherever the selection happened to start.
+    let from = joint.map_or(from, |(start, _)| from.max(start));
+    let piece = selected(row, from, to);
+    match joint {
+      Some((_, with)) if at > first => {
+        // Nothing to join to, or nothing to join: no space for a break to
+        // have taken out of the middle.
+        if !piece.is_empty() && !text.is_empty() && !text.ends_with('\n') {
+          text.push_str(with);
+        }
+      }
+      _ if at > first => text.push('\n'),
+      _ => {}
+    }
+    text.push_str(&piece);
+  }
+  text
+}
+
 /// The text of `line` between columns `from` and `to`, without the blanks a
 /// line ends in — which are the gap to the right margin rather than anything
 /// written on it.
@@ -5614,6 +5638,38 @@ mod tests {
     // The blanks a line ends in are the margin, not text that was selected.
     let padded = Line::raw("word     ");
     assert_eq!(selected(&padded, 0, usize::MAX), "word");
+  }
+
+  #[test]
+  fn a_wrapped_line_is_copied_as_the_line_it_was() {
+    let rows = crate::markdown::render(
+      "- alpha beta gamma\n- delta\n\n```\nlet long_name = 1;\nlet y = 2;\n```",
+      12,
+      false,
+    );
+    let all = Selection {
+      anchor: (0, 0),
+      head: (rows.len() - 1, 40),
+    };
+    // The rows the wrap made are one line again, and the lines the text was
+    // written on are still apart.
+    assert_eq!(
+      copied(&rows, all),
+      "- alpha beta gamma\n- delta\n\n```\n  let long_name = 1;\n  let y = 2;\n```"
+    );
+    // From the middle of one row into the next, the break is the space it
+    // took out.
+    let across = Selection {
+      anchor: (0, 8),
+      head: (1, 4),
+    };
+    assert_eq!(copied(&rows, across), "beta gam");
+    // The indent a wrapped row hangs under is not part of what it says.
+    let hanging = Selection {
+      anchor: (1, 0),
+      head: (1, 6),
+    };
+    assert_eq!(copied(&rows, hanging), "gamma");
   }
 
   #[test]
