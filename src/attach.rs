@@ -401,8 +401,9 @@ mod tests {
     // path passes through it.
     let found = tokens("@shots/", &dir);
     assert!(matches!(found[0].state, State::Directory));
-    // `~` is a directory too, not a missing file named after the home one.
-    if std::env::var_os("HOME").is_some() {
+    // `~` is a directory too, not a missing file named after the home one —
+    // where there is a home directory to be.
+    if std::env::var_os("HOME").is_some_and(|home| Path::new(&home).is_dir()) {
       let found = tokens("@~", &dir);
       assert!(matches!(found[0].state, State::Directory));
     }
