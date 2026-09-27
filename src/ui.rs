@@ -206,6 +206,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
   ("model", "Choose the model, or name one: /model <id>", true),
   ("name", "Set session display name", true),
   ("new", "Start a new session", false),
+  ("pause", "Stop the loop once the current turn is done", false),
   ("resume", "Resume a different session", false),
   ("session", "Show session info and stats", false),
   ("tree", "Go back to an earlier point (or press Esc twice)", false),
@@ -644,6 +645,8 @@ pub struct App {
   /// The run in flight, kept for abort recovery.
   /// Esc has been pressed and the run is on its way to stopping.
   aborting: bool,
+  /// `/pause` has been sent and the run stops at its next turn boundary.
+  pausing: bool,
   /// Tool calls the model is still writing, oldest first.
   writing: Vec<Writing>,
   /// How this run's tool calls went, by the id the transcript names them
@@ -756,6 +759,7 @@ impl App {
       compacting: false,
       resuming: false,
       aborting: false,
+      pausing: false,
       writing: Vec::new(),
       outcomes: HashMap::new(),
       anchor: None,
@@ -1852,7 +1856,8 @@ impl App {
     // What a run makes of what is typed at it is a message, which is what
     // was meant by all but these: they were typed at fa, and are answered
     // here whether or not a run has the floor.
-    let for_us = matches!(text.as_str(), "/quit" | "/new" | "/model" | "/goto") || text.starts_with("/model ");
+    let for_us =
+      matches!(text.as_str(), "/quit" | "/new" | "/model" | "/goto" | "/pause") || text.starts_with("/model ");
     if self.run.is_some() && !for_us {
       // Handed to the run, which reads it at the top of its next turn
       // rather than after the whole answer. It is kept there and nowhere
@@ -1895,6 +1900,7 @@ impl App {
       "/new" => self.new_session(),
       "/compact" => self.compact(),
       "/continue" => self.continue_run(),
+      "/pause" => self.pause(),
       "/resume" => {
         if self.run.is_some() {
           self.notify("Finish or abort the current run before resuming another session.");
@@ -2381,6 +2387,31 @@ impl App {
     self.agents.control.cancel();
   }
 
+  /// `/pause`: let the run finish the turn it is on — the answer being
+  /// written and the calls it asks for — and stop before the next one, so
+  /// nothing is cut off and `/continue` goes on from there.
+  ///
+  /// A compaction has no turns to stop between; pausing one means not
+  /// resuming the run it was making room for.
+  fn pause(&mut self) {
+    if self.run.is_none() {
+      self.notify("Nothing to pause.");
+      return;
+    }
+    if self.pausing || self.aborting {
+      return;
+    }
+    self.pausing = true;
+    self.agents.control.pause();
+  }
+
+  /// The run has stopped for `/pause`. What was typed after the run last
+  /// looked would start a new one, which is what pausing is to prevent.
+  fn paused(&mut self) {
+    self.entries.push(Entry::Info("Paused — /continue to carry on.".into()));
+    self.strand_queued();
+  }
+
   /// Esc stops everything, including what was waiting behind the run — but
   /// it was typed, so it is kept in the transcript rather than dropped out
   /// of sight.
@@ -2518,6 +2549,8 @@ impl App {
       }
       AgentEvent::Done { messages } => {
         self.run_over();
+        // It got to its answer before its next turn came round.
+        self.pausing = false;
         self.stopped(messages);
         // The run ended with its answer, so there is nothing to pick back
         // up; a context that outgrew the window is still made room in,
@@ -2532,6 +2565,7 @@ impl App {
       AgentEvent::Ended { messages } => {
         self.run_over();
         let full = self.overflowed();
+        let pausing = std::mem::take(&mut self.pausing);
         if self.compacting {
           // A compaction that did not finish is not worth starting again on
           // the next turn: the room it was going to make is not coming.
@@ -2550,6 +2584,15 @@ impl App {
           self.strand_queued();
           return;
         }
+        // Between turns, so nothing was left running. A context found full
+        // on the way is still made room in, but not carried on from.
+        if pausing {
+          self.paused();
+          if full {
+            self.compact();
+          }
+          return;
+        }
         if full {
           // The run stopped at a turn boundary to let this happen, and
           // goes on once there is room again.
@@ -2563,6 +2606,7 @@ impl App {
         self.run = None;
         self.compacting = false;
         let resuming = std::mem::take(&mut self.resuming);
+        let pausing = std::mem::take(&mut self.pausing);
         match result {
           Some(compacted) => {
             let kept = compacted.kept.len();
@@ -2578,6 +2622,10 @@ impl App {
             // What was cut short to make this room carries on where it
             // stopped — unless the user has said something since, which is
             // what it would have read next anyway.
+            if resuming && pausing {
+              self.paused();
+              return;
+            }
             if resuming && !self.agents.control.steering() {
               self.continue_run();
               return;
@@ -3022,7 +3070,11 @@ impl App {
     }
     if self.run.is_some() {
       left.push(Span::raw("  "));
-      let verb = if self.compacting { "compacting" } else { "working" };
+      let verb = match (self.compacting, self.pausing) {
+        (true, _) => "compacting",
+        (false, true) => "pausing",
+        (false, false) => "working",
+      };
       left.push(Span::raw(format!("{} {verb} — esc to abort", SPINNER[self.tick % SPINNER.len()])).fg(Color::Yellow));
       let queued = self.agents.control.waiting().len();
       if queued > 0 {

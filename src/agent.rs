@@ -191,10 +191,11 @@ pub struct ModelInfo {
 
 /// What the UI says to a run while it is going.
 ///
-/// Cancelling and steering are the two things it has to say, and both have
-/// to reach a run that is in the middle of something — so each is something
-/// the loop reads at its next opportunity, and cancelling can also be waited
-/// on by the parts that cannot wait for whatever the loop is blocked on.
+/// Cancelling, pausing and steering are the things it has to say, and all
+/// have to reach a run that is in the middle of something — so each is
+/// something the loop reads at its next opportunity, and cancelling can also
+/// be waited on by the parts that cannot wait for whatever the loop is
+/// blocked on.
 #[derive(Clone, Default)]
 pub struct Control(Arc<Signals>);
 
@@ -202,6 +203,9 @@ pub struct Control(Arc<Signals>);
 struct Signals {
   /// Esc, as a value the run can wait to see change rather than only read.
   cancelled: watch::Sender<bool>,
+  /// `/pause`: finish what is in hand, then stop before asking the model
+  /// again.
+  paused: AtomicBool,
   /// Raised by the run when the conversation outgrew the window. The UI
   /// takes it back down once it has made the room.
   overflow: AtomicBool,
@@ -217,6 +221,7 @@ impl Control {
   /// while the last one was ending, which was meant for this one.
   fn begin(&self) {
     self.0.cancelled.send_replace(false);
+    self.0.paused.store(false, Ordering::Relaxed);
   }
 
   /// Stop the run at the first thing it can stop in the middle of.
@@ -226,6 +231,17 @@ impl Control {
 
   pub fn cancelled(&self) -> bool {
     *self.0.cancelled.borrow()
+  }
+
+  /// Stop the run once the turn it is on is over: the answer it is writing
+  /// is finished and the calls it asked for are run, but nothing more is
+  /// asked of the model.
+  pub fn pause(&self) {
+    self.0.paused.store(true, Ordering::Relaxed);
+  }
+
+  fn paused(&self) -> bool {
+    self.0.paused.load(Ordering::Relaxed)
   }
 
   /// Resolves once the run should stop what it is doing — at once, when it
@@ -677,6 +693,9 @@ enum Stop {
   /// Esc. What it got through is kept, and the calls it was in the middle
   /// of are answered.
   Cancelled,
+  /// `/pause`, at a turn boundary: everything it got through is whole, and
+  /// `/continue` picks it back up.
+  Paused,
   /// The conversation outgrew the window. The UI makes room and picks the
   /// run back up where it left off.
   Overflow,
@@ -741,6 +760,11 @@ async fn run(
     }
     if control.cancelled() {
       return Some(Stop::Cancelled);
+    }
+    // After the steering is read, so what was typed is in the conversation
+    // `/continue` resumes rather than left behind in the queue.
+    if control.paused() {
+      return Some(Stop::Paused);
     }
 
     let mut chat = Vec::with_capacity(history.len() + made.len());
@@ -1460,6 +1484,47 @@ mod tests {
       ]
     );
     assert!(!control.steering(), "nothing is left waiting once it has been read");
+  }
+
+  /// Pausing lets the call in hand finish rather than cutting it off, and
+  /// stops before the model is asked again — with what was typed meanwhile
+  /// already in the conversation, for `/continue` to answer.
+  #[tokio::test]
+  async fn a_paused_run_finishes_its_turn_and_asks_no_more() {
+    let runtime = scripted(
+      vec![
+        vec![said("Working. "), asks("call_1", "sleep 0.5; echo one")],
+        vec![said("Never asked for.")],
+      ],
+      false,
+    );
+    let control = Control::default();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let handle = start_run(runtime, control.clone(), Vec::new(), vec![Message::user("start")], tx);
+    let mut paused = false;
+    let (messages, done) = loop {
+      let event = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+        .await
+        .expect("an event within 10s")
+        .expect("the channel open");
+      if !paused && matches!(&event, AgentEvent::ToolCall { call, .. } if call == "call_1") {
+        paused = true;
+        control.pause();
+        control.steer(Prompt::text("and this".into()));
+      }
+      match event {
+        AgentEvent::Done { messages } => break (messages, true),
+        AgentEvent::Ended { messages } => break (messages, false),
+        _ => {}
+      }
+    };
+    handle.await.expect("the run to finish");
+    assert!(!done, "a paused run ends short of its answer");
+    assert_eq!(
+      shapes(&messages),
+      ["user start", "said \"Working. \" + call call_1", "result call_1 one", "user and this"]
+    );
+    assert!(!control.steering());
   }
 
   const TEST_SETTINGS: Settings = Settings {
