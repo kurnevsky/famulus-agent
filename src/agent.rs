@@ -1522,7 +1522,12 @@ mod tests {
     assert!(!done, "a paused run ends short of its answer");
     assert_eq!(
       shapes(&messages),
-      ["user start", "said \"Working. \" + call call_1", "result call_1 one", "user and this"]
+      [
+        "user start",
+        "said \"Working. \" + call call_1",
+        "result call_1 one",
+        "user and this"
+      ]
     );
     assert!(!control.steering());
   }

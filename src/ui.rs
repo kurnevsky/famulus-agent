@@ -3365,7 +3365,9 @@ impl App {
         //
         // An edit's halves are lines of the file it names, so they are
         // coloured like it — the same colours the diff they become is drawn
-        // in, which is what keeps the call from recolouring as it lands.
+        // in, which is what keeps the call from recolouring as it lands. As
+        // there, only the mark is red or green; code no grammar colours is
+        // left plain.
         _ => {
           let path = (writing.name == "edit")
             .then(|| writing_path(&writing.args))
@@ -3378,7 +3380,12 @@ impl App {
                 "│" => String::new(),
                 mark => format!("{mark} "),
               };
-              marked_code(&prefix, mark_style(mark.chars().next()), language_of(&path), text)
+              let style = mark_style(mark.chars().next());
+              let plain = match *mark {
+                "│" => style,
+                _ => Style::default(),
+              };
+              marked_code(&prefix, style, plain, language_of(&path), text)
             })
             .collect()
         }
@@ -3886,7 +3893,7 @@ fn wrote_by<'a>(entries: &'a [Entry], call: &str) -> Option<(&'a str, &'a str)> 
 /// A write is not a change to be marked up — it is the file, so it is shown
 /// as the file, with none of a diff's pluses and none of its green.
 fn file_lines(path: &str, content: &str) -> Vec<Vec<Span<'static>>> {
-  marked_code("", mark_style(None), language_of(path), content)
+  marked_code("", mark_style(None), mark_style(None), language_of(path), content)
 }
 
 /// What a file's name says it is written in — its extension, which is all a
@@ -3917,7 +3924,7 @@ fn structured(name: &str, output: &str) -> Option<Vec<Vec<Span<'static>>>> {
     return None;
   }
   let pretty = serde_json::to_string_pretty(&value).ok()?;
-  Some(marked_code("", mark_style(None), "json", &pretty))
+  Some(marked_code("", mark_style(None), mark_style(None), "json", &pretty))
 }
 
 /// A diff as the transcript shows it: `+12` still says what became of the
@@ -3926,12 +3933,15 @@ fn structured(name: &str, output: &str) -> Option<Vec<Vec<Span<'static>>>> {
 /// The mark and the number keep the colour they always had, because once the
 /// code carries the grammar's colours they are the only thing left saying what
 /// changed. Context is dimmed over its highlighting, so what the edit did still
-/// comes forward. With no path, no grammar for it, or a diff this cannot take
-/// apart, it falls back to the marked-up text it has always been.
+/// comes forward. With no path or no grammar for it the code is left plain —
+/// the mark and the number are still the only thing coloured — and only a
+/// diff this cannot take apart falls back to the marked-up text it has always
+/// been.
 fn diff_lines(path: Option<&str>, diff: &str) -> Vec<Vec<Span<'static>>> {
-  let Some((language, column)) = path.map(language_of).zip(code_column(diff)) else {
+  let Some(column) = code_column(diff) else {
     return marked_lines(diff, true);
   };
+  let language = language_of(path.unwrap_or_default());
   // A line too short to reach that column is all numbering and no code.
   let split: Vec<(&str, &str)> = diff
     .lines()
@@ -3979,15 +3989,18 @@ fn diff_lines(path: Option<&str>, diff: &str) -> Vec<Vec<Span<'static>>> {
     crate::highlight::highlight(language, &old),
     crate::highlight::highlight(language, &new),
   );
-  if old.is_none() && new.is_none() {
-    return marked_lines(diff, true);
-  }
   split
     .iter()
     .zip(placed)
     .map(|((head, code), place)| {
       let mark = head.chars().next();
       let style = mark_style(mark);
+      // Code the grammar had nothing to say about is the file's own text,
+      // plain on a changed line and dimmed with the rest of the context.
+      let plain = match mark {
+        Some('+' | '-') => Style::default(),
+        _ => style,
+      };
       let spans = place
         .and_then(|(is_new, i)| if is_new { new.as_ref() } else { old.as_ref() }?.get(i))
         .filter(|spans| !spans.is_empty());
@@ -4001,7 +4014,7 @@ fn diff_lines(path: Option<&str>, diff: &str) -> Vec<Vec<Span<'static>>> {
             .map(|span| Span::styled(span.content.clone(), span.style.add_modifier(Modifier::DIM))),
         ),
         Some(spans) => row.extend(spans.iter().cloned()),
-        None => row.push(Span::styled((*code).to_string(), style)),
+        None => row.push(Span::styled((*code).to_string(), plain)),
       }
       row
     })
@@ -4009,12 +4022,12 @@ fn diff_lines(path: Option<&str>, diff: &str) -> Vec<Vec<Span<'static>>> {
 }
 
 /// Lines of `text` drawn under `prefix`, highlighted as `language` where
-/// there is a grammar for it and left in `style` where there is not.
+/// there is a grammar for it and left in `plain` where there is not.
 ///
 /// The prefix keeps `style` either way: it is the transcript talking about the
 /// line — the half of an edit it belongs to — not part of the line itself.
-fn marked_code(prefix: &str, style: Style, language: &str, text: &str) -> Vec<Vec<Span<'static>>> {
-  code_rows(language, text, Style::default(), style)
+fn marked_code(prefix: &str, style: Style, plain: Style, language: &str, text: &str) -> Vec<Vec<Span<'static>>> {
+  code_rows(language, text, Style::default(), plain)
     .into_iter()
     .map(|mut row| {
       row.insert(0, Span::styled(format!(" {prefix}"), style));
@@ -6269,7 +6282,7 @@ mod tests {
   fn an_edit_is_coloured_the_same_while_it_is_still_being_written() {
     // The half arriving is drawn in the file's colours, so nothing recolours
     // under the reader when the call lands and becomes a diff.
-    let lines = marked_code("+ ", mark_style(Some('+')), "rs", "    let x = 1;\n}");
+    let lines = marked_code("+ ", mark_style(Some('+')), Style::default(), "rs", "    let x = 1;\n}");
     let spans: Vec<(String, Option<Color>)> = lines[0]
       .iter()
       .map(|span| (span.content.to_string(), span.style.fg))
@@ -6277,9 +6290,15 @@ mod tests {
     assert_eq!(spans[0], (" + ".to_string(), Some(Color::Green)));
     assert!(spans.contains(&("let".to_string(), Some(Color::Magenta))), "{spans:?}");
     // A file the call has not named yet, or one with no grammar: the text as
-    // it is, under its mark.
-    let plain = painted(&marked_code("- ", mark_style(Some('-')), "", "let x = 1;"));
-    assert_eq!(plain, [(" - let x = 1;".to_string(), vec![Some(Color::Red); 2])]);
+    // it is, under its mark, which alone is coloured.
+    let plain = painted(&marked_code(
+      "- ",
+      mark_style(Some('-')),
+      Style::default(),
+      "",
+      "let x = 1;",
+    ));
+    assert_eq!(plain, [(" - let x = 1;".to_string(), vec![Some(Color::Red), None])]);
   }
 
   #[test]
@@ -6297,11 +6316,21 @@ mod tests {
   }
 
   #[test]
-  fn a_diff_of_a_file_we_cannot_read_is_marked_up_as_before() {
+  fn a_diff_of_a_file_we_cannot_highlight_colours_only_its_marks() {
     let diff = " 1 hello\n-2 there\n+2 world";
-    let plain = painted(&marked_lines(diff, true));
+    let plain = [
+      ("  1 hello".to_string(), vec![None, None]),
+      (" -2 there".to_string(), vec![Some(Color::Red), None]),
+      (" +2 world".to_string(), vec![Some(Color::Green), None]),
+    ];
     assert_eq!(painted(&diff_lines(Some("notes.txt"), diff)), plain);
     assert_eq!(painted(&diff_lines(None, diff)), plain, "a call that named no file");
+    // Context stays dimmed, code and all.
+    assert!(
+      diff_lines(None, diff)[0]
+        .iter()
+        .all(|span| span.style.add_modifier.contains(Modifier::DIM))
+    );
   }
 
   #[test]
