@@ -11,12 +11,13 @@
 //! models, tools and files, which can hold any of it.
 //!
 //! So before a frame goes out, every cell is held to a list of characters
-//! every terminal draws at the width ratatui gives them, one to a cell, and
-//! anything else is drawn as `�`. The list is short on purpose: a character it
-//! leaves out costs a `�`, one it wrongly lets in costs a broken screen.
+//! terminals, the Linux console among them, draw at the width ratatui gives
+//! them, one to a cell, and anything else is drawn as `�`. The list is short
+//! on purpose: a character it leaves out costs a `�`, one it wrongly lets in
+//! costs a broken screen.
 
 use ratatui::buffer::{Buffer, CellDiffOption};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// What a cell that could not be trusted shows instead.
 const REPLACEMENT: &str = "\u{fffd}";
@@ -36,10 +37,26 @@ pub fn guard(buffer: &mut Buffer) {
     }
     let symbol = cell.symbol();
     // A symbol of nothing is drawn as nothing, whatever it means.
-    if !(symbol.is_empty() || safe(symbol)) {
-      cell.set_symbol(REPLACEMENT);
+    if symbol.is_empty() || safe(symbol) {
+      continue;
     }
+    match plain(symbol) {
+      Some(plain) => cell.set_symbol(&plain),
+      None => cell.set_symbol(REPLACEMENT),
+    };
   }
+}
+
+/// `symbol` without what only says how an emoji is to look — drawn as text
+/// or as a picture, and in which skin tone — if what is left can be trusted
+/// and is no wider than the columns laid out for `symbol`: any it does not
+/// fill are blank, as after a replacement.
+fn plain(symbol: &str) -> Option<String> {
+  let plain: String = symbol
+    .chars()
+    .filter(|c| !matches!(c, '\u{fe0e}' | '\u{fe0f}' | '\u{1f3fb}'..='\u{1f3ff}'))
+    .collect();
+  (safe(&plain) && plain.width() <= symbol.width()).then_some(plain)
 }
 
 /// Whether `symbol` is drawn the same by every terminal: one character — a
@@ -59,11 +76,11 @@ fn safe(symbol: &str) -> bool {
 
 /// One column in every terminal: Latin, Greek and Cyrillic, punctuation, and
 /// the symbols an interface is drawn with — arrows, box drawing, blocks,
-/// shapes, dingbats, braille. The soft hyphen is drawn by some and not
-/// others. A few symbols an emoji skin tone can follow are taken for emoji,
-/// and so two columns, by some terminals, and emoji themselves are two
-/// columns only in terminals new enough to know them, so they are not here
-/// at all.
+/// shapes, dingbats, braille, and the letters of mathematics. The soft hyphen
+/// is drawn by some and not others. A few symbols an emoji skin tone can
+/// follow are taken for emoji, and so two columns, by some terminals, and the
+/// Linux console draws the gender signs, mostly written joined to another
+/// emoji, as nothing.
 fn narrow(c: char) -> bool {
   matches!(
     c,
@@ -78,13 +95,20 @@ fn narrow(c: char) -> bool {
       | '\u{2070}'..='\u{20cf}'
       | '\u{2100}'..='\u{2bff}'
       | '\u{fffd}'
-  ) && !matches!(c, '\u{261d}' | '\u{26f9}' | '\u{270c}' | '\u{270d}')
+      | '\u{1d400}'..='\u{1d7ff}'
+  ) && !matches!(
+    c,
+    '\u{261d}' | '\u{26f9}' | '\u{270c}' | '\u{270d}' | '\u{2640}' | '\u{2642}' | '\u{26a7}'
+  )
 }
 
 /// Two columns in every terminal: the ideographs, kana and Hangul of Chinese,
 /// Japanese and Korean, and their full-width punctuation and forms — only the
 /// blocks that have been full for long enough that no terminal's tables are
-/// missing any of them.
+/// missing any of them — and emoji, which every terminal of the last few years
+/// and the Linux console since 6.16 draw at two columns. The console draws
+/// the skin tones and hair styles, only ever meant to follow another emoji,
+/// as nothing, and so they are not here.
 fn wide(c: char) -> bool {
   matches!(
     c,
@@ -97,6 +121,11 @@ fn wide(c: char) -> bool {
       | '\u{ac00}'..='\u{d7a3}'
       | '\u{ff01}'..='\u{ff60}'
       | '\u{ffe0}'..='\u{ffe6}'
+      | '\u{2300}'..='\u{2bff}'
+      | '\u{1f000}'..='\u{1f3fa}'
+      | '\u{1f400}'..='\u{1f64f}'
+      | '\u{1f680}'..='\u{1f9af}'
+      | '\u{1f9b4}'..='\u{1faff}'
   )
 }
 
@@ -120,12 +149,26 @@ mod tests {
 
   #[test]
   fn anything_else_is_one_column_of_replacement_and_the_row_keeps_its_layout() {
-    // A cluster, an emoji two columns wide, and a syllable whose vowel sign
-    // ratatui counts as a column and some terminals as none. What was two
-    // columns wide is still two, the second blank.
-    let cells = drawn("e\u{301}🚀x\u{915}\u{93e}y");
+    // A cluster, emoji joined into one two columns wide, and a syllable whose
+    // vowel sign ratatui counts as a column and some terminals as none. What
+    // was two columns wide is still two, the second blank.
+    let cells = drawn("e\u{301}👨\u{200d}💻x\u{915}\u{93e}y");
     let replaced = "\u{fffd}";
     assert_eq!(cells[..7], [replaced, replaced, " ", "x", replaced, " ", "y"]);
+  }
+
+  #[test]
+  fn emoji_are_two_columns() {
+    let cells = drawn("✅❌🚀♀");
+    assert_eq!(cells[..7], ["✅", " ", "❌", " ", "🚀", " ", "\u{fffd}"]);
+  }
+
+  #[test]
+  fn how_an_emoji_is_to_look_goes_where_what_is_left_fits() {
+    // Asked for as a picture, which takes two columns, and in a skin tone.
+    // An emoji asked for as text is laid out in one column, too few for it.
+    let cells = drawn("⚠\u{fe0f}👍\u{1f3fd}✅\u{fe0e}x");
+    assert_eq!(cells[..6], ["⚠", " ", "👍", " ", "\u{fffd}", "x"]);
   }
 
   #[test]
