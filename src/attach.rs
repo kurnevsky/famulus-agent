@@ -238,6 +238,9 @@ pub struct Prompt {
   /// then the `/server:name` line it was written out from, which is what
   /// waits on screen and what taking it back hands the input box.
   pub expanded: Vec<Message>,
+  /// One of fa's own commands, waiting in the queue for the run to end
+  /// rather than for the run to read it: it is never the model's.
+  pub command: bool,
 }
 
 impl Prompt {
@@ -248,6 +251,7 @@ impl Prompt {
       text,
       images: Vec::new(),
       expanded: Vec::new(),
+      command: false,
     }
   }
 

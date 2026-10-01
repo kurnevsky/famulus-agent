@@ -17,8 +17,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use rig_agent::ModelHandle;
-use rig_agent::tool::ToolContext;
 use rig_agent::tool::server::{ToolServer, ToolServerHandle};
+use rig_agent::tool::{ToolContext, ToolExecutionError, ToolResult};
 use rig_core::client::Nothing;
 use rig_core::client::completion::CompletionClient;
 use rig_core::client::model_listing::ModelListingClient;
@@ -124,6 +124,16 @@ pub enum AgentEvent {
   Ended {
     messages: Vec<Message>,
   },
+  /// The run is making room for itself: the conversation outgrew the window,
+  /// so it is being compacted before the run goes on — `resuming` — or,
+  /// when it filled up with the answer, before the next prompt is sent into
+  /// it. `messages` is everything the run added up to here, which is what
+  /// the summary is made from and what `Done` or `Ended` will not carry
+  /// again.
+  Compacting {
+    messages: Vec<Message>,
+    resuming: bool,
+  },
   /// Compaction finished; `None` means there was nothing to compact.
   Compacted(Option<Compacted>),
   /// What the provider says it offers, or why it would not say. Sent by the
@@ -206,8 +216,8 @@ struct Signals {
   /// `/pause`: finish what is in hand, then stop before asking the model
   /// again.
   paused: AtomicBool,
-  /// Raised by the run when the conversation outgrew the window. The UI
-  /// takes it back down once it has made the room.
+  /// Raised by the run when the conversation outgrew the window, and taken
+  /// back down by whatever makes the room.
   overflow: AtomicBool,
   /// What the user typed while the run was going, for the run to read at
   /// the top of its next turn. Whole prompts rather than their text: an
@@ -271,14 +281,25 @@ impl Control {
     self.held().pop_front()
   }
 
-  /// Take everything, in the order it was typed: the run reads them into
-  /// the turn it is about to ask for, and Esc takes them out of its way.
+  /// Take everything, in the order it was typed, for Esc to take out of
+  /// the way.
   pub fn take(&self) -> Vec<Prompt> {
     self.held().drain(..).collect()
   }
 
+  /// Take the messages at the front, in the order they were typed, for the
+  /// run to read into the turn it is about to ask for. A command among them
+  /// is not the run's to read, so it stops there: the command, and anything
+  /// typed after it, wait for the run to end and go in the order they came.
+  fn take_said(&self) -> Vec<Prompt> {
+    let mut held = self.held();
+    let said = held.iter().take_while(|prompt| !prompt.command).count();
+    held.drain(..said).collect()
+  }
+
+  /// Whether something is waiting that the run has to read.
   pub fn steering(&self) -> bool {
-    !self.held().is_empty()
+    self.held().front().is_some_and(|prompt| !prompt.command)
   }
 
   /// What is waiting, for the screen to say so.
@@ -295,7 +316,7 @@ impl Control {
   }
 
   /// Whether the run found the context window full — and clear the mark,
-  /// since answering it is the UI's half of the bargain.
+  /// since whoever asks is the one answering it.
   pub fn overflowed(&self) -> bool {
     self.0.overflow.swap(false, Ordering::Relaxed)
   }
@@ -753,8 +774,8 @@ enum Stop {
   /// `/pause`, at a turn boundary: everything it got through is whole, and
   /// `/continue` picks it back up.
   Paused,
-  /// The conversation outgrew the window. The UI makes room and picks the
-  /// run back up where it left off.
+  /// The conversation outgrew the window. The run makes room and picks
+  /// itself back up where it left off.
   Overflow,
   /// Something the user should be told: the turn budget, or a provider or
   /// tool that would not.
@@ -763,22 +784,24 @@ enum Stop {
 
 /// Start one run in the background.
 ///
-/// `prompt` is the message the run opens with, or `None` for `/continue`,
+/// `made` is the message the run opens with, or nothing for `/continue`,
 /// which picks the loop back up over the history as it stands — an
 /// unanswered message is answered, a half-written turn is carried on.
 /// Everything the run adds, that prompt included, comes back in the `Done`
-/// or `Ended` that ends it, and nothing that was already in the history
-/// does: what is handed back is only ever new.
+/// or `Ended` that ends it — or in the `Compacting` before it, for what was
+/// added before the run made room — and nothing that was already in the
+/// history does: what is handed back is only ever new.
 pub fn start_run(
   runtime: Arc<Runtime>,
   control: Control,
   history: Vec<Message>,
-  mut made: Vec<Message>,
+  made: Vec<Message>,
   tx: mpsc::UnboundedSender<AgentEvent>,
 ) -> JoinHandle<()> {
   tokio::spawn(async move {
     control.begin();
-    let event = match run(&runtime, &control, &history, &mut made, &tx).await {
+    let (made, stop) = drive(&runtime, &control, history, made, &tx).await;
+    let event = match stop {
       None => AgentEvent::Done { messages: made },
       Some(stop) => {
         if let Stop::Failed(err) = stop {
@@ -789,6 +812,69 @@ pub fn start_run(
     };
     let _ = tx.send(event);
   })
+}
+
+/// The loop, and the room it needs: whenever it finds the conversation has
+/// outgrown the window, the conversation is compacted and the loop carries on
+/// over the summary.
+///
+/// Answers with what was added since the last compaction — what came before
+/// went out with `Compacting` — and why it stopped, if it stopped short.
+async fn drive(
+  rt: &Runtime,
+  control: &Control,
+  mut history: Vec<Message>,
+  mut made: Vec<Message>,
+  tx: &mpsc::UnboundedSender<AgentEvent>,
+) -> (Vec<Message>, Option<Stop>) {
+  loop {
+    let stop = run(rt, control, &history, &mut made, tx).await;
+    // Esc is the end of it: the next run weighs the window afresh.
+    if matches!(stop, Some(Stop::Cancelled)) || !control.overflowed() {
+      return (made, stop);
+    }
+    // Stopped for room, or refused for a request too big to take: it goes
+    // on once there is some. An answer or a pause is whole, and the room is
+    // only made before the next prompt is sent into it.
+    let resuming = matches!(stop, Some(Stop::Overflow | Stop::Failed(_)));
+    if let Some(Stop::Failed(err)) = &stop {
+      let _ = tx.send(AgentEvent::Error(err.clone()));
+    }
+    history.extend(made.iter().cloned());
+    let _ = tx.send(AgentEvent::Compacting {
+      messages: std::mem::take(&mut made),
+      resuming,
+    });
+    let compacted = tokio::select! {
+      biased;
+      () = control.stopped() => return (Vec::new(), Some(Stop::Cancelled)),
+      compacted = compaction::compact(rt, std::mem::take(&mut history), &rt.compaction) => compacted,
+    };
+    let compacted = match compacted {
+      Ok(compacted) => compacted,
+      Err(err) => return (Vec::new(), Some(Stop::Failed(format!("compaction failed: {err}")))),
+    };
+    // Nothing left to summarize but the turn the context is full of.
+    // Carrying on regardless would only fill it again and ask for the same
+    // summary, so this is where it stops — what it stopped for is already
+    // said.
+    let Some(compacted) = compacted else {
+      let _ = tx.send(AgentEvent::Compacted(None));
+      return (Vec::new(), if resuming { Some(Stop::Overflow) } else { stop });
+    };
+    history = std::iter::once(compaction::summary_message(&compacted.summary))
+      .chain(compacted.kept.iter().cloned())
+      .collect();
+    let _ = tx.send(AgentEvent::Compacted(Some(compacted)));
+    if !resuming {
+      return (Vec::new(), stop);
+    }
+    // Paused while the room was made: the run waits for `/continue`, and so
+    // does whatever was typed in the meantime.
+    if control.paused() {
+      return (Vec::new(), Some(Stop::Paused));
+    }
+  }
 }
 
 /// The loop itself. `made` grows with everything the run adds, and is the
@@ -807,7 +893,7 @@ async fn run(
   loop {
     // Anything typed while the last turn ran is read before this one, so it
     // lands where the user meant it rather than after the whole answer.
-    for prompt in control.take() {
+    for prompt in control.take_said() {
       let _ = tx.send(AgentEvent::Steered {
         text: prompt.text.clone(),
         images: prompt.preview(),
@@ -1088,11 +1174,23 @@ impl Runtime {
         text,
       });
     })));
-    let result = self
-      .tools
-      .now()
-      .execute(&name, &call.function.arguments.to_string(), &mut context)
-      .await;
+    // A tool the session was not offered is not run for being named anyway:
+    // the list the model was shown is the boundary, not a hint. It is
+    // answered as a tool that is not there, which is all the model was ever
+    // told about it.
+    let result = match self.rules.permits(&name) {
+      true => {
+        self
+          .tools
+          .now()
+          .execute(&name, &call.function.arguments.to_string(), &mut context)
+          .await
+      }
+      false => ToolResult::failed(
+        ToolExecutionError::not_found(format!("`{name}` is not offered in this session"))
+          .with_model_feedback(format!("tool `{name}` not found")),
+      ),
+    };
 
     // A built-in tool holds itself to a size as it makes its output; a
     // server's reply arrives whole, and as long as the server felt like, so
@@ -1296,7 +1394,13 @@ mod tests {
       &self,
       _request: CompletionRequest,
     ) -> Result<rig_core::completion::CompletionResponse, CompletionError> {
-      Err(CompletionError::ResponseError("the script only streams".into()))
+      // Only the summarizer asks without streaming, and it is told the same
+      // every time.
+      Ok(rig_core::completion::CompletionResponse::new(
+        vec![AssistantContent::text("Something about fruit.")],
+        Usage::new(),
+        "scripted",
+      ))
     }
 
     async fn stream(&self, _request: CompletionRequest) -> Result<StreamingCompletionResponse, CompletionError> {
@@ -1589,6 +1693,128 @@ mod tests {
     assert!(!control.steering());
   }
 
+  /// A command waiting in the queue is not the run's to read: the run takes
+  /// what was typed before it, and leaves it — and everything after it — to
+  /// go in order once the run is over.
+  #[test]
+  fn the_run_reads_up_to_a_waiting_command_and_no_further() {
+    let control = Control::default();
+    let command = |text: &str| Prompt {
+      command: true,
+      ..Prompt::text(text.into())
+    };
+    control.steer(Prompt::text("first".into()));
+    control.steer(command("/compact"));
+    control.steer(Prompt::text("after".into()));
+    assert!(control.steering(), "a message is in front");
+
+    let said: Vec<String> = control.take_said().into_iter().map(|prompt| prompt.text).collect();
+    assert_eq!(said, ["first"]);
+    assert!(!control.steering(), "a command is not the run's to wait for");
+    assert!(control.take_said().is_empty());
+    assert_eq!(control.waiting(), ["/compact", "after"]);
+    assert_eq!(
+      control.take_next().map(|prompt| prompt.text).as_deref(),
+      Some("/compact")
+    );
+  }
+
+  /// A call to a tool the session refused is answered as one to a tool that
+  /// is not there, and nothing is run: the model is only kept from a tool if
+  /// naming it anyway does not get it.
+  #[tokio::test]
+  async fn a_refused_tool_is_not_run_for_being_named() {
+    let witness = std::env::temp_dir().join(format!("fa-refused-{}", std::process::id()));
+    let _ = std::fs::remove_file(&witness);
+    let mut runtime = Arc::into_inner(scripted(
+      vec![
+        vec![asks("call_1", &format!("touch '{}'", witness.display()))],
+        vec![said("fine")],
+      ],
+      false,
+    ))
+    .expect("the only handle");
+    runtime.rules.refused = vec!["bash".into()];
+    assert!(runtime.definitions().await.unwrap().is_empty(), "bash is not offered");
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let handle = start_run(
+      Arc::new(runtime),
+      Control::default(),
+      Vec::new(),
+      vec![Message::user("make a file")],
+      tx,
+    );
+    let mut refused = false;
+    let messages = loop {
+      let event = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+        .await
+        .expect("an event within 10s")
+        .expect("the channel open");
+      match event {
+        AgentEvent::ToolResult { output, is_error, .. } => {
+          assert!(is_error, "{output}");
+          assert_eq!(output, "tool `bash` not found");
+          refused = true;
+        }
+        AgentEvent::Done { messages } => break messages,
+        AgentEvent::Ended { .. } => panic!("the run carried on to its answer"),
+        _ => {}
+      }
+    };
+    handle.await.expect("the run to finish");
+    assert!(refused, "the call was answered");
+    assert!(!witness.exists(), "the command was not run");
+    assert_eq!(
+      shapes(&messages)[1..],
+      ["call call_1", "result call_1 tool `bash` not found", "said \"fine\""]
+    );
+  }
+
+  /// A run that outgrows the window makes room for itself and carries on:
+  /// what it got through goes out with `Compacting` for the session to keep,
+  /// the summary takes its place, and the answer is asked for over that.
+  #[tokio::test]
+  async fn a_run_that_outgrows_the_window_compacts_and_carries_on() {
+    let runtime = scripted(vec![vec![asks("call_1", "echo ok")], vec![said("all done")]], false);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    // Past the 900 tokens the window leaves, so the turn after the first
+    // finds it full.
+    let prompt = format!("remember the kumquat {}", "x".repeat(4000));
+    let handle = start_run(runtime, Control::default(), Vec::new(), vec![Message::user(prompt)], tx);
+    let mut seen = Vec::new();
+    let done = loop {
+      let event = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+        .await
+        .expect("an event within 10s")
+        .expect("the channel open");
+      match event {
+        AgentEvent::Compacting { messages, resuming } => {
+          assert!(resuming, "it stopped for room, so it goes on");
+          assert_eq!(shapes(&messages)[1..], ["call call_1", "result call_1 ok"]);
+          seen.push("compacting");
+        }
+        AgentEvent::Compacted(Some(compacted)) => {
+          assert!(
+            compacted.summary.contains("Something about fruit."),
+            "{}",
+            compacted.summary
+          );
+          assert_eq!(shapes(&compacted.kept), ["call call_1", "result call_1 ok"]);
+          seen.push("compacted");
+        }
+        AgentEvent::Done { messages } => break messages,
+        AgentEvent::Ended { .. } => panic!("the run carried on to its answer: {seen:?}"),
+        AgentEvent::Error(err) => panic!("{err}"),
+        _ => {}
+      }
+    };
+    handle.await.expect("the run to finish");
+    assert_eq!(seen, ["compacting", "compacted"]);
+    // Only what came after the room was made: the rest went out before it.
+    assert_eq!(shapes(&done), ["said \"all done\""]);
+  }
+
   const TEST_SETTINGS: Settings = Settings {
     enabled: true,
     context_window: 1000,
@@ -1663,6 +1889,7 @@ mod tests {
         AgentEvent::Usage { .. } => "usage".into(),
         AgentEvent::Error(e) => format!("error:{e}"),
         AgentEvent::Ended { .. } => "ended".into(),
+        AgentEvent::Compacting { .. } => "compacting".into(),
         AgentEvent::Compacted(_) => "compacted".into(),
         AgentEvent::Models(_) => "models".into(),
         AgentEvent::Show(_) | AgentEvent::Ask(_) => "asking".into(),

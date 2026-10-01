@@ -167,6 +167,17 @@ fn thumb_offset(start: isize, thumb: Thumb, max_scroll: usize) -> usize {
 }
 
 /// Which session to open at startup.
+/// A compaction under way, and what comes after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Compaction {
+  /// `/compact`: the task is the compaction, and is over once it is.
+  Asked,
+  /// One a run is making for itself, which it carries on from once there is
+  /// room — `resuming` — or, made between its answer and the next prompt,
+  /// ends with.
+  Run { resuming: bool },
+}
+
 pub enum SessionStart {
   New,
   /// The most recently modified session, if any.
@@ -212,6 +223,20 @@ const COMMANDS: &[(&str, &str, bool)] = &[
   ("tree", "Go back to an earlier point (or press Esc twice)", false),
   ("quit", "Quit fa", false),
 ];
+/// Whether `text` is one of `COMMANDS`, as `dispatch` reads them: a command
+/// that takes an argument may have one after a space, and one that takes
+/// none is only ever its name.
+fn is_command(text: &str) -> bool {
+  let Some(typed) = text.strip_prefix('/') else {
+    return false;
+  };
+  COMMANDS.iter().any(|&(name, _, takes_arg)| {
+    typed
+      .strip_prefix(name)
+      .is_some_and(|rest| rest.is_empty() || (takes_arg && rest.starts_with(' ')))
+  })
+}
+
 /// Rows shown in the command popup.
 const COMPLETION_ROWS: usize = 5;
 /// Paths gathered for the `@` popup before it is cut to what fits. More than
@@ -637,11 +662,9 @@ pub struct App {
   prompts: Prompts,
   tx: mpsc::UnboundedSender<AgentEvent>,
   run: Option<JoinHandle<()>>,
-  /// The background task in `run` is a compaction rather than a model turn.
-  compacting: bool,
-  /// That compaction is making room for a run which stopped short of the
-  /// context window, and which carries on once there is some.
-  resuming: bool,
+  /// The background task in `run` is compacting rather than asking the
+  /// model, and what for.
+  compacting: Option<Compaction>,
   /// The run in flight, kept for abort recovery.
   /// Esc has been pressed and the run is on its way to stopping.
   aborting: bool,
@@ -756,8 +779,7 @@ impl App {
       prompts: Prompts::default(),
       tx,
       run: None,
-      compacting: false,
-      resuming: false,
+      compacting: None,
       aborting: false,
       pausing: false,
       writing: Vec::new(),
@@ -1851,17 +1873,18 @@ impl App {
     // Read here rather than wherever the prompt is finally sent: the file
     // is what it was when Enter was pressed, not what it becomes while a
     // run works through the queue ahead of it.
-    let prompt = self.attach(&text);
+    let mut prompt = self.attach(&text);
 
-    // What a run makes of what is typed at it is a message, which is what
-    // was meant by all but these: they were typed at fa, and are answered
-    // here whether or not a run has the floor.
-    let for_us =
-      matches!(text.as_str(), "/quit" | "/new" | "/model" | "/goto" | "/pause") || text.starts_with("/model ");
-    if self.run.is_some() && !for_us {
-      // Handed to the run, which reads it at the top of its next turn
-      // rather than after the whole answer. It is kept there and nowhere
-      // else, so whoever gets to it first is the only one who can.
+    // A command was typed at fa, and is fa's to answer whether or not a run
+    // has the floor — never the model's to read. Most are answered at once.
+    // The two that set something going in the run's place wait their turn
+    // behind it instead, as a message does, and are answered once it ends.
+    let waits = matches!(text.as_str(), "/compact" | "/continue");
+    if self.run.is_some() && (waits || !is_command(&text)) {
+      // A message is handed to the run, which reads it at the top of its
+      // next turn rather than after the whole answer. It is kept there and
+      // nowhere else, so whoever gets to it first is the only one who can.
+      prompt.command = waits;
       self.agents.control.steer(prompt);
       return;
     }
@@ -2086,7 +2109,6 @@ impl App {
   fn reset_conversation(&mut self) {
     self.agents.control.take();
     self.overflowed();
-    self.resuming = false;
     self.usage = Usage::new();
     self.context_tokens = None;
     self.anchor = None;
@@ -2304,12 +2326,11 @@ impl App {
   fn compact(&mut self) {
     if self.session.history.is_empty() {
       self.notify("Nothing to compact.");
-      self.resuming = false;
       self.next_queued();
       return;
     }
     self.entries.push(Entry::Info("Compacting context…".into()));
-    self.compacting = true;
+    self.compacting = Some(Compaction::Asked);
     self.run = Some(start_compaction(
       self.agents.runtime.clone(),
       self.session.history.clone(),
@@ -2369,14 +2390,14 @@ impl App {
       return;
     }
     // Esc is the end of it: a run stopped to be compacted is not resumed
-    // afterwards, and the next one starts with the window weighed afresh.
+    // afterwards — killing the task is what stops the one making room for
+    // itself — and the next one starts with the window weighed afresh.
     self.overflowed();
-    self.resuming = false;
-    if self.compacting {
+    if self.compacting.is_some() {
       if let Some(handle) = self.run.take() {
         handle.abort();
       }
-      self.compacting = false;
+      self.compacting = None;
       self.writing.clear();
       self.outcomes.clear();
       self.entries.push(Entry::Info("Compaction aborted.".into()));
@@ -2552,25 +2573,14 @@ impl App {
         // It got to its answer before its next turn came round.
         self.pausing = false;
         self.stopped(messages);
-        // The run ended with its answer, so there is nothing to pick back
-        // up; a context that outgrew the window is still made room in,
-        // before the next message is sent into it.
-        self.resuming = false;
-        if self.overflowed() {
-          self.compact();
-        } else {
-          self.next_queued();
-        }
+        self.next_queued();
       }
       AgentEvent::Ended { messages } => {
         self.run_over();
-        let full = self.overflowed();
         let pausing = std::mem::take(&mut self.pausing);
-        if self.compacting {
+        if self.compacting.take().is_some() {
           // A compaction that did not finish is not worth starting again on
           // the next turn: the room it was going to make is not coming.
-          self.compacting = false;
-          self.resuming = false;
           self.outcomes.clear();
           self.next_queued();
           return;
@@ -2584,29 +2594,30 @@ impl App {
           self.strand_queued();
           return;
         }
-        // Between turns, so nothing was left running. A context found full
-        // on the way is still made room in, but not carried on from.
+        // Between turns, so nothing was left running.
         if pausing {
           self.paused();
-          if full {
-            self.compact();
-          }
-          return;
-        }
-        if full {
-          // The run stopped at a turn boundary to let this happen, and
-          // goes on once there is room again.
-          self.resuming = true;
-          self.compact();
           return;
         }
         self.next_queued();
       }
+      // What the run got through before it ran out of room is saved before
+      // the summary takes its place, as a run's work is whenever it stops.
+      AgentEvent::Compacting { messages, resuming } => {
+        self.stopped(messages);
+        self.entries.push(Entry::Info("Compacting context…".into()));
+        self.compacting = Some(Compaction::Run { resuming });
+      }
       AgentEvent::Compacted(result) => {
-        self.run = None;
-        self.compacting = false;
-        let resuming = std::mem::take(&mut self.resuming);
-        let pausing = std::mem::take(&mut self.pausing);
+        let Some(compaction) = self.compacting.take() else {
+          return;
+        };
+        // `/compact` is over with this; a run goes on, or ends, by itself.
+        let asked = compaction == Compaction::Asked;
+        if asked {
+          self.run = None;
+          self.pausing = false;
+        }
         match result {
           Some(compacted) => {
             let kept = compacted.kept.len();
@@ -2619,27 +2630,16 @@ impl App {
               messages(kept)
             )));
             self.entries.push(Entry::Summary(compacted.summary));
-            // What was cut short to make this room carries on where it
-            // stopped — unless the user has said something since, which is
-            // what it would have read next anyway.
-            if resuming && pausing {
-              self.paused();
-              return;
-            }
-            if resuming && !self.agents.control.steering() {
-              self.continue_run();
-              return;
-            }
           }
-          // Nothing left to summarize but the turn the context is full of.
-          // Carrying on regardless would only fill it again and ask for the
-          // same summary, so this is where it stops and the user decides.
-          None if resuming => self.entries.push(Entry::Info(
+          // The run has stopped where it stood, and the user decides.
+          None if compaction == (Compaction::Run { resuming: true }) => self.entries.push(Entry::Info(
             "The context is full and there is nothing left to compact — /continue to carry on anyway.".into(),
           )),
           None => self.notify("Nothing to compact."),
         }
-        self.next_queued();
+        if asked {
+          self.next_queued();
+        }
       }
     }
   }
@@ -3070,7 +3070,7 @@ impl App {
     }
     if self.run.is_some() {
       left.push(Span::raw("  "));
-      let verb = match (self.compacting, self.pausing) {
+      let verb = match (self.compacting.is_some(), self.pausing) {
         (true, _) => "compacting",
         (false, true) => "pausing",
         (false, false) => "working",
@@ -5128,6 +5128,33 @@ fn shorten_home(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+  #[test]
+  fn a_command_is_known_by_its_name_and_the_argument_it_takes() {
+    for command in [
+      "/compact",
+      "/session",
+      "/model",
+      "/model mock-mini",
+      "/name",
+      "/name notes",
+    ] {
+      assert!(super::is_command(command), "{command}");
+    }
+    // A command that takes nothing is only ever its name; anything else
+    // starting with a slash is a message, and so is a server's prompt.
+    for message in [
+      "/compact now",
+      "/models",
+      "/named",
+      "/frobnicate",
+      "/notes:review",
+      "compact",
+      "/",
+    ] {
+      assert!(!super::is_command(message), "{message}");
+    }
+  }
+
   use super::*;
 
   /// The rows ratatui itself paints the thumb on, for [`thumb_bounds`] to be

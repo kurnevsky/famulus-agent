@@ -1420,6 +1420,65 @@ fn a_call_being_written_is_replaced_by_the_call_it_becomes() {
   }
 }
 
+/// A command typed while a run works is fa's to answer, never the model's to
+/// read. One that can be answered at once is; one that would set something
+/// going in the run's place waits for the run to end, and goes before
+/// whatever was typed after it.
+#[test]
+fn a_command_typed_mid_run_is_answered_by_fa_and_never_sent_to_the_model() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "Working. ",
+      tool: "bash",
+      args: serde_json::json!({ "command": "sleep 2; echo ok" }),
+    },
+    Turn::Echo,
+  ]);
+  // Kept to the last message, so there is something to compact.
+  let term = Term::start(
+    "command-mid-run",
+    &provider,
+    &["--no-session", "--keep-recent-tokens", "1"],
+  );
+  term.submit("start something slow");
+  term.wait_for("⚙ bash sleep 2");
+
+  // Answered while the run is still going.
+  term.submit("/session");
+  term.wait_for("tokens this run");
+  term.submit("/compact");
+  term.submit("and then this");
+  term.wait_for("Queued: and then this");
+  assert!(term.screen().contains("Queued: /compact"), "{}", term.screen());
+
+  let screen = term.wait_for("Answer to and then this.");
+  let at = |needle: &str| {
+    screen
+      .lines()
+      .position(|line| line.contains(needle))
+      .unwrap_or_else(|| panic!("{needle:?} on screen:\n{screen}"))
+  };
+  // The run answered what it was asked without being handed the command,
+  // then the room was made, then what was typed after it went.
+  assert!(
+    at("Answer to start something slow.") < at("into a summary")
+      && at("into a summary") < at("Answer to and then this."),
+    "in the order they were typed:\n{screen}"
+  );
+  assert!(
+    provider
+      .request("and then this")
+      .contains("was compacted into the following summary"),
+    "what came after the command was sent over the summary"
+  );
+  for command in ["/session", "/compact"] {
+    assert!(!provider.sent(command), "{command} never reached the model");
+  }
+}
+
 #[test]
 fn a_message_typed_mid_run_waits_at_the_bottom_and_goes_at_the_next_turn() {
   if !have_tmux() {
