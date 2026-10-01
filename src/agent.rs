@@ -25,8 +25,8 @@ use rig_core::client::model_listing::ModelListingClient;
 use rig_core::completion::{CompletionError, CompletionModel, Message, ToolDefinition, Usage};
 use rig_core::message::{AssistantContent, ToolCall, ToolResultContent, UserContent};
 use rig_core::providers::{
-  anthropic, cohere, deepseek, doubleword, gemini, groq, hyperbolic, llamafile, mira, mistral, ollama, openai,
-  openrouter, perplexity, together, venice, xai,
+  anthropic, azure, cohere, deepseek, doubleword, gemini, groq, huggingface, hyperbolic, llamafile, minimax, mira,
+  mistral, moonshot, ollama, openai, openrouter, perplexity, together, venice, xai, xiaomimimo, zai,
 };
 use rig_core::streaming::{StreamedAssistantContent, StreamingCompletionResponse, ToolCallDeltaContent};
 use tokio::sync::{mpsc, watch};
@@ -388,6 +388,11 @@ pub enum Provider {
   /// OpenAI Chat Completions and compatible servers
   #[value(name = "openai")]
   OpenAi,
+  /// OpenAI Responses API
+  #[value(name = "openai-responses")]
+  OpenAiResponses,
+  /// Azure OpenAI, at the resource endpoint `--base-url` names
+  Azure,
   /// OpenRouter
   #[value(name = "openrouter")]
   OpenRouter,
@@ -406,14 +411,22 @@ pub enum Provider {
   Doubleword,
   /// Groq
   Groq,
+  /// Hugging Face Inference
+  #[value(name = "huggingface")]
+  HuggingFace,
   /// Hyperbolic
   Hyperbolic,
   /// A llamafile server, on http://localhost:8080 by default
   Llamafile,
+  /// MiniMax
+  #[value(name = "minimax")]
+  MiniMax,
   /// Mira
   Mira,
   /// Mistral
   Mistral,
+  /// Moonshot AI (Kimi)
+  Moonshot,
   /// Perplexity
   Perplexity,
   /// Together AI
@@ -423,6 +436,12 @@ pub enum Provider {
   /// xAI
   #[value(name = "xai")]
   XAi,
+  /// Xiaomi MiMo
+  #[value(name = "xiaomimimo")]
+  XiaomiMimo,
+  /// Z.AI
+  #[value(name = "zai")]
+  ZAi,
 }
 
 impl Provider {
@@ -437,7 +456,13 @@ impl Provider {
   /// The environment variable the key is read from when `--api-key` is not
   /// given.
   pub fn key_env(self) -> String {
-    format!("{}_API_KEY", self.label().to_uppercase())
+    match self {
+      // One OpenAI key, whichever of its two APIs it is spoken to through.
+      Self::OpenAiResponses => "OPENAI_API_KEY".into(),
+      // Xiaomi spells the two words of its name apart.
+      Self::XiaomiMimo => "XIAOMI_MIMO_API_KEY".into(),
+      _ => format!("{}_API_KEY", self.label().to_uppercase()),
+    }
   }
 
   /// The key to use when none is given. Ollama and llamafile want no key at
@@ -472,10 +497,14 @@ pub struct Config {
 
 /// Whether this provider takes an image inside a tool result.
 ///
-/// Gemini takes one inside a function response and Anthropic inside a tool
-/// result; the rest refuse them there and have them relayed after it.
+/// Gemini takes one inside a function response, Anthropic inside a tool
+/// result, and the Responses API inside a function call's output; the rest
+/// refuse them there and have them relayed after it.
 fn relays_images(provider: Provider) -> bool {
-  !matches!(provider, Provider::Gemini | Provider::Anthropic)
+  !matches!(
+    provider,
+    Provider::Gemini | Provider::Anthropic | Provider::OpenAiResponses
+  )
 }
 
 /// A provider's client, with the configured key — or the one given, since
@@ -509,6 +538,25 @@ fn build_model(cfg: &Config) -> Result<ModelHandle> {
 
   Ok(match cfg.provider {
     Provider::OpenAi => model!(openai::CompletionsClient::builder(), "OpenAI-compatible"),
+    Provider::OpenAiResponses => model!(openai::Client::builder(), "OpenAI Responses"),
+    // Azure has no endpoint of its own to fall back to: every resource is
+    // reached at its own host. The key goes in the `api-key` header Azure
+    // keys are checked under — handed over as a plain string, rig would send
+    // it as a bearer token instead.
+    Provider::Azure => {
+      let endpoint = cfg.base_url.as_deref().with_context(|| {
+        format!(
+          "{} needs --base-url: the resource endpoint, like https://NAME.openai.azure.com",
+          cfg.provider.label()
+        )
+      })?;
+      let client = azure::Client::builder()
+        .api_key(azure::AzureOpenAIAuth::ApiKey(cfg.api_key.clone()))
+        .azure_endpoint(endpoint.trim_end_matches('/').to_string())
+        .build()
+        .context("failed to build Azure client")?;
+      ModelHandle::new(client.completion_model(cfg.model.clone()))
+    }
     Provider::OpenRouter => model!(openrouter::Client::builder(), "OpenRouter"),
     Provider::Ollama => model!(ollama::Client::builder(), "Ollama"),
     Provider::Gemini => model!(gemini::Client::builder(), "Gemini"),
@@ -525,14 +573,19 @@ fn build_model(cfg: &Config) -> Result<ModelHandle> {
     Provider::DeepSeek => model!(deepseek::Client::builder(), "DeepSeek"),
     Provider::Doubleword => model!(doubleword::Client::builder(), "Doubleword"),
     Provider::Groq => model!(groq::Client::builder(), "Groq"),
+    Provider::HuggingFace => model!(huggingface::Client::builder(), "Hugging Face"),
     Provider::Hyperbolic => model!(hyperbolic::Client::builder(), "Hyperbolic"),
     Provider::Llamafile => model!(llamafile::Client::builder(), "llamafile", Nothing),
+    Provider::MiniMax => model!(minimax::Client::builder(), "MiniMax"),
     Provider::Mira => model!(mira::Client::builder(), "Mira"),
     Provider::Mistral => model!(mistral::Client::builder(), "Mistral"),
+    Provider::Moonshot => model!(moonshot::Client::builder(), "Moonshot"),
     Provider::Perplexity => model!(perplexity::Client::builder(), "Perplexity"),
     Provider::Together => model!(together::Client::builder(), "Together"),
     Provider::Venice => model!(venice::Client::builder(), "Venice"),
     Provider::XAi => model!(xai::Client::builder(), "xAI"),
+    Provider::XiaomiMimo => model!(xiaomimimo::Client::builder(), "Xiaomi MiMo"),
+    Provider::ZAi => model!(zai::Client::builder(), "Z.AI"),
   })
 }
 
@@ -553,15 +606,19 @@ pub async fn list_models(cfg: &Config) -> Result<Vec<ModelInfo>> {
 
   let models = match cfg.provider {
     Provider::OpenAi => list!(openai::CompletionsClient::builder(), "OpenAI-compatible"),
+    Provider::OpenAiResponses => list!(openai::Client::builder(), "OpenAI Responses"),
     Provider::OpenRouter => list!(openrouter::Client::builder(), "OpenRouter"),
     Provider::Ollama => list!(ollama::Client::builder(), "Ollama"),
     Provider::Gemini => list!(gemini::Client::builder(), "Gemini"),
     Provider::Anthropic => list!(anthropic::Client::builder(), "Anthropic"),
     Provider::DeepSeek => list!(deepseek::Client::builder(), "DeepSeek"),
     Provider::Groq => list!(groq::Client::builder(), "Groq"),
+    Provider::MiniMax => list!(minimax::Client::builder(), "MiniMax"),
     Provider::Mira => list!(mira::Client::builder(), "Mira"),
     Provider::Mistral => list!(mistral::Client::builder(), "Mistral"),
+    Provider::Moonshot => list!(moonshot::Client::builder(), "Moonshot"),
     Provider::Venice => list!(venice::Client::builder(), "Venice"),
+    Provider::XiaomiMimo => list!(xiaomimimo::Client::builder(), "Xiaomi MiMo"),
     // The rest have no listing endpoint rig speaks. Refused here rather than
     // by a second list of which providers have an arm above: this is the
     // list, and it answers without a request going out.
@@ -1980,8 +2037,10 @@ mod tests {
 
   /// Every provider there is, and whether an image it is sent inside a tool
   /// result has to be relayed after it instead.
-  const PROVIDERS: [(Provider, bool); 17] = [
+  const PROVIDERS: [(Provider, bool); 24] = [
     (Provider::OpenAi, true),
+    (Provider::OpenAiResponses, false),
+    (Provider::Azure, true),
     (Provider::OpenRouter, true),
     (Provider::Ollama, true),
     (Provider::Gemini, false),
@@ -1990,22 +2049,32 @@ mod tests {
     (Provider::DeepSeek, true),
     (Provider::Doubleword, true),
     (Provider::Groq, true),
+    (Provider::HuggingFace, true),
     (Provider::Hyperbolic, true),
     (Provider::Llamafile, true),
+    (Provider::MiniMax, true),
     (Provider::Mira, true),
     (Provider::Mistral, true),
+    (Provider::Moonshot, true),
     (Provider::Perplexity, true),
     (Provider::Together, true),
     (Provider::Venice, true),
     (Provider::XAi, true),
+    (Provider::XiaomiMimo, true),
+    (Provider::ZAi, true),
   ];
 
-  /// Every provider builds, with a key and without one, and only the two
+  /// Every provider builds, with a key and without one, and only the three
   /// that take an image inside a tool result skip the relay.
   #[test]
   fn each_provider_builds_a_model() {
     for (provider, relay) in PROVIDERS {
       for (key, base_url) in [("", None), ("k", Some("http://127.0.0.1:1/v1/".to_string()))] {
+        // Azure has no endpoint to fall back on; that refusal is tested on
+        // its own.
+        if provider == Provider::Azure && base_url.is_none() {
+          continue;
+        }
         let cfg = Config {
           provider,
           base_url,
@@ -2023,6 +2092,38 @@ mod tests {
         assert_eq!(agents.runtime.relay_images, relay, "{provider:?}");
       }
     }
+  }
+
+  /// Azure is refused without an endpoint, and told what to give instead of
+  /// being built against nowhere.
+  #[test]
+  fn azure_needs_an_endpoint() {
+    let cfg = Config {
+      provider: Provider::Azure,
+      base_url: None,
+      api_key: "k".into(),
+      model: "mock".into(),
+      system_prompt: None,
+      max_tokens: None,
+      compaction: TEST_SETTINGS,
+      vision: true,
+      tools: Default::default(),
+    };
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let Err(err) = build_agents(&cfg, Path::new("/tmp"), &Host::new(tx), &Default::default()) else {
+      panic!("Azure built with no endpoint");
+    };
+    assert!(format!("{err:#}").contains("--base-url"), "{err:#}");
+  }
+
+  /// The key is read from the variable the provider's own tools use.
+  #[test]
+  fn each_provider_reads_its_own_key_variable() {
+    assert_eq!(Provider::OpenAi.key_env(), "OPENAI_API_KEY");
+    assert_eq!(Provider::OpenAiResponses.key_env(), "OPENAI_API_KEY");
+    assert_eq!(Provider::XiaomiMimo.key_env(), "XIAOMI_MIMO_API_KEY");
+    assert_eq!(Provider::ZAi.key_env(), "ZAI_API_KEY");
+    assert_eq!(Provider::HuggingFace.key_env(), "HUGGINGFACE_API_KEY");
   }
 
   /// Every provider answers being asked for its models, with a list or with

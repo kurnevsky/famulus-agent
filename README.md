@@ -40,6 +40,8 @@ variable it falls back to:
 | `--provider` | Default endpoint | Key from |
 |---|---|---|
 | `openai` (default) | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
+| `openai-responses` | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
+| `azure` | none: `--base-url` is required | `AZURE_API_KEY` |
 | `anthropic` | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` |
 | `gemini` | Google's generateContent API | `GEMINI_API_KEY` |
 | `openrouter` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
@@ -49,13 +51,18 @@ variable it falls back to:
 | `deepseek` | `https://api.deepseek.com` | `DEEPSEEK_API_KEY` |
 | `doubleword` | `https://api.doubleword.ai/v1` | `DOUBLEWORD_API_KEY` |
 | `groq` | `https://api.groq.com/openai/v1` | `GROQ_API_KEY` |
+| `huggingface` | `https://router.huggingface.co` | `HUGGINGFACE_API_KEY` |
 | `hyperbolic` | `https://api.hyperbolic.xyz` | `HYPERBOLIC_API_KEY` |
+| `minimax` | `https://api.minimax.io/v1` | `MINIMAX_API_KEY` |
 | `mira` | `https://api.mira.network` | `MIRA_API_KEY` |
 | `mistral` | `https://api.mistral.ai` | `MISTRAL_API_KEY` |
+| `moonshot` | `https://api.moonshot.ai/v1` | `MOONSHOT_API_KEY` |
 | `perplexity` | `https://api.perplexity.ai` | `PERPLEXITY_API_KEY` |
 | `together` | `https://api.together.xyz` | `TOGETHER_API_KEY` |
 | `venice` | `https://api.venice.ai/api/v1` | `VENICE_API_KEY` |
 | `xai` | `https://api.x.ai` | `XAI_API_KEY` |
+| `xiaomimimo` | `https://api.xiaomimimo.com/v1` | `XIAOMI_MIMO_API_KEY` |
+| `zai` | `https://api.z.ai/api/paas/v4` | `ZAI_API_KEY` |
 
 Most of these are OpenAI-compatible and reachable through `--provider openai
 --base-url ...` as well; naming one buys the default endpoint, the right key
@@ -63,6 +70,13 @@ variable, and whatever rig does differently on that wire. Anthropic will not
 take a request that names no `max_tokens`, so it is given what the named model
 allows — or 2048 for a model rig does not recognise, which is when
 `--max-tokens` is worth setting.
+
+`openai` speaks Chat Completions and `openai-responses` the newer Responses
+API, which carries a screenshot inside the tool result that read it rather
+than after it. `azure` has no endpoint to fall back on: `--base-url` names the
+resource, like `https://NAME.openai.azure.com`, `--model` the deployment, and
+the key is sent as Azure's `api-key` header. The China and coding endpoints of
+MiniMax, Moonshot and Z.AI are a `--base-url` away.
 
 | Flag | Env | Default | Meaning |
 |------|-----|---------|---------|
@@ -175,8 +189,9 @@ stops when the window fills, makes room, and picks itself back up. A provider
 that takes the request and never answers is given twenty seconds before fa
 stops listening.
 
-Seven providers cannot be asked at all (Cohere, Doubleword, Hyperbolic,
-llamafile, Perplexity, Together, xAI): rig speaks no listing endpoint for
+Ten providers cannot be asked at all (Azure, Cohere, Doubleword, Hugging
+Face, Hyperbolic, llamafile, Perplexity, Together, xAI, Z.AI): rig speaks no
+listing endpoint for
 them, so `/model` on one of those says so without a request going out, and
 `/model <id>` is the way to change model there.
 
