@@ -102,7 +102,7 @@ const HASKELL_HIGHLIGHTS: &str = r#"
 [
   "module" "where" "import" "qualified" "as" "hiding"
   "data" "newtype" "type" "class" "instance" "deriving" "family" "role"
-  "let" "in" "if" "then" "else" "case" "of" "do" "mdo" "rec"
+  "let" "in" "if" "then" "else" "case" "cases" "of" "do" "mdo" "rec"
   "forall" "foreign" "export" "pattern" "default"
   "infix" "infixl" "infixr" "via" "stock" "anyclass"
 ] @keyword
@@ -884,6 +884,15 @@ mod tests {
       !lines.iter().flatten().any(|s| s.style.fg == Some(Color::Yellow)),
       "{lines:?}"
     );
+  }
+
+  #[test]
+  #[cfg(feature = "lang-haskell")]
+  fn haskell_lambda_cases_is_a_keyword() {
+    let lines = highlight("haskell", "f = \\cases\n  x y -> case x of _ -> y").unwrap();
+    let keyword = style_of(&lines, "case").unwrap();
+    assert!(keyword.fg.is_some(), "{lines:?}");
+    assert_eq!(style_of(&lines, "cases"), Some(keyword), "{lines:?}");
   }
 
   #[test]

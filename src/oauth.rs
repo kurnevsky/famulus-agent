@@ -138,11 +138,11 @@ pub async fn login(name: &str, url: &str, settings: &Settings, store: &Store) ->
   let secret = secret(settings).await?;
   let mut manager = AuthorizationManager::new(url).await?;
   manager.set_credential_store(store.clone());
-  let metadata = manager
-    .discover_metadata()
+  let resolved = manager
+    .resolve_metadata()
     .await
     .context("could not find where it signs people in")?;
-  manager.set_metadata(metadata);
+  manager.set_metadata(resolved.metadata);
 
   let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, settings.port.unwrap_or(0)))
     .await

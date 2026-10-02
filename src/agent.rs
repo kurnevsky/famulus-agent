@@ -16,24 +16,20 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use futures::StreamExt;
-use rig_agent::ModelHandle;
 use rig_agent::tool::server::{ToolServer, ToolServerHandle};
 use rig_agent::tool::{ToolContext, ToolExecutionError, ToolResult};
-use rig_core::client::Nothing;
-use rig_core::client::completion::CompletionClient;
-use rig_core::client::model_listing::ModelListingClient;
-use rig_core::completion::{CompletionError, CompletionModel, Message, ToolDefinition, Usage};
-use rig_core::message::{AssistantContent, ToolCall, ToolResultContent, UserContent};
-use rig_core::providers::{
-  anthropic, azure, cohere, deepseek, doubleword, gemini, groq, huggingface, hyperbolic, llamafile, minimax, mira,
-  mistral, moonshot, ollama, openai, openrouter, perplexity, together, venice, xai, xiaomimimo, zai,
-};
-use rig_core::streaming::{StreamedAssistantContent, StreamingCompletionResponse, ToolCallDeltaContent};
+use rig_core::DynModel;
+use rig_core::completion::{CompletionRequest, Message, ToolDefinition, Usage};
+use rig_core::message::{AssistantContent, Reasoning, ToolCall, ToolResultContent, UserContent};
+use rig_core::operation::Completion;
+use rig_core::providers::{anthropic, cohere, gemini, ollama, openai, xai};
+use rig_core::streaming::{CompletionStream, Item, Part, PartKind, StreamEvent};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::attach::Prompt;
 use crate::compaction::{self, Compacted, Settings};
+use crate::drafts::{Fragment, drafting};
 use crate::modal::{Host, Modal};
 use crate::tools::{AskTool, BUILT_IN, BashTool, EditDiff, EditTool, Output, ReadTool, WriteTool};
 
@@ -177,12 +173,7 @@ impl Agents {
   /// the one it already had.
   pub fn use_model(&mut self, cfg: &Config) -> Result<()> {
     let old = &self.runtime;
-    self.runtime = Arc::new(Runtime::new(
-      cfg,
-      old.tools.clone(),
-      old.preamble.clone(),
-      old.relay_images,
-    )?);
+    self.runtime = Arc::new(Runtime::new(cfg, old.tools.clone(), old.preamble.clone())?);
     Ok(())
   }
 }
@@ -351,7 +342,7 @@ impl Tools {
 /// Everything a run needs that does not change between runs.
 pub struct Runtime {
   /// Whichever provider it came from: the rest of the file does not care.
-  model: ModelHandle,
+  model: DynModel<Completion>,
   tools: Tools,
   preamble: String,
   compaction: Settings,
@@ -365,9 +356,10 @@ pub struct Runtime {
 }
 
 impl Runtime {
-  fn new(cfg: &Config, tools: Tools, preamble: String, relay_images: bool) -> Result<Self> {
+  fn new(cfg: &Config, tools: Tools, preamble: String) -> Result<Self> {
+    let (model, relay_images) = build_model(cfg)?;
     Ok(Self {
-      model: build_model(cfg)?,
+      model,
       tools,
       preamble,
       compaction: cfg.compaction,
@@ -380,25 +372,11 @@ impl Runtime {
   /// One question to the model with no tools and the summarizer's preamble,
   /// and its answer: how compaction summarizes. Nothing here is a
   /// conversation.
-  pub async fn ask(&self, prompt: String) -> Result<String, CompletionError> {
-    let response = self
-      .model
-      .completion_request(Message::user(prompt))
-      .preamble(compaction::SYSTEM_PROMPT.to_string())
-      .max_tokens_opt(self.max_tokens)
-      .send()
-      .await?;
-    Ok(
-      response
-        .choice
-        .iter()
-        .filter_map(|content| match content {
-          AssistantContent::Text(text) => Some(text.text.as_str()),
-          _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join(""),
-    )
+  pub async fn ask(&self, prompt: String) -> Result<String> {
+    let request = CompletionRequest::new(Message::user(prompt))
+      .preamble(compaction::SYSTEM_PROMPT)
+      .max_tokens(self.max_tokens);
+    Ok(self.model.call(request).await?.text())
   }
 }
 
@@ -437,8 +415,10 @@ pub enum Provider {
   HuggingFace,
   /// Hyperbolic
   Hyperbolic,
-  /// A llamafile server, on http://localhost:8080 by default
-  Llamafile,
+  /// A llama.cpp server — llama-server, or a llamafile — on
+  /// http://localhost:8080 by default
+  #[value(name = "llamacpp")]
+  LlamaCpp,
   /// MiniMax
   #[value(name = "minimax")]
   MiniMax,
@@ -477,22 +457,22 @@ impl Provider {
   /// The environment variable the key is read from when `--api-key` is not
   /// given.
   pub fn key_env(self) -> String {
-    match self {
-      // One OpenAI key, whichever of its two APIs it is spoken to through.
-      Self::OpenAiResponses => "OPENAI_API_KEY".into(),
-      // Xiaomi spells the two words of its name apart.
-      Self::XiaomiMimo => "XIAOMI_MIMO_API_KEY".into(),
+    match (self, dialect(self)) {
+      // The variable rig reads for it, which is the one its own tools use.
+      (_, Some(dialect)) => dialect.api_key_env.into(),
+      (Self::Anthropic, None) => anthropic::ANTHROPIC.api_key_env.into(),
+      (Self::Gemini, None) => gemini::API_KEY_ENV.into(),
       _ => format!("{}_API_KEY", self.label().to_uppercase()),
     }
   }
 
-  /// The key to use when none is given. Ollama and llamafile want no key at
+  /// The key to use when none is given. Ollama and llama.cpp want no key at
   /// all — rig leaves the header off for an empty one, which is what a local
   /// server expects — while a hosted endpoint that ignores auth is happy with
   /// anything.
   pub fn no_key(self) -> &'static str {
     match self {
-      Self::Ollama | Self::Llamafile => "",
+      Self::Ollama | Self::LlamaCpp => "",
       _ => "none",
     }
   }
@@ -516,137 +496,152 @@ pub struct Config {
   pub tools: crate::tools::Rules,
 }
 
-/// Whether this provider takes an image inside a tool result.
-///
-/// Gemini takes one inside a function response, Anthropic inside a tool
-/// result, and the Responses API inside a function call's output; the rest
-/// refuse them there and have them relayed after it.
-fn relays_images(provider: Provider) -> bool {
-  !matches!(
-    provider,
-    Provider::Gemini | Provider::Anthropic | Provider::OpenAiResponses
-  )
+/// A provider's client, with the configured key and the base URL when there
+/// is one. Every OpenAI-shaped provider is the one client on a dialect of its
+/// own; the four that speak something else have clients of their own.
+enum Client {
+  OpenAi(Box<openai::OpenAI>),
+  Anthropic(anthropic::Anthropic),
+  Gemini(gemini::Gemini),
+  Ollama(ollama::Ollama),
+  Cohere(cohere::Cohere),
 }
 
-/// A provider's client, with the configured key — or the one given, since
-/// llamafile's client takes no key at all and says so in its type — and the
-/// base URL when there is one. Each builder is a type of its own, so this is
-/// spelled once here rather than once per provider.
-macro_rules! client {
-  ($cfg:expr, $builder:expr, $what:literal) => {
-    client!($cfg, $builder, $what, $cfg.api_key.as_str())
-  };
-  ($cfg:expr, $builder:expr, $what:literal, $key:expr) => {{
-    let mut builder = $builder.api_key($key);
-    if let Some(url) = $cfg.base_url.as_deref() {
-      builder = builder.base_url(url.trim_end_matches('/'));
-    }
-    builder.build().context(concat!("failed to build ", $what, " client"))?
-  }};
+/// The OpenAI-shaped dialect `provider` speaks, for the ones that speak one.
+fn dialect(provider: Provider) -> Option<&'static openai::wire::Dialect> {
+  use openai::wire::*;
+  Some(match provider {
+    Provider::OpenAi | Provider::OpenAiResponses => &OPENAI,
+    Provider::Azure => &AZURE,
+    Provider::OpenRouter => &OPENROUTER,
+    Provider::DeepSeek => &DEEPSEEK,
+    Provider::Doubleword => &DOUBLEWORD,
+    Provider::Groq => &GROQ,
+    Provider::HuggingFace => &HUGGINGFACE,
+    Provider::Hyperbolic => &HYPERBOLIC,
+    Provider::LlamaCpp => &LLAMACPP,
+    Provider::MiniMax => &MINIMAX,
+    Provider::Mira => &MIRA,
+    Provider::Mistral => &MISTRAL,
+    Provider::Moonshot => &MOONSHOT,
+    Provider::Perplexity => &PERPLEXITY,
+    Provider::Together => &TOGETHER,
+    Provider::Venice => &VENICE,
+    Provider::XAi => &xai::DIALECT,
+    Provider::XiaomiMimo => &XIAOMIMIMO,
+    Provider::ZAi => &ZAI,
+    Provider::Ollama | Provider::Gemini | Provider::Anthropic | Provider::Cohere => return None,
+  })
 }
 
-/// The handle `cfg.model` is reached through, whichever provider offers it.
-///
-/// Summarizing asks the same model the same way, so it is the same handle —
-/// what makes that call a summary is the preamble it carries, which belongs
-/// to the request rather than to the model.
-fn build_model(cfg: &Config) -> Result<ModelHandle> {
-  macro_rules! model {
-    ($($client:tt)*) => {
-      ModelHandle::new(client!(cfg, $($client)*).completion_model(cfg.model.clone()))
+fn client(cfg: &Config) -> Result<Client> {
+  let key = cfg.api_key.as_str();
+  let url = cfg.base_url.as_deref().map(|url| url.trim_end_matches('/'));
+  macro_rules! at {
+    ($config:expr) => {
+      match url {
+        Some(url) => $config.with_base_url(url),
+        None => $config,
+      }
+      .client()
     };
   }
 
-  Ok(match cfg.provider {
-    Provider::OpenAi => model!(openai::CompletionsClient::builder(), "OpenAI-compatible"),
-    Provider::OpenAiResponses => model!(openai::Client::builder(), "OpenAI Responses"),
+  if let Some(dialect) = dialect(cfg.provider) {
     // Azure has no endpoint of its own to fall back to: every resource is
     // reached at its own host. The key goes in the `api-key` header Azure
-    // keys are checked under — handed over as a plain string, rig would send
-    // it as a bearer token instead.
-    Provider::Azure => {
-      let endpoint = cfg.base_url.as_deref().with_context(|| {
-        format!(
-          "{} needs --base-url: the resource endpoint, like https://NAME.openai.azure.com",
-          cfg.provider.label()
-        )
-      })?;
-      let client = azure::Client::builder()
-        .api_key(azure::AzureOpenAIAuth::ApiKey(cfg.api_key.clone()))
-        .azure_endpoint(endpoint.trim_end_matches('/').to_string())
-        .build()
-        .context("failed to build Azure client")?;
-      ModelHandle::new(client.completion_model(cfg.model.clone()))
+    // keys are checked under, which is how its dialect sends one.
+    if cfg.provider == Provider::Azure && url.is_none() {
+      bail!(
+        "{} needs --base-url: the resource endpoint, like https://NAME.openai.azure.com",
+        cfg.provider.label()
+      );
     }
-    Provider::OpenRouter => model!(openrouter::Client::builder(), "OpenRouter"),
-    Provider::Ollama => model!(ollama::Client::builder(), "Ollama"),
-    Provider::Gemini => model!(gemini::Client::builder(), "Gemini"),
-    // Anthropic refuses a request that names no `max_tokens`, so the model is
-    // built through `with_model` rather than `completion_model`: it fills in
-    // what the named model allows, and falls back to a small cap for one it
-    // does not know — which is what `--max-tokens` is for, since a figure on
-    // the request wins over the model's own.
-    Provider::Anthropic => ModelHandle::new(anthropic::completion::CompletionModel::with_model(
-      client!(cfg, anthropic::Client::builder(), "Anthropic"),
-      &cfg.model,
-    )),
-    Provider::Cohere => model!(cohere::Client::builder(), "Cohere"),
-    Provider::DeepSeek => model!(deepseek::Client::builder(), "DeepSeek"),
-    Provider::Doubleword => model!(doubleword::Client::builder(), "Doubleword"),
-    Provider::Groq => model!(groq::Client::builder(), "Groq"),
-    Provider::HuggingFace => model!(huggingface::Client::builder(), "Hugging Face"),
-    Provider::Hyperbolic => model!(hyperbolic::Client::builder(), "Hyperbolic"),
-    Provider::Llamafile => model!(llamafile::Client::builder(), "llamafile", Nothing),
-    Provider::MiniMax => model!(minimax::Client::builder(), "MiniMax"),
-    Provider::Mira => model!(mira::Client::builder(), "Mira"),
-    Provider::Mistral => model!(mistral::Client::builder(), "Mistral"),
-    Provider::Moonshot => model!(moonshot::Client::builder(), "Moonshot"),
-    Provider::Perplexity => model!(perplexity::Client::builder(), "Perplexity"),
-    Provider::Together => model!(together::Client::builder(), "Together"),
-    Provider::Venice => model!(venice::Client::builder(), "Venice"),
-    Provider::XAi => model!(xai::Client::builder(), "xAI"),
-    Provider::XiaomiMimo => model!(xiaomimimo::Client::builder(), "Xiaomi MiMo"),
-    Provider::ZAi => model!(zai::Client::builder(), "Z.AI"),
+    return Ok(Client::OpenAi(Box::new(at!(openai::OpenAIConfig::with_key(
+      dialect, key
+    )))));
+  }
+  Ok(match cfg.provider {
+    Provider::Anthropic => Client::Anthropic(at!(anthropic::AnthropicConfig::new(key))),
+    Provider::Gemini => Client::Gemini(at!(gemini::GeminiConfig::new(key))),
+    Provider::Ollama => Client::Ollama(at!(ollama::OllamaConfig::new().with_api_key(key))),
+    Provider::Cohere => Client::Cohere(at!(cohere::CohereConfig::new(key))),
+    other => unreachable!("{other:?} speaks an OpenAI dialect"),
+  })
+}
+
+/// The model `cfg.model` is reached through, whichever provider offers it,
+/// and whether an image a tool answers with has to be relayed after the
+/// result rather than sent inside it.
+///
+/// Summarizing asks the same model the same way, so it is the same model —
+/// what makes that call a summary is the preamble it carries, which belongs
+/// to the request rather than to the model.
+///
+/// Gemini takes an image inside a function response, Anthropic inside a tool
+/// result, and the Responses API inside a function call's output. Chat
+/// Completions refuses one in a tool message unless the server is one rig
+/// knows takes it, so which of the two endpoints the model is spoken to
+/// through is what decides — and for some providers that is the model's to
+/// say, so it is read off the endpoint rig chose.
+fn build_model(cfg: &Config) -> Result<(DynModel<Completion>, bool)> {
+  let model = cfg.model.clone();
+  let chat = |chat: &openai::wire::Chat| !chat.provider.dialect.quirks.supports_image_tool_results;
+  Ok(match client(cfg)? {
+    // The official endpoint answers on either API, and which one is what the
+    // two providers are for.
+    Client::OpenAi(client) => match cfg.provider {
+      Provider::OpenAi => {
+        let model = client.chat(model);
+        let relay = chat(&model.wire);
+        (drafting(model), relay)
+      }
+      Provider::OpenAiResponses => (drafting(client.responses(model)), false),
+      _ => {
+        let model = client.completion(model);
+        let relay = match &model.wire {
+          openai::wire::OpenAiWire::Chat(wire) => chat(wire),
+          openai::wire::OpenAiWire::Responses(_) => false,
+        };
+        (drafting(model), relay)
+      }
+    },
+    // Anthropic refuses a request that names no `max_tokens`, so rig fills in
+    // what the named model allows. One it does not know is given a small cap
+    // rather than refused — which is what `--max-tokens` is for, since a
+    // figure on the request wins over the model's own.
+    Client::Anthropic(client) => {
+      let mut model = client.completion(model);
+      model.wire.default_max_tokens.get_or_insert(2048);
+      (drafting(model), false)
+    }
+    Client::Gemini(client) => (drafting(client.completion(model)), false),
+    Client::Ollama(client) => (drafting(client.completion(model)), true),
+    Client::Cohere(client) => (drafting(client.completion(model)), true),
   })
 }
 
 /// Ask the provider what models it offers, alphabetically.
 ///
-/// Only four of them report a context window — Gemini, Groq, Mistral and
-/// OpenRouter — and the rest answer with names alone, which is why the window
-/// a model is given falls back to the configured one.
+/// Only some of them report a context window, and the rest answer with names
+/// alone, which is why the window a model is given falls back to the
+/// configured one.
 pub async fn list_models(cfg: &Config) -> Result<Vec<ModelInfo>> {
-  macro_rules! list {
-    ($builder:expr, $what:literal) => {
-      client!(cfg, $builder, $what)
-        .list_models()
-        .await
-        .context(concat!($what, " would not say what models it has"))?
-    };
+  let models = match client(cfg)? {
+    Client::OpenAi(client) => client.list_models().await,
+    Client::Anthropic(client) => client.list_models().await,
+    Client::Gemini(client) => client.list_models().await,
+    Client::Ollama(client) => client.list_models().await,
+    // Refused without a request going out: there is no listing to ask for.
+    Client::Cohere(_) => bail!(
+      "{} does not list its models — name one with /model <id>",
+      cfg.provider.label()
+    ),
   }
-
-  let models = match cfg.provider {
-    Provider::OpenAi => list!(openai::CompletionsClient::builder(), "OpenAI-compatible"),
-    Provider::OpenAiResponses => list!(openai::Client::builder(), "OpenAI Responses"),
-    Provider::OpenRouter => list!(openrouter::Client::builder(), "OpenRouter"),
-    Provider::Ollama => list!(ollama::Client::builder(), "Ollama"),
-    Provider::Gemini => list!(gemini::Client::builder(), "Gemini"),
-    Provider::Anthropic => list!(anthropic::Client::builder(), "Anthropic"),
-    Provider::DeepSeek => list!(deepseek::Client::builder(), "DeepSeek"),
-    Provider::Groq => list!(groq::Client::builder(), "Groq"),
-    Provider::MiniMax => list!(minimax::Client::builder(), "MiniMax"),
-    Provider::Mira => list!(mira::Client::builder(), "Mira"),
-    Provider::Mistral => list!(mistral::Client::builder(), "Mistral"),
-    Provider::Moonshot => list!(moonshot::Client::builder(), "Moonshot"),
-    Provider::Venice => list!(venice::Client::builder(), "Venice"),
-    Provider::XiaomiMimo => list!(xiaomimimo::Client::builder(), "Xiaomi MiMo"),
-    // The rest have no listing endpoint rig speaks. Refused here rather than
-    // by a second list of which providers have an arm above: this is the
-    // list, and it answers without a request going out.
-    other => bail!("{} does not list its models — name one with /model <id>", other.label()),
-  };
+  .with_context(|| format!("{} would not say what models it has", cfg.provider.label()))?;
 
   let mut models: Vec<ModelInfo> = models
+    .data
     .into_iter()
     .map(|model| ModelInfo {
       // A name that only repeats the id is no more than the id.
@@ -707,7 +702,7 @@ pub fn build_agents(cfg: &Config, cwd: &Path, host: &Host, servers: &crate::mcp:
   catalog.on_change(move |catalog| again.replace(catalog.attach(built_in()).run()));
 
   Ok(Agents {
-    runtime: Arc::new(Runtime::new(cfg, tools, preamble, relays_images(cfg.provider))?),
+    runtime: Arc::new(Runtime::new(cfg, tools, preamble)?),
     control: Control::default(),
   })
 }
@@ -754,16 +749,12 @@ impl Weigh {
 /// What a provider says the request it answered came to, prompt and answer
 /// together.
 ///
-/// `input_tokens` is only the part of the prompt a provider charged as new.
-/// Anthropic counts what it read back from its cache, and what it wrote
-/// there, under fields of their own — so on a conversation that is mostly
-/// cached, which is what a long one becomes, the prompt and the answer added
-/// up come to a small fraction of what was actually sent. `total_tokens` is
-/// the figure the provider reports, or the one rig adds up from the parts for
-/// the providers that report only parts, and it is the whole request wherever
-/// there is one. The sum stands in where there is not.
+/// Rig counts every token of the prompt as input — what a provider read back
+/// from its cache and what it wrote there included — so a conversation that
+/// is mostly cached, which is what a long one becomes, still weighs what was
+/// actually sent. A counter the provider did not report adds nothing.
 fn weight(usage: &Usage) -> u64 {
-  usage.total_tokens.max(usage.input_tokens + usage.output_tokens)
+  usage.input_tokens.unwrap_or(0) + usage.output_tokens.unwrap_or(0)
 }
 
 /// Why a run stopped short of an answer.
@@ -933,28 +924,17 @@ async fn run(
 
     // Asked again every turn, since an MCP server can change what it offers
     // in the middle of a run — as the answer to one of its own tools, even.
-    let definitions = match rt.definitions().await {
-      Ok(definitions) => definitions,
-      Err(err) => return Some(Stop::Failed(err)),
-    };
     let sent = chat.len();
-    // The builder takes the newest message apart from the rest.
-    let Some(prompt) = chat.pop() else {
-      return Some(Stop::Failed("there is nothing to answer".into()));
-    };
-    let request = rt
-      .model
-      .completion_request(prompt)
+    let request = CompletionRequest::from(chat)
       .preamble(rt.preamble.clone())
-      .messages(chat)
-      .tools(definitions)
-      .max_tokens_opt(rt.max_tokens);
-    let mut stream = match request.stream().await {
+      .tools(rt.definitions())
+      .max_tokens(rt.max_tokens);
+    let mut stream = match rt.model.stream(request) {
       Ok(stream) => stream,
       Err(err) => return Some(Stop::Failed(err.to_string())),
     };
 
-    let mut partial = Partial::default();
+    let mut partial = Partial::new();
     loop {
       let stopped = tokio::select! {
         biased;
@@ -964,18 +944,21 @@ async fn run(
       // Nothing of this turn has run, so the half of it that was written is
       // kept for the transcript's sake and no more.
       let Some(item) = stopped else {
-        made.extend(cut_off(&mut stream).await);
+        made.extend(partial.cut_off(&stream));
         return Some(Stop::Cancelled);
       };
       let Some(item) = item else { break };
-      let content = match item {
-        Ok(content) => content,
+      let event = match item {
+        Ok(Item::Event(event)) => partial.saw(event),
+        // A piece of a call being written, or something the provider sent
+        // that rig has no word for.
+        Ok(Item::Unknown(payload)) => Fragment::from_payload(&payload).map(|piece| partial.drafted(piece)),
         Err(err) => {
-          made.extend(cut_off(&mut stream).await);
+          made.extend(partial.cut_off(&stream));
           return Some(Stop::Failed(err.to_string()));
         }
       };
-      if let Some(event) = partial.saw(content) {
+      if let Some(event) = event {
         let _ = tx.send(event);
       }
     }
@@ -986,27 +969,25 @@ async fn run(
     // reasoning, and the calls, in the order they were said. This is the
     // copy that goes into the conversation and the copy the next request
     // replays — there is only ever the one.
-    let choice = std::mem::take(&mut stream.choice);
-    let usage = stream.usage();
-    weigh.answered(&usage, sent);
+    let response = match stream.finish().await {
+      Ok(response) => response,
+      Err(err) => return Some(Stop::Failed(err.to_string())),
+    };
+    weigh.answered(&response.usage, sent);
     let _ = tx.send(AgentEvent::Usage {
-      usage,
+      usage: response.usage,
       context_tokens: weigh.reported.max(context),
     });
-    if choice.is_empty() {
-      return Some(Stop::Failed("the model answered with nothing".into()));
-    }
-    let calls: Vec<ToolCall> = choice
-      .iter()
-      .filter_map(|content| match content {
-        AssistantContent::ToolCall(call) => Some(call.clone()),
-        _ => None,
-      })
-      .collect();
-    made.push(Message::Assistant {
-      id: stream.message_id.clone(),
-      content: choice,
-    });
+    // Nothing at all, which is as far as a turn cut short by its budget or a
+    // filter can get: rig says which, and what to do about it.
+    let Some(message) = response.message() else {
+      return Some(Stop::Failed(match response.finish_reason() {
+        Some(reason) => reason.no_answer_message(),
+        None => "the model answered with nothing".into(),
+      }));
+    };
+    let calls: Vec<ToolCall> = response.tool_calls().cloned().collect();
+    made.push(message);
 
     if calls.is_empty() {
       // The answer — unless something was typed while it was being
@@ -1027,7 +1008,7 @@ async fn run(
       results.push(tokio::select! {
         biased;
         () = control.stopped() => aborted(call),
-        answer = rt.call(call, written.get(call.id.as_str()), tx) => answer,
+        answer = rt.call(call, written.get(&call.id.to_string()), tx) => answer,
       });
     }
     made.push(Message::User { content: results });
@@ -1037,113 +1018,206 @@ async fn run(
   }
 }
 
-/// What the UI is told about a turn while it streams, and what it has to be
-/// told again once the turn's calls are run.
-#[derive(Default)]
+/// What the UI is told about a turn while it streams, what it has to be told
+/// again once the turn's calls are run, and what the turn had said if it is
+/// stopped before it ends.
 struct Partial {
-  /// Arguments arrive a few characters at a time and each fragment carries
-  /// only what is new, so this holds what has arrived per call and the UI is
-  /// sent the whole of it, with nothing to reassemble.
-  writing: HashMap<String, (String, String)>,
-  /// The id rig correlated a call's fragments under, by the id the provider
-  /// gave the finished call.
+  /// Told apart from every other turn's, since the parts of a turn are
+  /// numbered from nought each time and a line still on screen from the last
+  /// one would otherwise be taken for this one's.
+  turn: uuid::Uuid,
+  /// What each part has said, in the order the parts opened.
+  parts: Vec<Said>,
+  /// The calls being written, by the provider's number for each: rig says
+  /// nothing of a call until it is whole, so these come from what the
+  /// provider sent, read on the way in.
+  drafts: HashMap<u64, Draft>,
+  /// Which of those a provider's id names, once it has named one.
+  named: HashMap<String, u64>,
+  /// The line a call was written on, by the id the finished call was given.
   ///
-  /// The two are not the same — rig mints its own so a call stays followable
-  /// before the provider has named it — and the line the call was written on
-  /// is keyed by rig's. Without the pairing, dispatching the call would
-  /// leave that line on screen with nothing to take it away.
+  /// The line is keyed from the call's first piece, before anything says
+  /// what the finished call will be called. Without the pairing, dispatching
+  /// the call would leave that line on screen with nothing to take it away.
   written: HashMap<String, String>,
 }
 
-impl Partial {
-  /// What the UI should be told about what the stream said.
-  fn saw(&mut self, content: StreamedAssistantContent) -> Option<AgentEvent> {
-    match content {
-      StreamedAssistantContent::Text(text) => Some(AgentEvent::Text(text.text)),
-      StreamedAssistantContent::ReasoningDelta { reasoning, .. } => Some(AgentEvent::Reasoning(reasoning)),
-      StreamedAssistantContent::Reasoning { reasoning, .. } => {
-        let text = reasoning.display_text();
-        (!text.is_empty()).then_some(AgentEvent::Reasoning(text))
-      }
-      StreamedAssistantContent::ToolCallDelta {
-        internal_call_id,
-        content,
-      } => {
-        let (name, args) = self.writing.entry(internal_call_id.clone()).or_default();
-        match content {
-          ToolCallDeltaContent::Name(part) => name.push_str(&part),
-          ToolCallDeltaContent::Delta(part) => args.push_str(&part),
-        }
-        Some(AgentEvent::ToolCallDelta {
-          id: internal_call_id,
-          name: name.clone(),
-          args: args.clone(),
-        })
-      }
-      // Written but not yet run — the loop reports it when it starts it.
-      // Showing it whole in the meantime is what the finished line will
-      // say, so nothing jumps when the two swap over.
-      StreamedAssistantContent::ToolCall {
-        tool_call,
-        internal_call_id,
-      } => {
-        self
-          .written
-          .insert(tool_call.id.as_str().to_string(), internal_call_id.clone());
-        Some(AgentEvent::ToolCallDelta {
-          id: internal_call_id,
-          name: tool_call.function.name,
-          args: tool_call.function.arguments.to_string(),
-        })
-      }
-      _ => None,
-    }
-  }
+/// A call still being written, as far as it has got.
+struct Draft {
+  line: String,
+  name: String,
+  args: String,
 }
 
-/// What a turn stopped part-way had said, if anything, as rig put it
-/// together: ending the stream is what has it finish the turn from what had
-/// arrived, reasoning signatures and all.
-///
-/// The calls are left out, finished or not — a call nobody ran is one
-/// nothing would answer — and so is text with nothing in it.
-async fn cut_off(stream: &mut StreamingCompletionResponse) -> Option<Message> {
-  stream.cancel();
-  while stream.next().await.is_some() {}
-  let content: Vec<AssistantContent> = std::mem::take(&mut stream.choice)
-    .into_iter()
-    .filter(|content| match content {
-      AssistantContent::ToolCall(_) => false,
-      AssistantContent::Text(text) => !text.text.trim().is_empty(),
-      _ => true,
-    })
-    .collect();
-  // No id: the provider never finished the message it would name, and
-  // replaying a half of it under that name is asking to be told it is not one.
-  (!content.is_empty()).then_some(Message::Assistant { id: None, content })
+/// One part of a turn, as far as it has got.
+enum Said {
+  Text(String),
+  Thought(String),
+  /// A part that ended, as rig finished it.
+  Done(Box<AssistantContent>),
+  /// A part that says nothing until it ends: a call, or an image.
+  Pending,
+}
+
+impl Partial {
+  fn new() -> Self {
+    Self {
+      turn: uuid::Uuid::new_v4(),
+      parts: Vec::new(),
+      drafts: HashMap::new(),
+      named: HashMap::new(),
+      written: HashMap::new(),
+    }
+  }
+
+  /// The id the UI keys the line a call is written on under.
+  fn line(&self, part: Part) -> String {
+    format!("{}:{}", self.turn, part.index())
+  }
+
+  /// A piece of a call being written. Arguments arrive a few characters at
+  /// a time and each piece carries only what is new, so the UI is sent the
+  /// whole of what has arrived, with nothing to reassemble.
+  fn drafted(&mut self, piece: Fragment) -> AgentEvent {
+    let line = format!("{}:draft:{}", self.turn, piece.index);
+    let draft = self.drafts.entry(piece.index).or_insert(Draft {
+      line,
+      name: String::new(),
+      args: String::new(),
+    });
+    if let Some(name) = piece.name {
+      draft.name = name;
+    }
+    draft.args.push_str(&piece.args);
+    if let Some(id) = piece.id {
+      self.named.insert(id, piece.index);
+    }
+    AgentEvent::ToolCallDelta {
+      id: draft.line.clone(),
+      name: draft.name.clone(),
+      args: draft.args.clone(),
+    }
+  }
+
+  /// The line the finished `call` was being written on: the draft its id
+  /// names, or — for a provider that gave it none, and has it named by rig —
+  /// the first one of its name still unclaimed.
+  fn claim(&mut self, call: &ToolCall) -> Option<String> {
+    let index = self
+      .named
+      .get(&call.id.to_string())
+      .copied()
+      .filter(|index| self.drafts.contains_key(index))
+      .or_else(|| {
+        self
+          .drafts
+          .iter()
+          .filter(|(_, draft)| draft.name == call.function.name.as_str())
+          .map(|(index, _)| *index)
+          .min()
+      })?;
+    self.drafts.remove(&index).map(|draft| draft.line)
+  }
+
+  /// What the UI should be told about what the stream said.
+  fn saw(&mut self, event: StreamEvent) -> Option<AgentEvent> {
+    match event {
+      StreamEvent::Start { kind, .. } => {
+        self.parts.push(match kind {
+          PartKind::Text => Said::Text(String::new()),
+          PartKind::Reasoning => Said::Thought(String::new()),
+          PartKind::ToolCall | PartKind::Image => Said::Pending,
+        });
+        None
+      }
+      StreamEvent::Text { part, text } => {
+        if let Some(Said::Text(said)) = self.parts.get_mut(part.index()) {
+          said.push_str(&text);
+        }
+        Some(AgentEvent::Text(text))
+      }
+      StreamEvent::Reasoning { part, text } => {
+        if let Some(Said::Thought(said)) = self.parts.get_mut(part.index()) {
+          said.push_str(&text);
+        }
+        Some(AgentEvent::Reasoning(text))
+      }
+      // Rig's own copy of a call's arguments arrives whole, just before the
+      // call ends: what the provider sent was drawn as it came.
+      StreamEvent::Arguments { .. } => None,
+      StreamEvent::End { part, content } => {
+        let said = self
+          .parts
+          .get_mut(part.index())
+          .map(|said| std::mem::replace(said, Said::Done(Box::new(content.clone()))));
+        match content {
+          // Reasoning that arrived whole, with nothing said along the way.
+          AssistantContent::Reasoning(reasoning) if matches!(&said, Some(Said::Thought(so_far)) if so_far.is_empty()) =>
+          {
+            let text = compaction::reasoning_text(&reasoning);
+            (!text.is_empty()).then_some(AgentEvent::Reasoning(text))
+          }
+          // Written but not yet run — the loop reports it when it starts it.
+          // Showing it whole in the meantime is what the finished line will
+          // say, so nothing jumps when the two swap over.
+          AssistantContent::ToolCall(call) => {
+            let line = self.claim(&call).unwrap_or_else(|| self.line(part));
+            self.written.insert(call.id.to_string(), line.clone());
+            Some(AgentEvent::ToolCallDelta {
+              id: line,
+              name: call.function.name.to_string(),
+              args: call.function.arguments.to_string(),
+            })
+          }
+          _ => None,
+        }
+      }
+    }
+  }
+
+  /// What a turn stopped part-way had said, if anything: what each part had
+  /// finished as, and what had arrived of the ones still going — a thought
+  /// cut off is still the thought the text after it came from.
+  ///
+  /// The calls are left out, finished or not — a call nobody ran is one
+  /// nothing would answer — and so is text with nothing in it.
+  fn cut_off(self, stream: &CompletionStream) -> Option<Message> {
+    let issuer = stream.reasoning_issuer();
+    let content: Vec<AssistantContent> = self
+      .parts
+      .into_iter()
+      .filter_map(|said| match said {
+        Said::Text(text) => (!text.trim().is_empty()).then(|| AssistantContent::text(text)),
+        Said::Thought(text) => {
+          (!text.is_empty()).then(|| AssistantContent::Reasoning(Reasoning::new(&text).sealed(issuer.clone())))
+        }
+        Said::Done(content) => match *content {
+          AssistantContent::ToolCall(_) => None,
+          AssistantContent::Text(text) if text.text.trim().is_empty() => None,
+          content => Some(content),
+        },
+        Said::Pending => None,
+      })
+      .collect();
+    // No id: the provider never finished the message it would name, and
+    // replaying a half of it under that name is asking to be told it is not
+    // one.
+    (!content.is_empty()).then_some(Message::Assistant { id: None, content })
+  }
 }
 
 /// A call answered without being run.
 fn aborted(call: &ToolCall) -> UserContent {
-  UserContent::tool_result(
-    call.id.as_str(),
-    &call.function.name,
-    vec![ToolResultContent::text(ABORTED)],
-  )
+  UserContent::ToolResult(call.result(vec![ToolResultContent::text(ABORTED)]))
 }
 
 impl Runtime {
   /// What this session offers the model, in a stable order — a tool set that
   /// shuffled between requests would be a different prompt every time.
-  async fn definitions(&self) -> Result<Vec<ToolDefinition>, String> {
-    let mut definitions = self
-      .tools
-      .now()
-      .get_tool_defs(None)
-      .await
-      .map_err(|err| err.to_string())?;
+  fn definitions(&self) -> Vec<ToolDefinition> {
+    let mut definitions = self.tools.now().static_tool_defs();
     definitions.retain(|definition| self.rules.permits(&definition.name));
-    Ok(definitions)
+    definitions
   }
 
   /// Run one call and answer it, telling the UI as it goes.
@@ -1153,8 +1227,8 @@ impl Runtime {
     written: Option<&String>,
     tx: &mpsc::UnboundedSender<AgentEvent>,
   ) -> UserContent {
-    let name = call.function.name.clone();
-    let id = call.id.as_str().to_string();
+    let name = call.function.name.to_string();
+    let id = call.id.to_string();
     let _ = tx.send(AgentEvent::ToolCall {
       name: name.clone(),
       args: call.function.arguments.clone(),
@@ -1162,18 +1236,17 @@ impl Runtime {
       internal: written.cloned().unwrap_or_else(|| id.clone()),
     });
 
-    let mut context = ToolContext::new();
     // Where to report output while the call runs, already answering for
     // this call. The loop dispatching it is the one that knows which it
     // is, so nothing has to be smuggled through the arguments to tell the
     // tool — and the tool never has to be told at all.
     let (reporting, under) = (tx.clone(), id.clone());
-    context.insert(Output(Arc::new(move |text| {
+    let mut context = ToolContext::new().with_scope(Arc::new(Output(Arc::new(move |text| {
       let _ = reporting.send(AgentEvent::ToolOutput {
         call: under.clone(),
         text,
       });
-    })));
+    }))));
     // A tool the session was not offered is not run for being named anyway:
     // the list the model was shown is the boundary, not a hint. It is
     // answered as a tool that is not there, which is all the model was ever
@@ -1205,14 +1278,14 @@ impl Runtime {
     let _ = tx.send(AgentEvent::ToolResult {
       name: name.clone(),
       call: id.clone(),
-      diff: context.result::<EditDiff>().map(|diff| diff.diff.clone()),
+      diff: context.result::<EditDiff>().ok().flatten().map(|diff| diff.diff),
       output,
       images,
       is_error: result.is_error() || result.is_refused(),
     });
     // What the transcript shows and what the model is given are the same
     // bytes: there is one copy of a result, not a shown one and a sent one.
-    UserContent::tool_result(id, name, content)
+    UserContent::ToolResult(call.result(content))
   }
 }
 
@@ -1345,7 +1418,9 @@ pub fn start_compaction(
 mod tests {
   //! Runs against a mock OpenAI-compatible server when `FA_TEST_BASE_URL` is set.
   use super::*;
-  use rig_core::completion::CompletionRequest;
+  use rig_core::driver::{Exchange, Opened, Opening, Transport};
+  use rig_core::test_utils::{MockFrame, MockScript, MockStreamEvent};
+  use rig_core::wire::Mode;
 
   async fn collect(
     runtime: &Arc<Runtime>,
@@ -1382,64 +1457,81 @@ mod tests {
   /// A model that answers from a script, so the loop can be put in the
   /// states a provider is too slow and too willing to reach: a turn cut off
   /// half-said, a turn whose calls never all come back.
+  #[derive(Clone, Default)]
   struct Scripted {
-    turns: Mutex<VecDeque<Vec<rig_core::streaming::RawStreamingChoice>>>,
+    turns: Arc<Mutex<VecDeque<Vec<MockStreamEvent>>>>,
     /// Leave the stream open after the script runs out, so a turn can be
     /// stopped in the middle of itself rather than ending on its own.
     hang: bool,
+    /// The cap each request carried, in the order they came.
+    caps: Arc<Mutex<Vec<Option<u64>>>>,
   }
 
-  impl CompletionModel for Scripted {
-    async fn completion(
-      &self,
-      _request: CompletionRequest,
-    ) -> Result<rig_core::completion::CompletionResponse, CompletionError> {
-      // Only the summarizer asks without streaming, and it is told the same
-      // every time.
-      Ok(rig_core::completion::CompletionResponse::new(
-        vec![AssistantContent::text("Something about fruit.")],
-        Usage::new(),
-        "scripted",
-      ))
-    }
-
-    async fn stream(&self, _request: CompletionRequest) -> Result<StreamingCompletionResponse, CompletionError> {
-      let turn = self.turns.lock().expect("a script nobody panicked holding").pop_front();
-      let items = futures::stream::iter(turn.unwrap_or_default().into_iter().map(Ok));
-      let inner: rig_core::streaming::StreamingResult = match self.hang {
-        true => Box::pin(items.chain(futures::stream::pending())),
-        false => Box::pin(items),
+  impl Transport<MockScript> for Scripted {
+    // The error type is the trait's, not ours to make smaller.
+    #[allow(clippy::result_large_err)]
+    fn send(&self, request: CompletionRequest, exchange: Exchange) -> Opening<MockFrame> {
+      self.caps.lock().unwrap().push(request.max_tokens);
+      let (turn, hang) = match exchange.mode {
+        // Only the summarizer asks without streaming, and it is told the
+        // same every time.
+        Mode::Unary => (vec![said("Something about fruit.")], false),
+        Mode::Streaming => (
+          self
+            .turns
+            .lock()
+            .expect("a script nobody panicked holding")
+            .pop_front()
+            .unwrap_or_default(),
+          self.hang,
+        ),
       };
-      Ok(StreamingCompletionResponse::stream("scripted", inner))
+      let frames = futures::stream::iter(turn.into_iter().map(|event| Ok(MockFrame::Event(event))));
+      let frames: futures::stream::BoxStream<'static, _> = match hang {
+        true => Box::pin(frames.chain(futures::stream::pending())),
+        false => Box::pin(frames.chain(futures::stream::iter([Ok(MockFrame::Event(
+          MockStreamEvent::FinalResponse(Default::default()),
+        ))]))),
+      };
+      Opening::ready(Opened::new(frames))
     }
   }
 
-  fn said(text: &str) -> rig_core::streaming::RawStreamingChoice {
-    rig_core::streaming::RawStreamingChoice::Message(text.to_string())
+  impl Scripted {
+    fn model(&self) -> DynModel<Completion> {
+      rig_core::Model::new(MockScript::default(), self.clone()).erase()
+    }
   }
 
-  fn asks(id: &str, command: &str) -> rig_core::streaming::RawStreamingChoice {
-    rig_core::streaming::RawStreamingChoice::ToolCall(rig_core::streaming::RawStreamingToolCall::new(
-      id,
-      "bash".to_string(),
-      serde_json::json!({ "command": command }),
-    ))
+  fn said(text: &str) -> MockStreamEvent {
+    MockStreamEvent::Text(text.to_string())
+  }
+
+  fn asks(id: &str, command: &str) -> MockStreamEvent {
+    MockStreamEvent::ToolCall {
+      id: id.to_string(),
+      name: "bash".to_string(),
+      arguments: serde_json::json!({ "command": command }),
+      call_id: None,
+    }
   }
 
   /// A runtime whose model reads from `turns` and whose only tool is the
   /// real `bash`, which is the one that can be told to take its time.
-  fn scripted(turns: Vec<Vec<rig_core::streaming::RawStreamingChoice>>, hang: bool) -> Arc<Runtime> {
+  fn scripted(turns: Vec<Vec<MockStreamEvent>>, hang: bool) -> Arc<Runtime> {
     let tools = ToolServer::new()
       .tool(BashTool {
         cwd: std::env::temp_dir(),
       })
       .run();
     let tools = Tools::new(tools);
+    let model = Scripted {
+      turns: Arc::new(Mutex::new(turns.into())),
+      hang,
+      ..Scripted::default()
+    };
     Arc::new(Runtime {
-      model: ModelHandle::new(Scripted {
-        turns: Mutex::new(turns.into()),
-        hang,
-      }),
+      model: model.model(),
       tools,
       preamble: String::new(),
       compaction: TEST_SETTINGS,
@@ -1489,7 +1581,7 @@ mod tests {
             UserContent::Text(text) => format!("user {}", text.text),
             UserContent::ToolResult(result) => format!(
               "result {} {}",
-              result.call.as_str(),
+              result.call,
               match &result.content[..] {
                 [ToolResultContent::Text(text)] => text.text.trim().to_string(),
                 _ => String::new(),
@@ -1503,8 +1595,8 @@ mod tests {
           .iter()
           .map(|c| match c {
             AssistantContent::Text(text) => format!("said {:?}", text.text),
-            AssistantContent::Reasoning(reasoning) => format!("thought {:?}", reasoning.display_text()),
-            AssistantContent::ToolCall(call) => format!("call {}", call.id.as_str()),
+            AssistantContent::Reasoning(reasoning) => format!("thought {:?}", compaction::reasoning_text(reasoning)),
+            AssistantContent::ToolCall(call) => format!("call {}", call.id),
             _ => "?".into(),
           })
           .collect::<Vec<_>>()
@@ -1536,9 +1628,8 @@ mod tests {
   /// said, in the order it came.
   #[tokio::test]
   async fn a_turn_cut_off_mid_thought_keeps_the_thought() {
-    let thinking = rig_core::streaming::RawStreamingChoice::ReasoningDelta {
-      id: rig_core::streaming::StreamPartId::wire("r1"),
-      provider_id: None,
+    let thinking = MockStreamEvent::ReasoningDelta {
+      id: "r1".to_string(),
       reasoning: "Where to look".to_string(),
     };
     let runtime = scripted(vec![vec![thinking, said("Half ")]], true);
@@ -1735,7 +1826,7 @@ mod tests {
     ))
     .expect("the only handle");
     runtime.rules.refused = vec!["bash".into()];
-    assert!(runtime.definitions().await.unwrap().is_empty(), "bash is not offered");
+    assert!(runtime.definitions().is_empty(), "bash is not offered");
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     let handle = start_run(
@@ -1865,7 +1956,7 @@ mod tests {
     let spent: Vec<(u64, u64)> = events
       .iter()
       .filter_map(|e| match e {
-        AgentEvent::Usage { usage, context_tokens } => Some((usage.output_tokens, *context_tokens)),
+        AgentEvent::Usage { usage, context_tokens } => Some((usage.output_tokens.unwrap_or(0), *context_tokens)),
         _ => None,
       })
       .collect();
@@ -2053,8 +2144,8 @@ mod tests {
   fn the_context_is_the_providers_own_count_plus_what_it_has_not_seen_yet() {
     let result = |text: &str| Message::User {
       content: vec![UserContent::tool_result(
-        "call",
-        "bash",
+        rig_core::message::CallId::from_wire("call"),
+        rig_core::message::ToolName::new("bash").unwrap(),
         vec![ToolResultContent::text(text)],
       )],
     };
@@ -2070,9 +2161,9 @@ mod tests {
     // came back after it.
     weigh.answered(
       &Usage {
-        input_tokens: 500,
-        output_tokens: 20,
-        ..Usage::new()
+        input_tokens: Some(500),
+        output_tokens: Some(20),
+        ..Usage::default()
       },
       1,
     );
@@ -2090,43 +2181,33 @@ mod tests {
 
     // A provider that says nothing leaves the last figure standing rather
     // than reporting the context as empty.
-    weigh.answered(&Usage::new(), 9);
+    weigh.answered(&Usage::default(), 9);
     assert_eq!(weigh.request(&chat), 520 + 200 + 100);
   }
 
   /// A cached prompt is still a prompt: what the provider read back from its
-  /// cache was in the request, and a context that leaves it out is the size
-  /// of a long conversation short by nearly all of it.
+  /// cache was in the request, and rig counts it as input, so the context is
+  /// the prompt and the answer — and a counter nobody reported is nothing.
   #[test]
-  fn the_context_counts_what_was_cached_as_well_as_what_was_charged() {
+  fn the_context_is_the_prompt_and_the_answer() {
     let cached = Usage {
-      input_tokens: 12,
-      output_tokens: 40,
-      cached_input_tokens: 30_000,
-      cache_creation_input_tokens: 2_000,
-      total_tokens: 32_052,
-      ..Usage::new()
+      input_tokens: Some(32_012),
+      output_tokens: Some(40),
+      cached_input_tokens: Some(30_000),
+      cache_creation_input_tokens: Some(2_000),
+      total_tokens: Some(32_052),
+      ..Usage::default()
     };
     assert_eq!(weight(&cached), 32_052);
 
-    // A provider that reports no total is taken at the sum of its parts.
-    let plain = Usage {
-      input_tokens: 500,
-      output_tokens: 20,
-      ..Usage::new()
+    // A provider that reports only the prompt is taken at its word for that.
+    let prompt = Usage {
+      input_tokens: Some(500),
+      ..Usage::default()
     };
-    assert_eq!(weight(&plain), 520);
+    assert_eq!(weight(&prompt), 500);
 
-    // And one whose total says less than the prompt and the answer it also
-    // reported is believed about neither: the larger of the two is the one
-    // that leaves nothing out.
-    let short = Usage {
-      total_tokens: 100,
-      ..plain
-    };
-    assert_eq!(weight(&short), 520);
-
-    assert_eq!(weight(&Usage::new()), 0);
+    assert_eq!(weight(&Usage::default()), 0);
   }
 
   #[test]
@@ -2166,14 +2247,13 @@ mod tests {
 
   #[test]
   fn relay_moves_tool_images_into_a_following_user_message() {
-    use rig_core::message::{ToolCallId, ToolResult};
+    use rig_core::message::{CallId, LocalCallId, ToolName};
     let result = |content: Vec<ToolResultContent>| {
-      UserContent::ToolResult(ToolResult {
-        call: ToolCallId::mint(),
-        provider: None,
-        name: "read".into(),
+      UserContent::tool_result(
+        CallId::from(LocalCallId::new()),
+        ToolName::new("read").unwrap(),
         content,
-      })
+      )
     };
     let mut history = vec![
       Message::user("look"),
@@ -2223,30 +2303,12 @@ mod tests {
   /// Anthropic refuses a request that names none, so it has to reach both.
   #[tokio::test]
   async fn a_token_cap_is_carried_on_every_request() {
-    #[derive(Default)]
-    struct Recording {
-      caps: Mutex<Vec<Option<u64>>>,
-    }
-
-    impl CompletionModel for Recording {
-      async fn completion(
-        &self,
-        request: CompletionRequest,
-      ) -> Result<rig_core::completion::CompletionResponse, CompletionError> {
-        self.caps.lock().unwrap().push(request.max_tokens);
-        Err(CompletionError::ResponseError("recorded, nothing to say".into()))
-      }
-
-      async fn stream(&self, request: CompletionRequest) -> Result<StreamingCompletionResponse, CompletionError> {
-        self.caps.lock().unwrap().push(request.max_tokens);
-        let items = futures::stream::iter([Ok(said("done"))]);
-        Ok(StreamingCompletionResponse::stream("recording", Box::pin(items)))
-      }
-    }
-
-    let recording = Arc::new(Recording::default());
+    let recording = Scripted {
+      turns: Arc::new(Mutex::new([vec![said("done")]].into())),
+      ..Scripted::default()
+    };
     let runtime = Arc::new(Runtime {
-      model: ModelHandle::new(recording.clone()),
+      model: recording.model(),
       tools: Tools::new(ToolServer::new().run()),
       preamble: String::new(),
       compaction: TEST_SETTINGS,
@@ -2278,7 +2340,7 @@ mod tests {
     (Provider::Groq, true),
     (Provider::HuggingFace, true),
     (Provider::Hyperbolic, true),
-    (Provider::Llamafile, true),
+    (Provider::LlamaCpp, false),
     (Provider::MiniMax, true),
     (Provider::Mira, true),
     (Provider::Mistral, true),
@@ -2286,12 +2348,12 @@ mod tests {
     (Provider::Perplexity, true),
     (Provider::Together, true),
     (Provider::Venice, true),
-    (Provider::XAi, true),
+    (Provider::XAi, false),
     (Provider::XiaomiMimo, true),
     (Provider::ZAi, true),
   ];
 
-  /// Every provider builds, with a key and without one, and only the three
+  /// Every provider builds, with a key and without one, and only the ones
   /// that take an image inside a tool result skip the relay.
   #[test]
   fn each_provider_builds_a_model() {

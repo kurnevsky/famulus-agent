@@ -149,13 +149,13 @@ fn said(note: &ProgressNotificationParam) -> String {
 pub fn tool(tool: &rmcp::model::Tool, peer: ServerSink, timeout: Option<Duration>, progress: Progress) -> DynamicTool {
   let name = tool.name.to_string();
   let description = tool.description.as_deref().unwrap_or_default().to_string();
-  DynamicTool::new(
+  DynamicTool::new_with_context(
     name.clone(),
     description,
     tool.schema_as_json_value(),
     move |context: &mut ToolContext, args: serde_json::Value| {
       let (name, peer, progress) = (name.clone(), peer.clone(), progress.clone());
-      let sink = context.get::<Output>().cloned();
+      let sink = context.scope::<Output>().map(|output| (*output).clone());
       Box::pin(async move {
         let mut params = CallToolRequestParams::new(name.clone());
         match args {

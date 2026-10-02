@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local};
 use rig_core::completion::Message;
-use rig_core::message::{AssistantContent, ToolResult, UserContent};
+use rig_core::message::{AssistantContent, UserContent};
 use serde::{Deserialize, Serialize};
 
 use crate::compaction;
@@ -254,21 +254,7 @@ pub fn user_text(message: &Message) -> Option<String> {
   Some(text.join("\n"))
 }
 
-/// Every way a tool result names the call it answers.
-///
-/// Rig mints its own handle for a call and keeps the provider's alongside it
-/// when there was one, and which of the two a hook reports depends on the
-/// provider. Offering both is what keeps the match from depending on that.
-pub fn result_ids(result: &ToolResult) -> impl Iterator<Item = String> + '_ {
-  [
-    Some(result.call.as_str().to_string()),
-    result.provider.as_ref().map(|p| p.call_id.clone()),
-  ]
-  .into_iter()
-  .flatten()
-}
-
-/// The same for every tool result in a message.
+/// The calls every tool result in a message answers.
 fn call_ids(message: &Message) -> impl Iterator<Item = String> + '_ {
   let content = match message {
     Message::User { content } => Some(content),
@@ -281,7 +267,7 @@ fn call_ids(message: &Message) -> impl Iterator<Item = String> + '_ {
       UserContent::ToolResult(result) => Some(result),
       _ => None,
     })
-    .flat_map(result_ids)
+    .map(|result| result.call.to_string())
 }
 
 /// Write the session file at `path` again without the entries in `gone`, and
@@ -994,7 +980,11 @@ mod tests {
     let prompt = session.leaf().unwrap().to_string();
     let call = Message::Assistant {
       id: None,
-      content: vec![AssistantContent::tool_call("1", "read", serde_json::json!({}))],
+      content: vec![AssistantContent::tool_call(
+        "1",
+        rig_core::message::ToolName::new("read").unwrap(),
+        serde_json::json!({}),
+      )],
     };
     session.append(vec![call, tool_result("1", "fn main() {}")]).unwrap();
     let result = session.leaf().unwrap().to_string();
@@ -1064,8 +1054,8 @@ mod tests {
     use rig_core::message::ToolResultContent;
     Message::User {
       content: vec![UserContent::tool_result(
-        call,
-        "bash",
+        rig_core::message::CallId::from_wire(call),
+        rig_core::message::ToolName::new("bash").unwrap(),
         vec![ToolResultContent::text(output)],
       )],
     }

@@ -13,12 +13,12 @@ path = "src/main.rs"
 # code blocks fall back to the single colour they had before.
 [features]
 default = ["languages", "mcp"]
-# Tools from MCP servers, over stdio or streamable HTTP. Rig speaks the
-# protocol through `rmcp`; this only finds the servers and hands their tools to
+# Tools from MCP servers, over stdio or streamable HTTP. `rmcp` speaks the
+# protocol; this only finds the servers and hands their tools to
 # the agent, so `--no-default-features` leaves the four built-in tools alone.
 # A server that wants a login gets one over OAuth, and the tokens it hands
 # back are kept in the system keyring through `oo7`.
-mcp = ["dep:rmcp", "dep:http", "rig-agent/rmcp", "rmcp/auth", "dep:oo7", "dep:async-trait", "dep:reqwest", "dep:url"]
+mcp = ["dep:rmcp", "dep:http", "rmcp/auth", "dep:oo7", "dep:async-trait", "dep:reqwest", "dep:url"]
 languages = [
   "lang-bash",
   "lang-c",
@@ -127,15 +127,15 @@ nucleo-matcher = "0.3.1"
 oo7 = { version = "0.6", optional = true }
 # PDFs `read` is given, turned into Markdown. Without its OCR features: a
 # scanned page is reported as having no text rather than read from pixels.
-pdf-inspector = "1.24"
+pdf-inspector = "1.25"
 ratatui = "0.30"
 # The client rmcp calls a server with once it is signed in to, and the address
 # the browser comes back to; both already in the tree through rmcp.
 reqwest = { version = "0.13", default-features = false, optional = true }
 ratatui-textarea = "0.9"
-rig-agent = "0.42"
-rig-core = "0.42"
-rmcp = { version = "2", features = [
+rig-agent = "0.43"
+rig-core = { version = "0.43", features = ["reqwest"] }
+rmcp = { version = "3", features = [
   "client",
   "transport-child-process",
   "transport-streamable-http-client-reqwest",
@@ -148,8 +148,8 @@ schemars = { version = "1", features = ["preserve_order"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 similar = "3.2.0"
-thiserror = "2.0.20"
-toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+thiserror = "2.0.21"
+toml = { version = "1", default-features = false, features = ["parse", "serde"] }
 tokio = { version = "1.53.1", features = ["full"] }
 tree-sitter = { version = "0.27", optional = true }
 tree-sitter-bash = { version = "0.25", optional = true }
@@ -165,7 +165,7 @@ tree-sitter-erlang = { version = "0.20", optional = true }
 tree-sitter-fortran = { version = "0.6", optional = true }
 tree-sitter-gleam = { version = "1.0", optional = true }
 tree-sitter-go = { version = "0.25", optional = true }
-tree-sitter-haskell = { version = "0.23", optional = true }
+tree-sitter-haskell = { version = "0.24", optional = true }
 tree-sitter-highlight = { version = "0.27", optional = true }
 tree-sitter-html = { version = "0.23", optional = true }
 tree-sitter-ini = { version = "1.4", optional = true }
@@ -200,3 +200,7 @@ unicode-normalization = "0.1.25"
 unicode-width = "0.2"
 url = { version = "2", optional = true }
 uuid = { version = "1.26.1", features = ["v4"] }
+
+# The scripted model the run loop is tested against.
+[dev-dependencies]
+rig-core = { version = "0.43", features = ["test-utils"] }

@@ -247,14 +247,14 @@ impl Offer {
 }
 
 /// How long a call to a server may take, from the seconds its table says:
-/// five minutes, as rig has it, unless told otherwise, and zero lets a call
-/// take as long as it takes.
+/// five minutes unless told otherwise, and zero lets a call take as long as
+/// it takes.
 #[cfg(feature = "mcp")]
 fn call_timeout(seconds: Option<u64>) -> Option<std::time::Duration> {
   match seconds {
     Some(0) => None,
     Some(seconds) => Some(std::time::Duration::from_secs(seconds)),
-    None => Some(rig_agent::tool::rmcp::DEFAULT_MCP_TOOL_TIMEOUT),
+    None => Some(std::time::Duration::from_secs(5 * 60)),
   }
 }
 

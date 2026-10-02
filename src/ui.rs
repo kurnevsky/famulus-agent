@@ -21,7 +21,7 @@ use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 use rig_core::completion::{Message, Usage};
 #[cfg(test)]
 use rig_core::message::ToolResultContent;
-use rig_core::message::{AssistantContent, ToolCall, ToolResult, UserContent};
+use rig_core::message::{AssistantContent, ToolResult, UserContent};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -798,7 +798,7 @@ impl App {
       pictures: HashMap::new(),
       drawn: HashMap::new(),
       stream: crate::markdown::Stream::default(),
-      usage: Usage::new(),
+      usage: Usage::default(),
       context_tokens: None,
       tick: 0,
       quit: false,
@@ -2109,7 +2109,7 @@ impl App {
   fn reset_conversation(&mut self) {
     self.agents.control.take();
     self.overflowed();
-    self.usage = Usage::new();
+    self.usage = Usage::default();
     self.context_tokens = None;
     self.anchor = None;
   }
@@ -2288,8 +2288,8 @@ impl App {
       s.created.format("%Y-%m-%d %H:%M"),
       s.model,
       s.history.len(),
-      self.usage.input_tokens,
-      self.usage.output_tokens
+      self.usage.input_tokens.unwrap_or(0),
+      self.usage.output_tokens.unwrap_or(0)
     );
     self.entries.push(Entry::Info(info));
   }
@@ -3089,7 +3089,14 @@ impl App {
     if let Some(percent) = (self.context() * 100).checked_div(self.cfg.compaction.context_window) {
       right.push(Span::styled(format!("ctx {percent}%  "), context_style(percent)));
     }
-    right.push(Span::raw(format!("{}↑ {}↓", self.usage.input_tokens, self.usage.output_tokens)).dim());
+    right.push(
+      Span::raw(format!(
+        "{}↑ {}↓",
+        self.usage.input_tokens.unwrap_or(0),
+        self.usage.output_tokens.unwrap_or(0)
+      ))
+      .dim(),
+    );
     // The figures go over the end of the rest where the two do not both fit:
     // how full the context is matters more than the tail of a notice.
     f.render_widget(Line::from(left), footer_area);
@@ -4553,7 +4560,7 @@ fn place_result(entries: &mut Vec<Entry>, result: Finished) {
 /// Every tool result in a history, and which call each answers.
 struct Results<'a> {
   results: Vec<&'a ToolResult>,
-  /// Both of the ids a result can be claimed by, to its place above.
+  /// The call each result answers, to its place above.
   by_id: HashMap<String, usize>,
 }
 
@@ -4567,17 +4574,15 @@ impl<'a> Results<'a> {
         UserContent::ToolResult(result) => Some(result),
         _ => None,
       }) {
-        for id in crate::session::result_ids(result) {
-          by_id.insert(id, results.len());
-        }
+        by_id.insert(result.call.to_string(), results.len());
         results.push(result);
       }
     }
     Self { results, by_id }
   }
 
-  fn index(&self, ids: impl Iterator<Item = String>) -> Option<usize> {
-    ids.filter_map(|id| self.by_id.get(&id)).next().copied()
+  fn index(&self, id: &str) -> Option<usize> {
+    self.by_id.get(id).copied()
   }
 
   fn entry(&self, index: usize, session: &Session, now: Instant) -> Entry {
@@ -4587,12 +4592,12 @@ impl<'a> Results<'a> {
     // edit produced is not in it at all, so both are things the session
     // remembers — against this result's own call, since one message can
     // answer several calls that went differently.
-    let outcome = crate::session::result_ids(result).find_map(|id| session.outcome(&id));
+    let outcome = session.outcome(&result.call.to_string());
     Entry::ToolResult {
-      name: result.name.clone(),
+      name: result.name.to_string(),
       output,
       images,
-      call: result.call.as_str().to_string(),
+      call: result.call.to_string(),
       is_error: outcome.is_some_and(|outcome| outcome.failed),
       running: false,
       diff: outcome.and_then(|outcome| outcome.diff.clone()),
@@ -4600,16 +4605,6 @@ impl<'a> Results<'a> {
       took: None,
     }
   }
-}
-
-/// Every way a tool call names itself, matching `session::result_ids`.
-fn call_ids(call: &ToolCall) -> impl Iterator<Item = String> + '_ {
-  [
-    Some(call.id.as_str().to_string()),
-    call.provider.as_ref().map(|p| p.call_id.clone()),
-  ]
-  .into_iter()
-  .flatten()
 }
 
 /// Rebuild the transcript view from a resumed session's history.
@@ -4640,7 +4635,7 @@ fn entries_from_history(session: &Session) -> Vec<Entry> {
       Message::User { content } => entries.extend(user_entries(content, |r| {
         // An output nothing claimed — a result whose call is not in this
         // branch — is still shown, where it was written.
-        let i = results.index(crate::session::result_ids(r))?;
+        let i = results.index(&r.call.to_string())?;
         answered.insert(i).then(|| results.entry(i, session, now))
       })),
       Message::Assistant { content, .. } => {
@@ -4648,7 +4643,7 @@ fn entries_from_history(session: &Session) -> Vec<Entry> {
           match c {
             AssistantContent::Text(t) => entries.push(Entry::Assistant(t.text.clone())),
             AssistantContent::Reasoning(r) => {
-              let text = r.display_text();
+              let text = crate::compaction::reasoning_text(r);
               if !text.is_empty() {
                 entries.push(Entry::Reasoning(text));
               }
@@ -4657,14 +4652,14 @@ fn entries_from_history(session: &Session) -> Vec<Entry> {
               entries.push(Entry::ToolCall {
                 wrote: wrote_content(&call.function.name, &call.function.arguments),
                 edited: edited_path(&call.function.name, &call.function.arguments),
-                name: call.function.name.clone(),
+                name: call.function.name.to_string(),
                 summary: summarize_args(&call.function.name, &call.function.arguments),
-                call: call.id.as_str().to_string(),
+                call: call.id.to_string(),
                 started: now,
               });
               // The output belongs under the call that asked for it, not
               // after every call of the turn.
-              if let Some(i) = results.index(call_ids(call))
+              if let Some(i) = results.index(&call.id.to_string())
                 && answered.insert(i)
               {
                 entries.push(results.entry(i, session, now));
@@ -4796,7 +4791,7 @@ fn classify(message: &Message) -> Kind {
       }
       let text = content.iter().find_map(|c| match c {
         AssistantContent::Text(t) => Some(first_line(&t.text)),
-        AssistantContent::Reasoning(r) => Some(format!("· {}", first_line(&r.display_text()))),
+        AssistantContent::Reasoning(r) => Some(format!("· {}", first_line(&crate::compaction::reasoning_text(r)))),
         _ => None,
       });
       Kind::Step(text.unwrap_or_else(|| "(no text)".into()))
@@ -5490,8 +5485,16 @@ mod tests {
 
   /// A history of one prompt, a tool call answered, and a final answer.
   fn tool_history() -> Vec<Message> {
-    let call = AssistantContent::tool_call("1", "read", serde_json::json!({ "path": "a.rs" }));
-    let result = UserContent::tool_result("1", "read", vec![ToolResultContent::text("fn main() {}")]);
+    let call = AssistantContent::tool_call(
+      "1",
+      rig_core::message::ToolName::new("read").unwrap(),
+      serde_json::json!({ "path": "a.rs" }),
+    );
+    let result = UserContent::tool_result(
+      rig_core::message::CallId::from_wire("1"),
+      rig_core::message::ToolName::new("read").unwrap(),
+      vec![ToolResultContent::text("fn main() {}")],
+    );
     vec![
       Message::user("look at a.rs"),
       Message::Assistant {
@@ -5975,8 +5978,20 @@ mod tests {
     // A turn that ran two commands at once, with the provider answering them
     // in the other order — which is allowed, and which taking the history as
     // it comes would render as both commands and then both outputs.
-    let call = |id: &str, cmd: &str| AssistantContent::tool_call(id, "bash", serde_json::json!({ "command": cmd }));
-    let result = |id: &str, out: &str| UserContent::tool_result(id, "bash", vec![ToolResultContent::text(out)]);
+    let call = |id: &str, cmd: &str| {
+      AssistantContent::tool_call(
+        id,
+        rig_core::message::ToolName::new("bash").unwrap(),
+        serde_json::json!({ "command": cmd }),
+      )
+    };
+    let result = |id: &str, out: &str| {
+      UserContent::tool_result(
+        rig_core::message::CallId::from_wire(id),
+        rig_core::message::ToolName::new("bash").unwrap(),
+        vec![ToolResultContent::text(out)],
+      )
+    };
     let session = session_of(vec![
       Message::user("build and test"),
       Message::Assistant {
@@ -6139,8 +6154,8 @@ mod tests {
     // but not the question — is drawn where it was written rather than lost.
     let session = session_of(vec![Message::User {
       content: vec![UserContent::tool_result(
-        "gone",
-        "bash",
+        rig_core::message::CallId::from_wire("gone"),
+        rig_core::message::ToolName::new("bash").unwrap(),
         vec![ToolResultContent::text("orphan output")],
       )],
     }]);

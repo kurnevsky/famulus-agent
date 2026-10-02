@@ -17,7 +17,7 @@ use ratatui::crossterm::event::KeyEvent;
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use rmcp::model::{
-  ClientCapabilities, ClientInfo, ConstTitle, ElicitRequestParams, ElicitResult, ElicitationAction,
+  ClientCapabilities, ClientConfig, ConstTitle, ElicitRequestParams, ElicitResult, ElicitationAction,
   ElicitationCapability, ElicitationSchema, EnumSchema, ErrorData, FormElicitationCapability, Implementation,
   MultiSelectEnumSchema, PrimitiveSchemaDefinition, ProgressNotificationParam, PromptArgument, SingleSelectEnumSchema,
   StringSchema,
@@ -75,11 +75,11 @@ impl rmcp::ClientHandler for crate::mcp::Watch {
 
   /// Forms and nothing else, under this program's own name rather than the
   /// library's.
-  fn get_info(&self) -> ClientInfo {
+  fn get_info(&self) -> ClientConfig {
     let capabilities = ClientCapabilities::builder()
       .enable_elicitation_with(ElicitationCapability::new().with_form(FormElicitationCapability::new()))
       .build();
-    ClientInfo::new(
+    ClientConfig::new(
       capabilities,
       Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
     )

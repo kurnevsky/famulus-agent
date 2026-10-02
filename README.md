@@ -46,7 +46,7 @@ variable it falls back to:
 | `gemini` | Google's generateContent API | `GEMINI_API_KEY` |
 | `openrouter` | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` |
 | `ollama` | `http://localhost:11434` | `OLLAMA_API_KEY`, or none |
-| `llamafile` | `http://localhost:8080` | none |
+| `llamacpp` | `http://localhost:8080` | none |
 | `cohere` | `https://api.cohere.ai` | `COHERE_API_KEY` |
 | `deepseek` | `https://api.deepseek.com` | `DEEPSEEK_API_KEY` |
 | `doubleword` | `https://api.doubleword.ai/v1` | `DOUBLEWORD_API_KEY` |
@@ -83,7 +83,7 @@ MiniMax, Moonshot and Z.AI are a `--base-url` away.
 | `--config` | `FA_CONFIG` | XDG search path | Read settings from this file instead; see below |
 | `--provider` | `FA_PROVIDER` | `openai` | API flavour to speak; see the table above |
 | `--base-url` | `FA_BASE_URL` | provider default | Endpoint root, e.g. `http://localhost:8080/v1` |
-| `--api-key` | `FA_API_KEY` | the provider's own variable, else `none` | API key (any value for servers without auth; Ollama and llamafile need none) |
+| `--api-key` | `FA_API_KEY` | the provider's own variable, else `none` | API key (any value for servers without auth; Ollama and llama.cpp need none) |
 | `-m, --model` | `FA_MODEL` | required, here or in the file | Model name; `/model` changes it later |
 | `--system-prompt` | `FA_SYSTEM_PROMPT` | built-in | Replace the system prompt |
 | `--max-tokens` | `FA_MAX_TOKENS` | the provider's own | Cap on what one answer may come to, in tokens |
@@ -189,11 +189,10 @@ stops when the window fills, makes room, and picks itself back up. A provider
 that takes the request and never answers is given twenty seconds before fa
 stops listening.
 
-Ten providers cannot be asked at all (Azure, Cohere, Doubleword, Hugging
-Face, Hyperbolic, llamafile, Perplexity, Together, xAI, Z.AI): rig speaks no
-listing endpoint for
-them, so `/model` on one of those says so without a request going out, and
-`/model <id>` is the way to change model there.
+Cohere cannot be asked at all: rig speaks no listing endpoint for it, so
+`/model` there says so without a request going out, and `/model <id>` is the
+way to change model. Every other provider is asked, though not every server
+behind an OpenAI-compatible one answers.
 
 ## Which tools
 

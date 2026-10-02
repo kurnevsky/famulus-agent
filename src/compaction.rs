@@ -4,9 +4,8 @@
 //! most recent ~`keep_recent_tokens` stay verbatim.
 
 use crate::agent::Runtime;
-use rig_core::completion::CompletionError;
 use rig_core::completion::Message;
-use rig_core::message::{AssistantContent, ToolResultContent, UserContent};
+use rig_core::message::{AssistantContent, Reasoning, Sealed, ToolResultContent, UserContent};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
@@ -158,6 +157,15 @@ fn message_tokens(message: &Message) -> u64 {
   (message_chars(message) as u64).div_ceil(4)
 }
 
+/// What a model thought, as it reads: the text of reasoning sealed to the
+/// service that produced it, which is the one place a client reads it from.
+pub fn reasoning_text(reasoning: &Sealed<Reasoning>) -> String {
+  reasoning
+    .open(reasoning.issuer())
+    .map(Reasoning::display_text)
+    .unwrap_or_default()
+}
+
 fn message_chars(message: &Message) -> usize {
   match message {
     Message::System { content } => content.len(),
@@ -174,7 +182,7 @@ fn message_chars(message: &Message) -> usize {
       .map(|c| match c {
         AssistantContent::Text(t) => t.text.len(),
         AssistantContent::ToolCall(call) => call.function.name.len() + call.function.arguments.to_string().len(),
-        AssistantContent::Reasoning(r) => r.display_text().len(),
+        AssistantContent::Reasoning(r) => reasoning_text(r).len(),
         AssistantContent::Image(_) => ESTIMATED_IMAGE_CHARS,
       })
       .sum(),
@@ -323,7 +331,7 @@ pub fn serialize(messages: &[Message]) -> String {
         let mut calls = Vec::new();
         for c in content {
           match c {
-            AssistantContent::Reasoning(r) => thinking.push(r.display_text()),
+            AssistantContent::Reasoning(r) => thinking.push(reasoning_text(r)),
             AssistantContent::Text(t) => text.push(t.text.as_str()),
             AssistantContent::ToolCall(call) => {
               let args = match &call.function.arguments {
@@ -375,7 +383,7 @@ async fn summarize(
   messages: &[Message],
   previous: Option<&str>,
   instructions: &str,
-) -> Result<String, CompletionError> {
+) -> anyhow::Result<String> {
   let mut prompt = format!("<conversation>\n{}\n</conversation>\n\n", serialize(messages));
   if let Some(previous) = previous {
     prompt.push_str(&format!("<previous-summary>\n{previous}\n</previous-summary>\n\n"));
@@ -387,12 +395,10 @@ async fn summarize(
 /// What the summarizer said, which may not be nothing: an empty checkpoint
 /// stands for the conversation every bit as much as a full one does, and
 /// there would be no telling afterwards what it was standing for.
-async fn answer(summarizer: &Runtime, prompt: String) -> Result<String, CompletionError> {
+async fn answer(summarizer: &Runtime, prompt: String) -> anyhow::Result<String> {
   let summary = summarizer.ask(prompt).await?.trim().to_string();
   if summary.is_empty() {
-    return Err(CompletionError::ResponseError(
-      "summarizer returned an empty summary".into(),
-    ));
+    anyhow::bail!("summarizer returned an empty summary");
   }
   Ok(summary)
 }
@@ -408,7 +414,7 @@ pub async fn compact(
   summarizer: &Runtime,
   mut history: Vec<Message>,
   settings: &Settings,
-) -> Result<Option<Compacted>, CompletionError> {
+) -> anyhow::Result<Option<Compacted>> {
   let previous = history.first().and_then(previous_summary);
   let start = usize::from(previous.is_some());
   let Some(cut) = cut_point(&history, start, settings.keep_recent_tokens) else {
@@ -451,7 +457,7 @@ pub async fn compact(
 #[cfg(test)]
 mod tests {
   use super::*;
-  use rig_core::message::{ToolCall, ToolCallId, ToolFunction, ToolResult, ToolResultContent};
+  use rig_core::message::{CallId, ToolCall, ToolFunction, ToolName, ToolResultContent};
 
   /// Where the tail starts, past the summary in front when there is one.
   fn cut(history: &[Message], keep_recent_tokens: u64) -> Option<usize> {
@@ -466,16 +472,11 @@ mod tests {
     Message::assistant(text)
   }
   fn tool_turn() -> (Message, Message) {
-    let call = ToolCall::new(
-      ToolCallId::mint(),
-      ToolFunction::new("bash".into(), serde_json::json!({"command": "ls"})),
+    let call = ToolCall::from_wire(
+      "",
+      ToolFunction::new(ToolName::new("bash").unwrap(), serde_json::json!({"command": "ls"})),
     );
-    let result = ToolResult {
-      call: call.id.clone(),
-      provider: None,
-      name: "bash".into(),
-      content: vec![ToolResultContent::text("a\nb")],
-    };
+    let result = call.result(vec![ToolResultContent::text("a\nb")]);
     (
       Message::Assistant {
         id: None,
@@ -515,8 +516,8 @@ mod tests {
     let (call, _) = tool_turn();
     let answered = Message::User {
       content: vec![UserContent::tool_result(
-        "c",
-        "bash",
+        CallId::from_wire("c"),
+        ToolName::new("bash").unwrap(),
         vec![ToolResultContent::text("z".repeat(2000))],
       )],
     };

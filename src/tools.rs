@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use rig_agent::tool::{Tool, ToolContext, ToolExecutionError};
 use rig_core::message::{MimeType, ToolResultContent};
+use rig_core::tool::ContextValue;
 use rustix::process::{Pid, Signal, kill_process_group};
 
 use crate::ask::{self, Dialog, Question};
@@ -18,7 +19,7 @@ use crate::{edit, images, pdf};
 use schemars::generate::SchemaSettings;
 use schemars::transform::RecursiveTransform;
 use schemars::{JsonSchema, Schema};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
 const MAX_LINES: usize = 2000;
@@ -869,9 +870,13 @@ impl Tool for WriteTool {
 
 /// Host-only detail attached to a file a tool changed: the numbered diff for
 /// the UI. It is never sent to the model.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EditDiff {
   pub diff: String,
+}
+
+impl ContextValue for EditDiff {
+  const KEY: &'static str = "edit_diff";
 }
 
 /// Leave the change behind for the UI to draw, so a file's own before and
@@ -883,7 +888,8 @@ pub struct EditDiff {
 fn attach_diff(ctx: &mut ToolContext, before: &str, after: &str) {
   let diff = edit::generate_diff_string(before, after, 4);
   if !diff.trim().is_empty() {
-    ctx.insert_result(EditDiff { diff });
+    // A string always serializes, so there is no failure to report.
+    let _ = ctx.insert_result(EditDiff { diff });
   }
 }
 
@@ -1041,12 +1047,15 @@ mod write_tests {
     // Nothing of its own: what a write put in the file is what it was asked
     // to put there, and the asking is already in the transcript, so that is
     // where the transcript reads it from.
-    assert!(ctx.result::<EditDiff>().is_none(), "a write is not a change to mark up");
+    assert!(
+      ctx.result::<EditDiff>().unwrap().is_none(),
+      "a write is not a change to mark up"
+    );
 
     // The same on a rewrite, which is still just the file as it now reads.
     let (result, ctx) = write(&dir, "one\ntwo!\n").await;
     assert!(result.is_ok());
-    assert!(ctx.result::<EditDiff>().is_none());
+    assert!(ctx.result::<EditDiff>().unwrap().is_none());
     std::fs::remove_dir_all(&dir).unwrap();
   }
 }
@@ -1096,7 +1105,7 @@ mod edit_tests {
       std::fs::read(&file).unwrap(),
       "\u{FEFF}one\r\n2\r\nthree\r\n".as_bytes()
     );
-    let diff = ctx.result::<EditDiff>().expect("diff attached for the UI");
+    let diff = ctx.result::<EditDiff>().unwrap().expect("diff attached for the UI");
     assert_eq!(diff.text_lines(), [" 1 one", "-2 two", "+2 2", " 3 three"]);
     std::fs::remove_dir_all(dir).unwrap();
   }
@@ -1224,7 +1233,7 @@ impl Tool for BashTool {
     let mut merged = tokio::net::unix::pipe::Receiver::from_owned_fd(reads.into())?;
 
     let mut output = OutputAccumulator::new();
-    let mut throttle = UpdateThrottle::new(ctx.get::<Output>().cloned());
+    let mut throttle = UpdateThrottle::new(ctx.scope::<Output>().map(|output| (*output).clone()));
     // The timeout while the command runs; once it has exited, how long what
     // it left behind may keep the pipe open.
     let mut deadline = timeout.map(|t| tokio::time::Instant::now() + t);
@@ -1562,8 +1571,8 @@ mod bash_tests {
 
     let seen: Arc<Mutex<Vec<String>>> = Arc::default();
     let sink = seen.clone();
-    let mut ctx = ToolContext::new();
-    ctx.insert(Output(Arc::new(move |text| sink.lock().unwrap().push(text))));
+    let mut ctx =
+      ToolContext::new().with_scope(Arc::new(Output(Arc::new(move |text| sink.lock().unwrap().push(text)))));
     let args = BashArgs {
       command: "echo first; sleep 0.3; echo second".into(),
       timeout: None,

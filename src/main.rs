@@ -7,6 +7,7 @@ mod cells;
 mod clipboard;
 mod compaction;
 mod config;
+mod drafts;
 mod edit;
 #[cfg(feature = "mcp")]
 mod elicit;
