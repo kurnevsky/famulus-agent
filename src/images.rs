@@ -2,7 +2,8 @@
 //! image fits within 2000x2000 pixels and 4.5 MB of base64.
 //!
 //! And the other direction: an image a tool answered with, drawn in the
-//! transcript as half-blocks.
+//! transcript — by the terminal itself where it has a graphics protocol, and
+//! as half-blocks where it has none.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -10,8 +11,12 @@ use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
 use image::imageops::FilterType;
 use image::{DynamicImage, GenericImageView, ImageFormat, Rgba};
+use ratatui::layout::Size;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
+use ratatui_image::Resize;
+use ratatui_image::picker::{Picker, ProtocolType};
+use ratatui_image::sliced::SlicedProtocol;
 use rig_core::message::{DocumentSourceKind, ImageMediaType, ToolResultContent};
 
 const MAX_WIDTH: u32 = 2000;
@@ -146,6 +151,66 @@ fn encode_jpeg(image: &DynamicImage, quality: u8) -> Option<Vec<u8>> {
     .write_with_encoder(JpegEncoder::new_with_quality(&mut out, quality))
     .ok()?;
   Some(out)
+}
+
+/// How the transcript draws an image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Graphics {
+  /// The terminal's own graphics protocol, if it answers with one; half-blocks if not
+  Auto,
+  /// The kitty graphics protocol
+  Kitty,
+  /// Sixels
+  Sixel,
+  /// The iTerm2 inline image protocol
+  Iterm2,
+  /// Coloured half-blocks, which any terminal with true colour can show
+  Blocks,
+}
+
+/// What the terminal will draw images with, or `None` for half-blocks.
+///
+/// Asks the terminal, so it has to be called once the screen is in raw mode
+/// and before anything else is reading what the terminal sends: the answer
+/// comes back as input. A terminal that does not answer leaves `Auto` to
+/// half-blocks, and draws a protocol that was named at a guessed font size.
+pub fn picker(graphics: Graphics) -> Option<Picker> {
+  let forced = match graphics {
+    Graphics::Blocks => return None,
+    Graphics::Auto => None,
+    Graphics::Kitty => Some(ProtocolType::Kitty),
+    Graphics::Sixel => Some(ProtocolType::Sixel),
+    Graphics::Iterm2 => Some(ProtocolType::Iterm2),
+  };
+  let mut picker = Picker::from_query_stdio().ok()?;
+  if let Some(protocol) = forced {
+    picker.set_protocol_type(protocol);
+  }
+  // Its half-blocks are not drawn the way the transcript's own are — those
+  // leave a transparent pixel to the terminal and never enlarge — and drawn
+  // as text they do not need placing the way a picture does.
+  (picker.protocol_type() != ProtocolType::Halfblocks).then_some(picker)
+}
+
+/// An image for the terminal to draw, within `cols` columns and `rows` lines.
+///
+/// Fitted to the cells it is given at the pixels the terminal's font has, and,
+/// like the half-blocks, never enlarged: an icon is drawn at its own size.
+/// Encoded for the protocol once, here, and drawn from that on every frame —
+/// a slice of it at a time when only some of its lines are on screen.
+pub fn graphic(picker: &Picker, bytes: &[u8], cols: u16, rows: u16) -> Option<SlicedProtocol> {
+  if cols == 0 || rows == 0 {
+    return None;
+  }
+  let image = image::load_from_memory(bytes).ok()?;
+  if image.width() == 0 || image.height() == 0 {
+    return None;
+  }
+  // Triangle for the reason the half-blocks use it: it runs again whenever
+  // the width changes.
+  let resize = Resize::Fit(Some(FilterType::Triangle));
+  let size = resize.size_for(&image, picker.font_size(), Size::new(cols, rows));
+  SlicedProtocol::new_with_resize(picker, image, size, resize).ok()
 }
 
 /// A pixel this transparent is left to the terminal's own background.

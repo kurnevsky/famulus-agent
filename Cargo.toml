@@ -129,6 +129,15 @@ oo7 = { version = "0.6", optional = true }
 # scanned page is reported as having no text rather than read from pixels.
 pdf-inspector = "1.25"
 ratatui = "0.30"
+# Images in the transcript drawn by the terminal itself — kitty, sixel or
+# iTerm2, whichever it speaks. Without chafa, which is a C library: a terminal
+# with none of the three gets fa's own half-blocks instead. Without the
+# `image` crate's defaults, so only the formats fa reads are built.
+# Pinned to 12's release candidate: 11 asks the terminal from a thread that
+# goes on reading input after it has given up waiting, and takes the answer
+# to the next question anyone asks — which, inside a tmux that nothing outside
+# answers, is crossterm's, and fa never starts.
+ratatui-image = { version = "=12.0.0-rc.0", default-features = false, features = ["crossterm"] }
 # The client rmcp calls a server with once it is signed in to, and the address
 # the browser comes back to; both already in the tree through rmcp.
 reqwest = { version = "0.13", default-features = false, optional = true }

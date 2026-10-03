@@ -9,14 +9,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{
   self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{
+  Block, BorderType, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Widget,
+};
 use ratatui::{DefaultTerminal, Frame};
+use ratatui_image::picker::{Picker, ProtocolType};
+use ratatui_image::sliced::{SignedPosition, SlicedImage, SlicedProtocol};
 use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 use rig_core::completion::{Message, Usage};
 #[cfg(test)]
@@ -206,6 +211,9 @@ pub struct Options {
   pub catalog: crate::mcp::Catalog,
   /// Whether a question the model asks rings the terminal.
   pub bell: bool,
+  /// What the terminal draws images with, or `None` to draw them as
+  /// half-blocks.
+  pub graphics: Option<Picker>,
 }
 
 /// Slash commands offered by the `/` popup: name, description, takes an argument.
@@ -632,6 +640,18 @@ pub struct App {
   catalog: crate::mcp::Catalog,
   /// Whether a question the model asks rings the terminal.
   bell: bool,
+  /// What the terminal draws images with, or `None` when they are drawn as
+  /// half-blocks.
+  graphics: Option<Picker>,
+  /// Whether the last frame had the terminal draw a picture of its own.
+  pictured: bool,
+  /// Whether the last frame drew a toast.
+  toasted: bool,
+  /// Whether the next frame is to be drawn on a cleared screen. A sixel or
+  /// an iTerm2 picture is drawn once, from its corner, and the cells it covers
+  /// are left alone after that — so a toast drawn over one stays on the
+  /// screen once it is gone, until something sends the picture again.
+  repaint: bool,
   /// The conversation: history plus its on-disk file.
   session: Session,
   overlay: Option<Overlay>,
@@ -737,6 +757,7 @@ impl App {
       notes,
       catalog,
       bell,
+      graphics,
     } = options;
     let mut input = TextArea::default();
     input.set_cursor_line_style(Style::default());
@@ -761,6 +782,10 @@ impl App {
       toast: None,
       catalog,
       bell,
+      graphics,
+      pictured: false,
+      toasted: false,
+      repaint: false,
       cwd,
       store,
       session,
@@ -851,12 +876,16 @@ impl App {
     loop {
       let due = drawn.map_or_else(Instant::now, |at| at + FRAME);
       if changed && Instant::now() >= due {
+        if std::mem::take(&mut self.repaint) {
+          terminal.clear()?;
+        }
         terminal.draw(|f| {
           self.draw(f);
           crate::cells::guard(f.buffer_mut());
         })?;
         drawn = Some(Instant::now());
-        changed = false;
+        // A frame that left something over a picture behind draws again.
+        changed = self.repaint;
       }
       tokio::select! {
           Some(ev) = input_rx.recv() => {
@@ -2681,6 +2710,7 @@ impl App {
     }
 
     self.thumb = None;
+    self.pictured = false;
     if !self.modals.is_empty() {
       self.draw_modal(f, transcript_area);
     } else if self.overlay.is_some() {
@@ -2714,16 +2744,28 @@ impl App {
       f.render_widget(&self.input, input_area);
     }
     self.draw_footer(f, footer_area);
-    self.draw_toast(f, transcript_area);
+    let toasted = self.draw_toast(f, transcript_area);
+    // A kitty picture is drawn as text, which a frame that leaves the toast
+    // out draws again; the others leave the cells they cover to the picture.
+    let drawn_once = self
+      .graphics
+      .as_ref()
+      .is_some_and(|picker| picker.protocol_type() != ProtocolType::Kitty);
+    if self.toasted && !toasted && self.pictured && drawn_once {
+      self.repaint = true;
+    }
+    self.toasted = toasted;
   }
 
   /// Drawn last, over whatever the transcript area holds, so it shows above a
   /// list or a question just as it does above the conversation.
-  fn draw_toast(&mut self, f: &mut Frame, area: Rect) {
+  ///
+  /// Whether there was one to draw.
+  fn draw_toast(&mut self, f: &mut Frame, area: Rect) -> bool {
     if self.toast.as_ref().is_some_and(|(_, until)| Instant::now() >= *until) {
       self.toast = None;
     }
-    let Some((text, _)) = &self.toast else { return };
+    let Some((text, _)) = &self.toast else { return false };
     // A list or a question is framed, and its top border says which keys do
     // what, so the toast goes inside the frame rather than over the hints.
     let area = match self.overlay.is_some() || !self.modals.is_empty() {
@@ -2745,6 +2787,7 @@ impl App {
     let block = frame(Color::Gray).padding(Padding::horizontal(1));
     f.render_widget(Clear, toast);
     f.render_widget(Paragraph::new(lines).block(block), toast);
+    true
   }
 
   fn draw_transcript(&mut self, f: &mut Frame, transcript_area: Rect) {
@@ -2777,6 +2820,7 @@ impl App {
       })
       .collect();
     f.render_widget(Paragraph::new(visible), content_area);
+    self.pictured |= draw_graphics(f.buffer_mut(), content_area, offset, &rows.pictures, &self.pictures);
     self.rendered = rows;
     self.content = content_area;
     let overflows = total > viewport;
@@ -3150,7 +3194,7 @@ impl App {
         .flatten();
       if let Some(key) = key {
         if let Some(block) = redrawn.get(&key) {
-          rows.push(Arc::clone(&block.rows));
+          rows.push_drawn(block);
           continue;
         }
         if let Some(block) = drawn.remove(&key) {
@@ -3159,13 +3203,20 @@ impl App {
               kept.insert(*used, value);
             }
           }
-          rows.push(Arc::clone(&block.rows));
+          rows.push_drawn(&block);
           redrawn.insert(key, block);
           continue;
         }
       }
       let mut lines = Vec::new();
       let mut live = RenderCache::new();
+      let mut placed = Vec::new();
+      let mut pictures = Pictures {
+        graphics: self.graphics.as_ref(),
+        cached: &mut cached,
+        live: &mut live,
+        placed: &mut placed,
+      };
       match entry {
         Entry::User { text, images } => {
           lines.push(Line::default());
@@ -3181,14 +3232,7 @@ impl App {
           // has, folded, and cached by its bytes and that width.
           for image in images {
             let gutter = Span::styled("│", Style::default().fg(Color::Cyan));
-            draw_image(
-              image,
-              gutter,
-              width,
-              self.tools_fold,
-              (&mut cached, &mut live),
-              &mut lines,
-            );
+            draw_image(image, gutter, width, self.tools_fold, &mut pictures, &mut lines);
           }
         }
         Entry::Assistant(text) => {
@@ -3289,14 +3333,7 @@ impl App {
           // rendered markdown is. The fold is not part of the key: it is how
           // much of the same drawing is shown.
           for image in images {
-            draw_image(
-              image,
-              stripe.clone(),
-              width,
-              self.tools_fold,
-              (&mut cached, &mut live),
-              &mut lines,
-            );
+            draw_image(image, stripe.clone(), width, self.tools_fold, &mut pictures, &mut lines);
           }
           if name == "bash" && (*running || took.is_some()) && self.tools_fold != Fold::Collapsed {
             let (label, elapsed) = match took {
@@ -3345,11 +3382,12 @@ impl App {
         }
       }
       let block = Drawn {
-        rows: Arc::new(wrapped(lines, width)),
+        rows: Arc::new(wrapped_placing(lines, width, &mut placed)),
         uses: live.keys().copied().collect(),
+        placed,
       };
       kept.extend(live);
-      rows.push(block.rows.clone());
+      rows.push_drawn(&block);
       if let Some(key) = key {
         redrawn.insert(key, block);
       }
@@ -3469,12 +3507,29 @@ fn wrapped(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
     .collect()
 }
 
+/// [`wrapped`], for an entry with pictures the terminal draws: each was placed
+/// at a line, and is moved to the row that line starts on.
+fn wrapped_placing(lines: Vec<Line<'static>>, width: u16, placed: &mut [Placed]) -> Vec<Line<'static>> {
+  let mut rows = Vec::with_capacity(lines.len());
+  let mut starts = Vec::with_capacity(lines.len());
+  for line in lines {
+    starts.push(rows.len());
+    rows.extend(crate::markdown::wrap_line(line, width));
+  }
+  for placed in placed {
+    placed.row = starts[placed.row];
+  }
+  rows
+}
+
 /// The rows an entry was drawn as, kept from one frame to the next.
 struct Drawn {
   rows: Arc<Vec<Line<'static>>>,
   /// The pictures they were drawn from, kept for as long as they are: a fold
   /// they are not kept for draws them again from those.
   uses: Vec<RenderKey>,
+  /// Where among them the terminal draws pictures of its own.
+  placed: Vec<Placed>,
 }
 
 /// The transcript as last drawn, a row at a time: one block of rows for each
@@ -3486,9 +3541,21 @@ struct Rows {
   /// The row each block starts at.
   starts: Vec<usize>,
   len: usize,
+  /// The pictures the terminal draws over them, by the row each starts on.
+  pictures: Vec<Placed>,
 }
 
 impl Rows {
+  /// An entry's rows, and the pictures the terminal draws over them.
+  fn push_drawn(&mut self, block: &Drawn) {
+    let start = self.len;
+    self.pictures.extend(block.placed.iter().map(|placed| Placed {
+      row: start + placed.row,
+      ..*placed
+    }));
+    self.push(Arc::clone(&block.rows));
+  }
+
   fn push(&mut self, block: Arc<Vec<Line<'static>>>) {
     self.starts.push(self.len);
     self.len += block.len();
@@ -3550,35 +3617,112 @@ fn picked_out(text: &str, highlights: &[u32], base: Style) -> Vec<Span<'static>>
 }
 
 /// Drawn pictures, by what they were drawn from and at what width.
-type RenderCache = HashMap<RenderKey, Vec<Line<'static>>>;
+type RenderCache = HashMap<RenderKey, Picture>;
+
+/// An image, drawn for the transcript.
+enum Picture {
+  /// As half-blocks, which are lines of text like the rest of it.
+  Blocks(Vec<Line<'static>>),
+  /// Encoded for the terminal to draw, over rows left blank for it.
+  Graphic(SlicedProtocol),
+}
+
+/// Where a picture the terminal draws sits among the transcript's rows.
+#[derive(Clone, Copy)]
+struct Placed {
+  /// The row its top is on: of its entry while the entry is drawn, and of the
+  /// transcript once it is in [`Rows`].
+  row: usize,
+  /// How many of its rows are shown, which is fewer than it has when it is
+  /// folded.
+  rows: usize,
+  /// The column its left edge is on.
+  column: u16,
+  key: RenderKey,
+}
+
+/// The pictures the terminal draws itself, over the rows left blank for them
+/// in `area`, which shows the transcript from row `offset` on — only the slice
+/// of one that is on screen when the top or the bottom of it cuts through.
+/// Whether any of them was.
+fn draw_graphics(buf: &mut Buffer, area: Rect, offset: usize, placed: &[Placed], pictures: &RenderCache) -> bool {
+  let bottom = offset + usize::from(area.height);
+  let mut drawn = false;
+  for placed in placed.iter().filter(|p| p.row < bottom && p.row + p.rows > offset) {
+    let Some(Picture::Graphic(graphic)) = pictures.get(&placed.key) else {
+      continue;
+    };
+    let top = placed.row.max(offset);
+    let end = (placed.row + placed.rows).min(bottom);
+    let shown = Rect {
+      x: area.x + placed.column,
+      y: area.y + (top - offset) as u16,
+      width: area.width.saturating_sub(placed.column),
+      height: (end - top) as u16,
+    };
+    // Where its top is, which is above the rows it is given when the screen
+    // cuts it: the rows below them it is not given are cut by that alone.
+    let above = i16::try_from(top - placed.row).unwrap_or(i16::MAX);
+    SlicedImage::new(graphic, SignedPosition { x: 0, y: -above }).render(shown, buf);
+    drawn = true;
+  }
+  drawn
+}
+
+/// What an entry's pictures are drawn with: what the terminal draws images
+/// with, the drawings last frame kept, the ones this entry keeps for the
+/// next, and where the terminal is to draw its own.
+struct Pictures<'a> {
+  graphics: Option<&'a Picker>,
+  cached: &'a mut RenderCache,
+  live: &'a mut RenderCache,
+  placed: &'a mut Vec<Placed>,
+}
 
 type RenderKey = (u64, u16, bool);
 
 /// An image in the transcript, under `gutter`, folded like any other block.
 /// Its drawing is taken from last frame's cache when it is there, and kept for
 /// the next.
+///
+/// One the terminal draws itself is folded the same way, as the rows it
+/// covers: they are left blank here, and it is drawn over them once they are
+/// on screen.
 fn draw_image(
   image: &[u8],
   gutter: Span<'static>,
   width: u16,
   fold: Fold,
-  (cached, live): (&mut RenderCache, &mut RenderCache),
+  pictures: &mut Pictures<'_>,
   lines: &mut Vec<Line<'static>>,
 ) {
   // Two columns of indent and the gutter, as every other block of a tool's
   // output is drawn.
-  let cols = width.saturating_sub(3);
+  const INDENT: u16 = 3;
+  let cols = width.saturating_sub(INDENT);
   let key = (hash(IMAGE_KIND, image), cols, false);
-  let drawn = cached.remove(&key).unwrap_or_else(|| {
-    crate::images::blocks(image, cols, IMAGE_MAX_LINES).unwrap_or_else(|| {
-      vec![Line::styled(
+  let picture = pictures.cached.remove(&key).unwrap_or_else(|| {
+    let drawn = match pictures.graphics {
+      Some(picker) => crate::images::graphic(picker, image, cols, IMAGE_MAX_LINES).map(Picture::Graphic),
+      None => crate::images::blocks(image, cols, IMAGE_MAX_LINES).map(Picture::Blocks),
+    };
+    drawn.unwrap_or_else(|| {
+      Picture::Blocks(vec![Line::styled(
         "[image could not be drawn]",
         Style::default().add_modifier(Modifier::DIM),
-      )]
+      )])
     })
   });
+  let body: Vec<Vec<Span<'static>>> = match &picture {
+    Picture::Blocks(drawn) => drawn.iter().map(|line| line.spans.clone()).collect(),
+    Picture::Graphic(graphic) => vec![Vec::new(); usize::from(graphic.size().height)],
+  };
+  // A preview keeps the start, so whatever of the picture is shown starts
+  // on the first row drawn.
+  let shown = body.len() - fold.hidden(body.len(), IMAGE_LINES);
+  let row = lines.len();
   Preview {
-    body: drawn.iter().map(|line| line.spans.clone()).collect(),
+    body,
     gutter,
     cap: IMAGE_LINES,
     fold,
@@ -3587,7 +3731,15 @@ fn draw_image(
     cursor: false,
   }
   .draw(lines);
-  live.insert(key, drawn);
+  if matches!(picture, Picture::Graphic(_)) && shown > 0 {
+    pictures.placed.push(Placed {
+      row,
+      rows: shown,
+      column: INDENT,
+      key,
+    });
+  }
+  pictures.live.insert(key, picture);
 }
 
 /// Identifies a message or an image by content, for the rendered-text cache.
@@ -6528,5 +6680,135 @@ mod tests {
       panic!("a prompt")
     };
     assert_eq!(images, &[bytes]);
+  }
+
+  /// A PNG of `width` by `height` pixels, all one colour.
+  fn png_of(width: u32, height: u32) -> Vec<u8> {
+    let image = image::ImageBuffer::from_pixel(width, height, image::Rgb([9u8, 200, 60]));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image)
+      .write_to(&mut bytes, image::ImageFormat::Png)
+      .unwrap();
+    bytes.into_inner()
+  }
+
+  /// A terminal that speaks kitty with a font of 10 by 20 pixels, asked
+  /// nothing: encoding a picture for it needs no terminal at all.
+  fn kitty() -> Picker {
+    let mut picker = Picker::halfblocks();
+    picker.set_protocol_type(ProtocolType::Kitty);
+    picker
+  }
+
+  /// `image` drawn into a transcript `width` columns wide, as the rows it
+  /// leaves and the places it was given among them.
+  fn placed_image(image: &[u8], width: u16, fold: Fold) -> (Vec<Line<'static>>, Vec<Placed>, RenderCache) {
+    let picker = kitty();
+    let (mut cached, mut live, mut placed) = (RenderCache::new(), RenderCache::new(), Vec::new());
+    let mut lines = Vec::new();
+    let mut pictures = Pictures {
+      graphics: Some(&picker),
+      cached: &mut cached,
+      live: &mut live,
+      placed: &mut placed,
+    };
+    draw_image(image, gutter(false, false), width, fold, &mut pictures, &mut lines);
+    (lines, placed, live)
+  }
+
+  #[test]
+  fn a_picture_the_terminal_draws_is_left_blank_rows_under_its_gutter() {
+    // 40 by 60 pixels is four cells across and three down at 10 by 20.
+    let (lines, placed, live) = placed_image(&png_of(40, 60), 80, Fold::Preview);
+    assert_eq!(lines.len(), 3);
+    // Two columns of indent and the stripe, and nothing after them.
+    assert!(lines.iter().all(|line| text_of(&line.spans) == "   "), "{lines:?}");
+    let [placed] = placed.as_slice() else {
+      panic!("one picture placed: {}", placed.len())
+    };
+    assert_eq!((placed.row, placed.rows, placed.column), (0, 3, 3));
+    let Some(Picture::Graphic(graphic)) = live.get(&placed.key) else {
+      panic!("kept for the frame to draw")
+    };
+    assert_eq!(graphic.size(), ratatui::layout::Size::new(4, 3));
+  }
+
+  #[test]
+  fn a_tall_picture_the_terminal_draws_folds_like_the_half_blocks_do() {
+    // Two hundred pixels across is twenty cells, and two thousand down a
+    // hundred rows — which the ceiling holds to eighty, the width following.
+    let tall = png_of(200, 2000);
+    let (lines, placed, _) = placed_image(&tall, 80, Fold::Preview);
+    assert_eq!(placed[0].rows, IMAGE_LINES);
+    // The rows shown, and the note saying how many more there are.
+    assert_eq!(lines.len(), IMAGE_LINES + 1);
+    let (lines, placed, _) = placed_image(&tall, 80, Fold::Full);
+    assert_eq!((lines.len(), placed[0].rows), (80, 80));
+    let (lines, placed, _) = placed_image(&tall, 80, Fold::Collapsed);
+    assert!(lines.is_empty() && placed.is_empty());
+  }
+
+  #[test]
+  fn a_picture_is_moved_down_by_the_rows_a_line_above_it_wrapped_into() {
+    let (image, placed, _) = placed_image(&png_of(40, 60), 20, Fold::Preview);
+    let mut lines = vec![Line::raw("a line long enough to wrap twice at twenty")];
+    let mut placed: Vec<Placed> = placed.into_iter().map(|p| Placed { row: p.row + 1, ..p }).collect();
+    lines.extend(image);
+    let rows = wrapped_placing(lines, 20, &mut placed);
+    assert_eq!(placed[0].row, 3);
+    assert_eq!(text_of(&rows[3].spans), "   ");
+  }
+
+  #[test]
+  fn an_entry_s_pictures_are_placed_at_the_row_it_starts_on() {
+    let (lines, placed, _) = placed_image(&png_of(40, 60), 80, Fold::Preview);
+    let block = Drawn {
+      rows: Arc::new(lines),
+      uses: Vec::new(),
+      placed,
+    };
+    let mut rows = Rows::default();
+    rows.push(Arc::new(vec![Line::default(); 5]));
+    rows.push_drawn(&block);
+    rows.push_drawn(&block);
+    let at: Vec<usize> = rows.pictures.iter().map(|p| p.row).collect();
+    assert_eq!(at, [5, 8]);
+  }
+
+  /// What a cell of the drawn buffer holds, for telling a picture's from text.
+  fn symbol(buf: &Buffer, x: u16, y: u16) -> &str {
+    buf.cell((x, y)).unwrap().symbol()
+  }
+
+  #[test]
+  fn a_picture_is_drawn_over_its_rows_and_only_the_slice_on_screen() {
+    let (_, placed, live) = placed_image(&png_of(40, 60), 80, Fold::Preview);
+    let placed = vec![Placed { row: 5, ..placed[0] }];
+    let area = Rect::new(0, 0, 20, 6);
+    let placeholder = |buf: &Buffer, x, y| symbol(buf, x, y).contains('\u{10EEEE}');
+
+    // All three of its rows on screen, from the row it starts on, in the
+    // columns after the gutter.
+    let mut buf = Buffer::empty(area);
+    assert!(draw_graphics(&mut buf, area, 2, &placed, &live));
+    assert!((3..6).all(|y| (3..7).all(|x| placeholder(&buf, x, y))));
+    assert!(!placeholder(&buf, 2, 3) && !placeholder(&buf, 7, 3) && !placeholder(&buf, 3, 2));
+
+    // Scrolled until its top row is off the screen: the rest is drawn from
+    // the top, saying it is the picture's second row.
+    let mut buf = Buffer::empty(area);
+    assert!(draw_graphics(&mut buf, area, 6, &placed, &live));
+    assert!((0..2).all(|y| placeholder(&buf, 3, y)) && !placeholder(&buf, 3, 2));
+    // The placeholder, then the row and the column of the picture it shows.
+    assert!(
+      symbol(&buf, 3, 0).contains("\u{10EEEE}\u{30D}\u{305}"),
+      "{:?}",
+      symbol(&buf, 3, 0)
+    );
+
+    // And scrolled away, nothing.
+    let mut buf = Buffer::empty(area);
+    assert!(!draw_graphics(&mut buf, area, 8, &placed, &live));
+    assert!(buf.content.iter().all(|cell| cell.symbol() == " "));
   }
 }

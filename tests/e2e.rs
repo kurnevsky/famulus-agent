@@ -600,6 +600,10 @@ impl Term {
 
   fn open(dir: PathBuf, provider: &Provider, args: &[&str]) -> Self {
     std::fs::create_dir_all(dir.join("sessions")).expect("a working directory");
+    // Images as half-blocks, which is what `capture-pane` can read back:
+    // left to ask, fa would find whatever graphics the terminal around tmux
+    // has, by the variables it left in the environment.
+    //
     // An empty configuration directory, pointed at by both halves of the XDG
     // search path: a developer with servers of their own in `mcp.toml` would
     // otherwise have them started by every test, and what the transcript says
@@ -611,7 +615,7 @@ impl Term {
     // The session's name is its socket's too: one server per terminal.
     let name = format!("fa-e2e-{}", uuid_ish());
     let command = format!(
-      "cd {} && FA_SESSIONS_DIR={} XDG_CONFIG_HOME={} XDG_CONFIG_DIRS={} {} --base-url {} -m mock {}",
+      "cd {} && FA_SESSIONS_DIR={} XDG_CONFIG_HOME={} XDG_CONFIG_DIRS={} FA_GRAPHICS=blocks {} --base-url {} -m mock {}",
       shell(&dir),
       shell(&dir.join("sessions")),
       shell(&config),
@@ -1108,6 +1112,49 @@ fn an_image_a_tool_read_is_drawn_where_it_was_read() {
       .any(|line| line.contains('▄') && line.contains("\u{1b}[38;")),
     "the blocks carry the image's colours:\n{coloured:?}"
   );
+}
+
+#[test]
+fn an_image_the_terminal_draws_is_placed_where_the_half_blocks_would_be() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "",
+      tool: "read",
+      args: serde_json::json!({ "path": "red.png" }),
+    },
+    Turn::Say("A red square."),
+  ]);
+  // Kitty draws a picture as text — a placeholder character in every cell
+  // it covers — so where it went can be read back like anything else, even
+  // though no terminal outside tmux is there to show the picture itself.
+  let term = Term::start("kitty", &provider, &["--no-session", "--graphics", "kitty"]);
+  let red = image::ImageBuffer::from_pixel(40, 60, image::Rgb([220u8, 20, 60]));
+  image::DynamicImage::ImageRgb8(red)
+    .save(term.dir.join("red.png"))
+    .expect("an image to read");
+  term.submit("look at red.png");
+  term.wait_for("A red square.");
+
+  let screen = term.screen();
+  let lines: Vec<&str> = screen.lines().collect();
+  let rows: Vec<usize> = (0..lines.len())
+    .filter(|&at| lines[at].contains('\u{10EEEE}'))
+    .collect();
+  assert!(!rows.is_empty(), "the picture is placed:\n{screen}");
+  // One block of rows, right under what the tool said, and no half-blocks.
+  assert!(rows.windows(2).all(|pair| pair[1] == pair[0] + 1), "{screen}");
+  assert!(lines[rows[0] - 1].contains("Read image file"), "{screen}");
+  assert!(!screen.contains('▄'), "{screen}");
+  // Every row as wide as the others, after the indent and the stripe.
+  let width = |line: &str| line.matches('\u{10EEEE}').count();
+  assert!(
+    rows.iter().all(|&at| width(lines[at]) == width(lines[rows[0]])),
+    "{screen}"
+  );
+  assert!(lines[rows[0]].starts_with("   \u{10EEEE}"), "{:?}", lines[rows[0]]);
 }
 
 #[test]

@@ -138,6 +138,12 @@ struct Cli {
   #[arg(long, env = "FA_SCROLLBAR", value_enum)]
   scrollbar: Option<ui::ScrollbarMode>,
 
+  /// How images are drawn in the transcript: with the terminal's own
+  /// graphics protocol when it answers with one, with the protocol named, or
+  /// as half-blocks [default: auto]
+  #[arg(long, env = "FA_GRAPHICS", value_enum)]
+  graphics: Option<images::Graphics>,
+
   /// Do not ring the terminal when the model asks a question
   #[arg(long, env = "FA_NO_BELL")]
   no_bell: bool,
@@ -284,6 +290,10 @@ async fn main() -> Result<()> {
   };
 
   let agents = agent::build_agents(&cfg, &cwd, &host, &servers)?;
+  // The terminal is asked what it can draw images with, which wants it in
+  // raw mode and nothing else yet reading what it says back.
+  let mut terminal = ratatui::init();
+  let graphics = images::picker(cli.graphics.or(file.graphics).unwrap_or(images::Graphics::Auto));
   let app = ui::App::new(
     agents,
     cfg,
@@ -297,10 +307,10 @@ async fn main() -> Result<()> {
       notes,
       catalog: servers.catalog().clone(),
       bell: !(cli.no_bell || file.no_bell),
+      graphics,
     },
   );
 
-  let mut terminal = ratatui::init();
   // Mouse wheel scrolls the transcript. Note: while captured, the terminal's
   // own drag-selection usually needs Shift held.
   let _ = execute!(stdout(), EnableMouseCapture);
