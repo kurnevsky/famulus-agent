@@ -227,7 +227,7 @@ impl Tool for ReadTool {
              Images are sent as attachments, PDFs as the Markdown of their text; other binary files are refused. \
              For text files and PDFs, output is truncated to {MAX_LINES} lines \
              or {}KB (whichever is hit first). Use offset/limit for large files. When you need the \
-             full file, continue with offset until complete.",
+             full file, continue with offset until complete. Use this rather than cat or sed to examine files.",
       MAX_BYTES / 1024
     )
   }
@@ -849,7 +849,7 @@ impl Tool for WriteTool {
 
   fn description(&self) -> String {
     "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. \
-         Automatically creates parent directories."
+         Automatically creates parent directories. Use only for new files or complete rewrites."
       .into()
   }
 
@@ -940,10 +940,12 @@ impl Tool for EditTool {
   tool_args!(EditArgs);
 
   fn description(&self) -> String {
-    "Edit a single file using exact text replacement. Every edits[].oldText must match a \
-         unique, non-overlapping region of the original file. If two changes affect the same \
-         block or nearby lines, merge them into one edit instead of emitting overlapping edits. \
-         Do not include large unchanged regions just to connect distant changes."
+    "Edit a single file using exact text replacement. Put all changes to one file in a single \
+         call. Every edits[].oldText must match a unique, non-overlapping region of the original \
+         file; it is matched against the original, not after earlier edits are applied. If two \
+         changes affect the same block or nearby lines, merge them into one edit instead of \
+         emitting overlapping edits. Keep oldText as small as possible while still unique; do not \
+         include large unchanged regions just to connect distant changes."
       .into()
   }
 
@@ -1739,7 +1741,8 @@ impl Tool for AskTool {
          - Use multiSelect: true when multiple answers are valid.\n\
          - If you recommend a specific option, make that the first option in the list and add \
          \"(Recommended)\" at the end of the label.\n\
-         - Group all clarifying questions into one call rather than asking again straight after."
+         - Group all clarifying questions into one call rather than asking again straight after.\n\
+         - Only ask when you cannot proceed without a decision; do not ask what you can find out yourself."
       .into()
   }
 

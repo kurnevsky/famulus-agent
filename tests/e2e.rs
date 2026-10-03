@@ -3277,8 +3277,8 @@ fn a_session_can_be_held_to_some_of_its_tools() {
   // And the model is not told about what it cannot call, which it would
   // otherwise try and report being refused.
   assert!(
-    request.contains("Use read to examine files") && !request.contains("Use bash for"),
-    "the prompt speaks only for the tools there are: {request}"
+    request.contains("rather than cat or sed") && !request.contains("edits[].oldText"),
+    "the guidance is only for the tools there are: {request}"
   );
   // A name nothing answers to is worth saying, since it leaves nothing out.
   let term = Term::start("typo", &provider, &["--no-session", "--no-tools", "bahs"]);

@@ -701,7 +701,7 @@ pub async fn list_models(cfg: &Config) -> Result<Vec<ModelInfo>> {
 pub fn build_agents(cfg: &Config, cwd: &Path, host: &Host, servers: &crate::mcp::Servers) -> Result<Agents> {
   let preamble = match &cfg.system_prompt {
     Some(p) => p.clone(),
-    None => default_system_prompt(cwd, &cfg.tools),
+    None => default_system_prompt(cwd),
   };
 
   let catalog = servers.catalog();
@@ -1424,51 +1424,12 @@ fn relay(message: Message) -> (Message, Option<Message>) {
   (Message::User { content }, relay)
 }
 
-/// The lines of the built-in prompt that speak for a tool, by the tool they
-/// speak for: a session without one should not be told to use it.
-/// A whole word, so `read` does not take `already` with it — and the plural
-/// too, since the rules speak of a tool's arguments as `edits[]`.
-fn mentions(line: &str, tool: &str) -> bool {
-  line
-    .split(|c: char| !c.is_ascii_alphanumeric())
-    .any(|word| word == tool || word.strip_suffix('s') == Some(tool))
-}
-
-/// Drop what the prompt says about tools this session does not have.
-///
-/// A model told about `bash` and then refused it does not quietly do without:
-/// it tries, is refused, and says so instead of using what it does have.
-fn for_tools(prompt: &str, tools: &crate::tools::Rules) -> String {
-  let gone: Vec<&str> = crate::tools::BUILT_IN
-    .iter()
-    .copied()
-    .filter(|name| !tools.permits(name))
-    .collect();
-  if gone.is_empty() {
-    return prompt.to_string();
-  }
-  prompt
-    .lines()
-    .filter(|line| !gone.iter().any(|tool| mentions(line, tool)))
-    .collect::<Vec<_>>()
-    .join("\n")
-}
-
-fn default_system_prompt(cwd: &Path, tools: &crate::tools::Rules) -> String {
-  let mut prompt = for_tools(
-    "You are an expert coding assistant operating inside a minimal terminal coding agent. \
-         You help users by reading files, executing commands, editing code, and writing new files.\n\n\
-         <rules>\n\
-         - Use read to examine files instead of cat or sed.\n\
-         - Use edit for precise changes (edits[].oldText must match exactly)\n\
-         - When changing multiple separate locations in one file, use one edit call with multiple entries in edits[] instead of multiple edit calls\n\
-         - Each edits[].oldText is matched against the original file, not after earlier edits are applied. Do not emit overlapping or nested edits. Merge nearby changes into one edit.\n\
-         - Keep edits[].oldText as small as possible while still being unique in the file. Do not pad with large unchanged regions.\n\
-         - Use write only for new files or complete rewrites.\n\
-         - Use ask whenever the request is underspecified and you cannot proceed without a concrete decision; do not ask what the code itself can answer\n\
-         - Be concise in your responses\n\
-         </rules>\n",
-    tools,
+fn default_system_prompt(cwd: &Path) -> String {
+  let mut prompt = String::from(
+    "You are a helpful general-purpose assistant. \
+     You help with anything: answering questions, research, writing, analysis and software work, \
+     using your tools when the task calls for them. \
+     Be concise and direct. Say plainly when you are unsure or something failed.\n",
   );
 
   let path = cwd.join("AGENTS.md");
@@ -2300,41 +2261,6 @@ mod tests {
     assert_eq!(weight(&prompt), 500);
 
     assert_eq!(weight(&Usage::default()), 0);
-  }
-
-  #[test]
-  fn the_prompt_stops_speaking_for_a_tool_the_session_does_not_have() {
-    let rules = |refused: &[&str]| crate::tools::Rules {
-      refused: refused.iter().map(|s| s.to_string()).collect(),
-    };
-    let all = default_system_prompt(Path::new("/work"), &rules(&[]));
-    for rule in ["Use read", "Use edit", "Use write", "Use ask"] {
-      assert!(all.contains(rule), "{rule:?} is there by default");
-    }
-
-    // A model told about `bash` and then refused it tries anyway and reports
-    // being refused, instead of using what it does have.
-    let reading = default_system_prompt(Path::new("/work"), &rules(&["bash", "edit", "write", "ask"]));
-    for gone in [
-      "Use edit for",
-      "Use write only",
-      // Including where the rules speak of a tool's arguments rather than of
-      // the tool by name.
-      "edits[].oldText",
-    ] {
-      assert!(!reading.contains(gone), "{gone:?} is not this session's: {reading}");
-    }
-    // What does not speak for a tool stays, and so does the rest of it.
-    assert!(reading.contains("- Be concise in your responses"));
-    assert!(reading.contains("Use read to examine files"));
-    assert!(reading.contains("<cwd>\n/work\n</cwd>"));
-
-    // Refusing a tool the prompt does not speak for changes nothing.
-    assert_eq!(default_system_prompt(Path::new("/work"), &rules(&["fetch"])), all);
-    // And refusing one leaves the rest.
-    let no_edit = default_system_prompt(Path::new("/work"), &rules(&["edit"]));
-    assert!(!no_edit.contains("edits[]"), "{no_edit}");
-    assert!(no_edit.contains("Use read"), "{no_edit}");
   }
 
   #[test]
