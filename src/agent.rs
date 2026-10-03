@@ -20,7 +20,9 @@ use rig_agent::tool::server::{ToolServer, ToolServerHandle};
 use rig_agent::tool::{ToolContext, ToolExecutionError, ToolResult};
 use rig_core::DynModel;
 use rig_core::completion::{CompletionRequest, Message, ToolDefinition, Usage};
-use rig_core::message::{AssistantContent, Reasoning, ToolCall, ToolResultContent, UserContent};
+use rig_core::message::{
+  AssistantContent, Issuer, Reasoning, ReasoningContent, ToolCall, ToolResultContent, UserContent,
+};
 use rig_core::operation::Completion;
 use rig_core::providers::{anthropic, cohere, gemini, ollama, openai, xai};
 use rig_core::streaming::{CompletionStream, Item, Part, PartKind, StreamEvent};
@@ -351,13 +353,17 @@ pub struct Runtime {
   /// Chat completions will not carry an image inside a tool message, so a
   /// `read` that answers with a screenshot has it relayed after the result.
   relay_images: bool,
+  /// Who the readable part of reasoning another service produced is passed
+  /// off as, so it is sent here too; `None` where only what this service
+  /// signed itself may go back.
+  adopt_reasoning: Option<Adopter>,
   /// Cap on one answer, left to the provider when `None`.
   max_tokens: Option<u64>,
 }
 
 impl Runtime {
   fn new(cfg: &Config, tools: Tools, preamble: String) -> Result<Self> {
-    let (model, relay_images) = build_model(cfg)?;
+    let (model, relay_images, adopt_reasoning) = build_model(cfg)?;
     Ok(Self {
       model,
       tools,
@@ -365,6 +371,7 @@ impl Runtime {
       compaction: cfg.compaction,
       rules: cfg.tools.clone(),
       relay_images,
+      adopt_reasoning,
       max_tokens: cfg.max_tokens,
     })
   }
@@ -571,8 +578,9 @@ fn client(cfg: &Config) -> Result<Client> {
 }
 
 /// The model `cfg.model` is reached through, whichever provider offers it,
-/// and whether an image a tool answers with has to be relayed after the
-/// result rather than sent inside it.
+/// whether an image a tool answers with has to be relayed after the result
+/// rather than sent inside it, and who reasoning other services produced is
+/// passed off as ([`adopt_reasoning`]).
 ///
 /// Summarizing asks the same model the same way, so it is the same model —
 /// what makes that call a summary is the preamble it carries, which belongs
@@ -584,26 +592,26 @@ fn client(cfg: &Config) -> Result<Client> {
 /// knows takes it, so which of the two endpoints the model is spoken to
 /// through is what decides — and for some providers that is the model's to
 /// say, so it is read off the endpoint rig chose.
-fn build_model(cfg: &Config) -> Result<(DynModel<Completion>, bool)> {
+fn build_model(cfg: &Config) -> Result<(DynModel<Completion>, bool, Option<Adopter>)> {
   let model = cfg.model.clone();
-  let chat = |chat: &openai::wire::Chat| !chat.provider.dialect.quirks.supports_image_tool_results;
+  let chat = |chat: &openai::wire::Chat| (!chat.provider.dialect.quirks.supports_image_tool_results, adopter(chat));
   Ok(match client(cfg)? {
     // The official endpoint answers on either API, and which one is what the
     // two providers are for.
     Client::OpenAi(client) => match cfg.provider {
       Provider::OpenAi => {
         let model = client.chat(model);
-        let relay = chat(&model.wire);
-        (drafting(model), relay)
+        let (relay, adopt) = chat(&model.wire);
+        (drafting(model), relay, adopt)
       }
-      Provider::OpenAiResponses => (drafting(client.responses(model)), false),
+      Provider::OpenAiResponses => (drafting(client.responses(model)), false, None),
       _ => {
         let model = client.completion(model);
-        let relay = match &model.wire {
+        let (relay, adopt) = match &model.wire {
           openai::wire::OpenAiWire::Chat(wire) => chat(wire),
-          openai::wire::OpenAiWire::Responses(_) => false,
+          openai::wire::OpenAiWire::Responses(_) => (false, None),
         };
-        (drafting(model), relay)
+        (drafting(model), relay, adopt)
       }
     },
     // Anthropic refuses a request that names no `max_tokens`, so rig fills in
@@ -613,12 +621,45 @@ fn build_model(cfg: &Config) -> Result<(DynModel<Completion>, bool)> {
     Client::Anthropic(client) => {
       let mut model = client.completion(model);
       model.wire.default_max_tokens.get_or_insert(2048);
-      (drafting(model), false)
+      (drafting(model), false, None)
     }
-    Client::Gemini(client) => (drafting(client.completion(model)), false),
-    Client::Ollama(client) => (drafting(client.completion(model)), true),
-    Client::Cohere(client) => (drafting(client.completion(model)), true),
+    Client::Gemini(client) => (drafting(client.completion(model)), false, None),
+    Client::Ollama(client) => (drafting(client.completion(model)), true, None),
+    Client::Cohere(client) => (drafting(client.completion(model)), true, None),
   })
+}
+
+/// What a Chat Completions endpoint makes of reasoning from elsewhere: who
+/// it is passed off as, and whose it sends back as it is already.
+pub struct Adopter {
+  /// The endpoint's own name, which is always among those it sends reasoning
+  /// back for.
+  issuer: Issuer,
+  /// Whose reasoning goes back untouched, signed and sealed: the endpoint's
+  /// own and, behind a gateway, the family of the model asked for.
+  native: Vec<Issuer>,
+}
+
+/// What reasoning from elsewhere becomes on its way out over `wire`.
+///
+/// Chat Completions carries a thought as plain text, which any server on it
+/// reads whoever thought it, and a server that takes none has it dropped by
+/// rig. Claude is the exception, behind a gateway as anywhere: it refuses a
+/// thought it did not sign, so it is given only its own. The Responses API
+/// and the native wires replay reasoning as items of their own service, and
+/// get nothing from elsewhere either.
+fn adopter(wire: &openai::wire::Chat) -> Option<Adopter> {
+  let dialect = &wire.provider.dialect;
+  let issuer = Issuer::from_static(dialect.name);
+  let mut native = vec![issuer.clone()];
+  if dialect.quirks.upstream_reasoning_issuer {
+    let upstream = openai::wire::upstream_reasoning_issuer(dialect.name, &wire.model);
+    if upstream == "anthropic" {
+      return None;
+    }
+    native.push(Issuer::from(upstream));
+  }
+  Some(Adopter { issuer, native })
 }
 
 /// Ask the provider what models it offers, alphabetically.
@@ -906,6 +947,9 @@ async fn run(
     chat.extend(made.iter().cloned());
     if rt.relay_images {
       relay_tool_images(&mut chat);
+    }
+    if let Some(adopter) = &rt.adopt_reasoning {
+      adopt_reasoning(&mut chat, adopter);
     }
 
     // Weighed before it is sent rather than once the answer comes back: a
@@ -1289,6 +1333,53 @@ impl Runtime {
   }
 }
 
+/// Reasoning another service produced, passed off as the adopter's so that
+/// it goes out with the rest rather than being left behind.
+///
+/// Only what reads as a thought travels: its text and summaries. Signatures,
+/// ciphertext and the reasoning's id mean something only to the service that
+/// issued them, so they are dropped, and reasoning that was nothing but those
+/// stays its issuer's. What the endpoint sends back as it is already is left
+/// alone, and so is the transcript: this is the copy the request is made
+/// from.
+fn adopt_reasoning(history: &mut [Message], adopter: &Adopter) {
+  for message in history {
+    let Message::Assistant { content, .. } = message else {
+      continue;
+    };
+    for part in content {
+      let AssistantContent::Reasoning(sealed) = part else {
+        continue;
+      };
+      if sealed.open_for(&adopter.native).is_some() {
+        continue;
+      }
+      let Some(reasoning) = sealed.open(sealed.issuer()) else {
+        continue;
+      };
+      let readable: Vec<ReasoningContent> = reasoning
+        .content
+        .iter()
+        .filter_map(|block| match block {
+          ReasoningContent::Text { text, .. } => Some(ReasoningContent::Text {
+            text: text.clone(),
+            signature: None,
+          }),
+          ReasoningContent::Summary(summary) => Some(ReasoningContent::Summary(summary.clone())),
+          ReasoningContent::Encrypted(_) | ReasoningContent::Redacted { .. } => None,
+        })
+        .collect();
+      if !readable.is_empty() {
+        *sealed = Reasoning {
+          id: None,
+          content: readable,
+        }
+        .sealed(adopter.issuer.clone());
+      }
+    }
+  }
+}
+
 /// The OpenAI chat completions API only accepts text in tool messages, so
 /// this strips images out of tool results and re-sends them in a user
 /// message right after, so `read` can return screenshots.
@@ -1537,6 +1628,7 @@ mod tests {
       compaction: TEST_SETTINGS,
       rules: Default::default(),
       relay_images: false,
+      adopt_reasoning: None,
       max_tokens: None,
     })
   }
@@ -2314,6 +2406,7 @@ mod tests {
       compaction: TEST_SETTINGS,
       rules: Default::default(),
       relay_images: false,
+      adopt_reasoning: None,
       max_tokens: Some(99),
     });
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -2403,6 +2496,112 @@ mod tests {
       panic!("Azure built with no endpoint");
     };
     assert!(format!("{err:#}").contains("--base-url"), "{err:#}");
+  }
+
+  /// Chat Completions takes thoughts from anywhere, as its own; Claude, and
+  /// the wires that replay reasoning as items of their own, do not.
+  #[test]
+  fn chat_completions_adopts_reasoning() {
+    for (provider, model, adopter) in [
+      (Provider::LlamaCpp, "mock", Some("llamacpp")),
+      (Provider::OpenAi, "mock", Some("openai")),
+      (Provider::DeepSeek, "deepseek-reasoner", Some("deepseek")),
+      (Provider::OpenRouter, "deepseek/deepseek-r1", Some("openrouter")),
+      (Provider::OpenRouter, "anthropic/claude-sonnet-4.5", None),
+      (Provider::OpenAiResponses, "mock", None),
+      (Provider::Anthropic, "claude-sonnet-4-5", None),
+      (Provider::Gemini, "mock", None),
+      (Provider::Ollama, "mock", None),
+    ] {
+      let cfg = Config {
+        provider,
+        base_url: Some("http://127.0.0.1:1/v1".to_string()),
+        api_key: "k".into(),
+        model: model.into(),
+        system_prompt: None,
+        max_tokens: None,
+        compaction: TEST_SETTINGS,
+        vision: true,
+        tools: Default::default(),
+      };
+      let (_, _, adopt) = build_model(&cfg).unwrap();
+      assert_eq!(
+        adopt.as_ref().map(|adopt| adopt.issuer.as_str()),
+        adopter,
+        "{provider:?} {model}"
+      );
+    }
+  }
+
+  /// What reads as a thought is passed off as the adopter's, without what only
+  /// its issuer could check; the rest, and what the endpoint sends back as it
+  /// is already, is left as it was.
+  #[test]
+  fn adopted_reasoning_keeps_what_reads() {
+    let reasoning = |issuer: &'static str, id: Option<&str>, content: Vec<ReasoningContent>| {
+      AssistantContent::Reasoning(
+        Reasoning {
+          id: id.map(String::from),
+          content,
+        }
+        .sealed(issuer),
+      )
+    };
+    let signed = ReasoningContent::Text {
+      text: "think".into(),
+      signature: Some("sig".into()),
+    };
+    let foreign = reasoning(
+      "llamacpp",
+      Some("r1"),
+      vec![
+        signed.clone(),
+        ReasoningContent::Encrypted("blob".into()),
+        ReasoningContent::Summary("in short".into()),
+      ],
+    );
+    let sealed_shut = reasoning("anthropic", None, vec![ReasoningContent::Redacted { data: "x".into() }]);
+    let upstream = reasoning("openrouter/deepseek", Some("mine"), vec![signed]);
+    let mut history = vec![
+      Message::user("hi"),
+      Message::Assistant {
+        id: None,
+        content: vec![
+          foreign,
+          sealed_shut.clone(),
+          upstream.clone(),
+          AssistantContent::text("done"),
+        ],
+      },
+    ];
+    let adopter = Adopter {
+      issuer: Issuer::from_static("openrouter"),
+      native: vec![
+        Issuer::from_static("openrouter"),
+        Issuer::from_static("openrouter/deepseek"),
+      ],
+    };
+    adopt_reasoning(&mut history, &adopter);
+    let Message::Assistant { content, .. } = &history[1] else {
+      panic!("not an answer")
+    };
+    assert_eq!(
+      content[0],
+      reasoning(
+        "openrouter",
+        None,
+        vec![
+          ReasoningContent::Text {
+            text: "think".into(),
+            signature: None,
+          },
+          ReasoningContent::Summary("in short".into()),
+        ],
+      )
+    );
+    assert_eq!(content[1], sealed_shut);
+    assert_eq!(content[2], upstream);
+    assert_eq!(content[3], AssistantContent::text("done"));
   }
 
   /// The key is read from the variable the provider's own tools use.
