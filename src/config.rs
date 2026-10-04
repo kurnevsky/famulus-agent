@@ -70,6 +70,8 @@ pub struct Settings {
   pub no_bell: bool,
   #[serde(default, deserialize_with = "path")]
   pub mcp_config: Option<PathBuf>,
+  #[serde(default, deserialize_with = "path")]
+  pub theme: Option<PathBuf>,
   #[serde(default)]
   pub no_mcp: bool,
   pub tools: Option<Vec<String>>,

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use ::markdown::ParseOptions;
 use ::markdown::mdast::{AlignKind, FootnoteDefinition, List, Node};
 use mdstitch::{StitchOptions, stitch};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -28,13 +28,14 @@ const HR_MAX: usize = 80;
 /// Nested lists step in by this much per level.
 const LIST_INDENT: usize = 4;
 
-/// Colours come from the terminal's own palette, so they keep working
-/// against a light background.
+/// Colours come from the theme, whose defaults are the terminal's own
+/// palette, so they keep working against a light background.
 mod style {
   use super::*;
+  use crate::theme::theme;
 
   pub fn heading(depth: u8) -> Style {
-    let style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let style = Style::new().fg(theme().markdown.heading).add_modifier(Modifier::BOLD);
     if depth == 1 {
       style.add_modifier(Modifier::UNDERLINED)
     } else {
@@ -42,16 +43,32 @@ mod style {
     }
   }
 
-  pub const CODE_BLOCK: Style = Style::new().fg(Color::Green);
+  pub fn code_block() -> Style {
+    Style::new().fg(theme().markdown.code_block)
+  }
   /// Everything drawn around the text rather than in it: a code block's
   /// fences, a quote's bar, a rule, a table's lines.
-  pub const BORDER: Style = Style::new().fg(Color::DarkGray);
-  pub const INLINE_CODE: Style = Style::new().fg(Color::Cyan);
-  pub const LINK: Style = Style::new().fg(Color::Blue).add_modifier(Modifier::UNDERLINED);
+  pub fn border() -> Style {
+    Style::new().fg(theme().markdown.border)
+  }
+  pub fn inline_code() -> Style {
+    Style::new().fg(theme().markdown.inline_code)
+  }
+  pub fn link() -> Style {
+    Style::new()
+      .fg(theme().markdown.link)
+      .add_modifier(Modifier::UNDERLINED)
+  }
   pub const DIM: Style = Style::new().add_modifier(Modifier::DIM);
-  pub const QUOTE: Style = Style::new().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
-  pub const BULLET: Style = Style::new().fg(Color::Green);
-  pub const FOOTNOTE: Style = Style::new().fg(Color::Blue);
+  pub fn quote() -> Style {
+    Style::new().fg(theme().markdown.quote).add_modifier(Modifier::ITALIC)
+  }
+  pub fn bullet() -> Style {
+    Style::new().fg(theme().markdown.bullet)
+  }
+  pub fn footnote() -> Style {
+    Style::new().fg(theme().markdown.footnote)
+  }
 }
 
 /// Renders `md` into lines that each fit `width` columns.
@@ -468,9 +485,9 @@ impl<'a> Refs<'a> {
       return;
     }
     out.push(Line::default());
-    out.push(Line::styled("─".repeat(width.min(HR_MAX)), style::BORDER));
+    out.push(Line::styled("─".repeat(width.min(HR_MAX)), style::border()));
     for (number, definition) in definitions {
-      let marker = Span::styled(format!("[{number}] "), style::FOOTNOTE);
+      let marker = Span::styled(format!("[{number}] "), style::footnote());
       let body = width.saturating_sub(marker.width()).max(1);
       let mut inner = Vec::new();
       blocks(&definition.children, body, self, &mut inner);
@@ -661,7 +678,7 @@ fn block(node: &Node, width: usize, refs: &Refs, out: &mut Vec<Line<'static>>) {
     }
     Node::Code(code) => {
       let lang = code.lang.clone().unwrap_or_default();
-      out.push(Line::styled(format!("```{lang}"), style::BORDER));
+      out.push(Line::styled(format!("```{lang}"), style::border()));
       // A language we have a grammar for is coloured token by token; anything
       // else — no info string, a language not built in — keeps the one colour
       // the whole block used to have.
@@ -682,13 +699,13 @@ fn block(node: &Node, width: usize, refs: &Refs, out: &mut Vec<Line<'static>>) {
         // it could not finish leaves later lines plain rather than shifted.
         let spans = match highlighted.as_ref().and_then(|lines| lines.get(i)) {
           Some(spans) => trim_indent(spans.clone()),
-          None => vec![Span::styled(code.to_string(), style::CODE_BLOCK)],
+          None => vec![Span::styled(code.to_string(), style::code_block())],
         };
         for wrapped in wrap(spans, body) {
           out.push(prefix(Span::raw(indent.clone()), wrapped));
         }
       }
-      out.push(Line::styled("```", style::BORDER));
+      out.push(Line::styled("```", style::border()));
     }
     Node::List(list) => list_block(list, 0, width, refs, out),
     Node::Blockquote(_) => {
@@ -700,13 +717,13 @@ fn block(node: &Node, width: usize, refs: &Refs, out: &mut Vec<Line<'static>>) {
         // The quote style is a floor, not an override: inline code and links
         // inside a quote keep their own colour.
         for span in &mut line.spans {
-          span.style = style::QUOTE.patch(span.style);
+          span.style = style::quote().patch(span.style);
         }
-        out.push(prefix(Span::styled(QUOTE_PREFIX, style::BORDER), line));
+        out.push(prefix(Span::styled(QUOTE_PREFIX, style::border()), line));
       }
     }
     Node::ThematicBreak(_) => {
-      out.push(Line::styled("─".repeat(width.min(HR_MAX)), style::BORDER));
+      out.push(Line::styled("─".repeat(width.min(HR_MAX)), style::border()));
     }
     Node::Table(table) => table_block(&table.children, &table.align, width, refs, out),
     Node::Html(html) => out.extend(plain(&html.value, width, style::DIM)),
@@ -740,7 +757,7 @@ fn list_block(list: &List, depth: usize, width: usize, refs: &Refs, out: &mut Ve
       Some(false) => "[ ] ",
       None => "",
     };
-    let marker = Span::styled(format!("{indent}{bullet}{task}"), style::BULLET);
+    let marker = Span::styled(format!("{indent}{bullet}{task}"), style::bullet());
     let body = width.saturating_sub(marker.width()).max(1);
 
     let mut inner: Vec<Line<'static>> = Vec::new();
@@ -814,7 +831,7 @@ fn table_block(rows: &[Node], align: &[AlignKind], width: usize, refs: &Refs, ou
       s.push_str(&"─".repeat(w + 2));
       s.push_str(if i + 1 == widths.len() { right } else { mid });
     }
-    Line::styled(s, style::BORDER)
+    Line::styled(s, style::border())
   };
 
   out.push(rule("┌", "┬", "┐"));
@@ -827,7 +844,7 @@ fn table_block(rows: &[Node], align: &[AlignKind], width: usize, refs: &Refs, ou
       .collect();
     let height = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
     for line in 0..height {
-      let mut spans = vec![Span::styled("│", style::BORDER)];
+      let mut spans = vec![Span::styled("│", style::border())];
       for (c, column) in wrapped.iter().enumerate() {
         let content = column.get(line).cloned().unwrap_or_default();
         let pad = widths[c].saturating_sub(content.width());
@@ -841,7 +858,7 @@ fn table_block(rows: &[Node], align: &[AlignKind], width: usize, refs: &Refs, ou
         // row across the table is a line of its own.
         spans.extend(content.spans.into_iter().filter(|span| joined_with(span).is_none()));
         spans.push(Span::raw(" ".repeat(after + 1)));
-        spans.push(Span::styled("│", style::BORDER));
+        spans.push(Span::styled("│", style::border()));
       }
       out.push(Line::from(spans));
     }
@@ -878,7 +895,7 @@ fn fit(natural: &[usize], budget: usize) -> Vec<usize> {
 /// An autolink shows its own URL, so repeating it would only add noise.
 fn link_spans(children: &[Node], url: &str, base: Style, refs: &Refs, out: &mut Vec<Span<'static>>) {
   let start = out.len();
-  inline(children, base.patch(style::LINK), refs, out);
+  inline(children, base.patch(style::link()), refs, out);
   let text: String = out[start..].iter().map(|s| s.content.as_ref()).collect();
   let bare = url.strip_prefix("mailto:").unwrap_or(url);
   if text != url && text != bare {
@@ -901,7 +918,7 @@ fn inline(nodes: &[Node], base: Style, refs: &Refs, out: &mut Vec<Span<'static>>
       Node::Strong(strong) => inline(&strong.children, base.add_modifier(Modifier::BOLD), refs, out),
       Node::Emphasis(emphasis) => inline(&emphasis.children, base.add_modifier(Modifier::ITALIC), refs, out),
       Node::Delete(delete) => inline(&delete.children, base.add_modifier(Modifier::CROSSED_OUT), refs, out),
-      Node::InlineCode(code) => out.push(Span::styled(code.value.clone(), base.patch(style::INLINE_CODE))),
+      Node::InlineCode(code) => out.push(Span::styled(code.value.clone(), base.patch(style::inline_code()))),
       Node::InlineMath(math) => out.push(Span::styled(math.value.clone(), base)),
       Node::Link(link) => link_spans(&link.children, &link.url, base, refs, out),
       // `[text][label]`, whose target lives in a definition elsewhere. Without
@@ -918,7 +935,7 @@ fn inline(nodes: &[Node], base: Style, refs: &Refs, out: &mut Vec<Span<'static>>
         // swallow the line it sits in. The list at the end uses the same
         // numbers, which is the only thing tying the two together here.
         if let Some(number) = refs.number(&reference.identifier) {
-          out.push(Span::styled(format!("[{number}]"), base.patch(style::FOOTNOTE)));
+          out.push(Span::styled(format!("[{number}]"), base.patch(style::footnote())));
         }
       }
       Node::Break(_) => out.push(Span::styled("\n", base)),
@@ -1017,6 +1034,7 @@ fn words(text: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use ratatui::style::Color;
 
   fn plain(lines: &[Line<'static>]) -> Vec<String> {
     lines

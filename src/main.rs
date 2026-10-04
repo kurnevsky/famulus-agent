@@ -26,6 +26,7 @@ mod prompts;
 #[cfg(feature = "mcp")]
 mod resources;
 mod session;
+mod theme;
 mod tools;
 mod ui;
 
@@ -152,6 +153,10 @@ struct Cli {
   #[arg(long, env = "FA_MCP_CONFIG")]
   mcp_config: Option<PathBuf>,
 
+  /// Colours to draw with, instead of the theme.toml in $XDG_CONFIG_HOME/fa
+  #[arg(long, env = "FA_THEME")]
+  theme: Option<PathBuf>,
+
   /// Start no MCP servers this session
   #[arg(long, conflicts_with = "mcp_config")]
   no_mcp: bool,
@@ -174,6 +179,14 @@ async fn main() -> Result<()> {
     &config::files(config::FILE, cli.config.as_deref()),
     cli.config.is_some(),
   )?;
+  // Colours are fixed before anything is drawn, since what is drawn is cached
+  // in them.
+  // A file named here is the only one read, and has to be there.
+  let theme_file = cli.theme.take().or(file.theme);
+  theme::set(theme::load(
+    &config::files(theme::FILE, theme_file.as_deref()),
+    theme_file.is_some(),
+  )?);
   let provider = cli.provider.or(file.provider).unwrap_or(agent::Provider::OpenAi);
   let Some(model) = cli.model.take().or(file.model) else {
     bail!(

@@ -128,7 +128,8 @@ oo7 = { version = "0.6", optional = true }
 # PDFs `read` is given, turned into Markdown. Without its OCR features: a
 # scanned page is reported as having no text rather than read from pixels.
 pdf-inspector = "1.25"
-ratatui = "0.30"
+# `serde` for the colours `theme.toml` names, read the way ratatui spells them.
+ratatui = { version = "0.30", features = ["serde"] }
 # Images in the transcript drawn by the terminal itself — kitty, sixel or
 # iTerm2, whichever it speaks. Without chafa, which is a C library: a terminal
 # with none of the three gets fa's own half-blocks instead. Without the

@@ -14,7 +14,7 @@
 use std::borrow::Cow;
 
 use ratatui::crossterm::event::KeyEvent;
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::Line;
 use rmcp::model::{
   ClientCapabilities, ClientConfig, ConstTitle, ElicitRequestParams, ElicitResult, ElicitationAction,
@@ -28,6 +28,7 @@ use serde_json::{Map, Value};
 use crate::ask::{Answer, Choice, Dialog, Question, Refusal};
 use crate::markdown::wrap_text;
 use crate::modal::Component;
+use crate::theme::theme;
 
 /// The client side of one server's connection: what it says it can do, and
 /// what it does when asked.
@@ -274,7 +275,7 @@ impl Component for Form {
       lines.extend(wrap_text(
         &format!("⚠ {error}"),
         width,
-        Style::default().fg(Color::Yellow),
+        Style::default().fg(theme().ui.warning),
       ));
       lines.push(Line::raw(""));
     }

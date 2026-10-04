@@ -19,7 +19,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui_textarea::{CursorMove, DataCursor, TextArea};
 use schemars::JsonSchema;
@@ -27,6 +27,7 @@ use serde::Deserialize;
 
 use crate::markdown::{wrap_line, wrap_text};
 use crate::modal::Component;
+use crate::theme::theme;
 
 /// Questions one call may ask. Four is an interruption; more is an interview.
 pub const MAX_QUESTIONS: usize = 4;
@@ -595,7 +596,7 @@ impl Dialog {
   /// The strip of tabs: a box per question, filled once it has an answer, and
   /// the submit tab at the end.
   fn tab_bar(&self) -> Line<'static> {
-    let mut spans = vec![Span::styled(" ← ", Style::default().fg(Color::DarkGray))];
+    let mut spans = vec![Span::styled(" ← ", Style::default().fg(theme().ui.muted))];
     for (index, question) in self.questions.iter().enumerate() {
       let answered = self.answers.contains_key(&index);
       let box_ = if answered { "■" } else { "□" };
@@ -607,7 +608,7 @@ impl Dialog {
     }
     let all = self.answers.len() == self.questions.len();
     spans.push(Span::styled(" ✓ Submit ", tab_style(self.on_submit_tab(), all)));
-    spans.push(Span::styled(" →", Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(" →", Style::default().fg(theme().ui.muted)));
     Line::from(spans)
   }
 
@@ -617,7 +618,7 @@ impl Dialog {
     if !self.tabbed() && !question.header.trim().is_empty() {
       out.push(Line::styled(
         format!(" {} ", question.header),
-        Style::default().fg(Color::Black).bg(Color::Cyan),
+        Style::default().fg(theme().ui.on_accent).bg(theme().ui.accent),
       ));
       out.push(Line::raw(""));
     }
@@ -722,7 +723,7 @@ impl Dialog {
     let prefix = row_prefix(active, number, digits, ticked);
     let indent = " ".repeat(prefix.chars().count());
     let style = match active {
-      true => Style::default().fg(Color::Cyan).bold(),
+      true => Style::default().fg(theme().ui.accent).bold(),
       false => Style::default(),
     };
     let width = width.saturating_sub(prefix.chars().count() as u16);
@@ -744,7 +745,7 @@ impl Dialog {
   fn draw_submit(&self, width: u16, out: &mut Vec<Line<'static>>, focus: &mut usize) {
     out.push(Line::styled(
       "Review your answers",
-      Style::default().fg(Color::Cyan).bold(),
+      Style::default().fg(theme().ui.accent).bold(),
     ));
     out.push(Line::raw(""));
     let dim = Style::default().add_modifier(Modifier::DIM);
@@ -769,7 +770,7 @@ impl Dialog {
       true => Line::styled("Ready to submit your answers?", dim),
       false => Line::styled(
         format!("⚠ Answer remaining questions before submitting: {}", missing.join(", ")),
-        Style::default().fg(Color::Yellow),
+        Style::default().fg(theme().ui.warning),
       ),
     });
     for (index, label) in ["Submit answers", "Cancel"].into_iter().enumerate() {
@@ -859,9 +860,9 @@ fn row_prefix(active: bool, number: Option<usize>, digits: usize, ticked: Option
 /// is answered, dim until then.
 fn tab_style(shown: bool, answered: bool) -> Style {
   match (shown, answered) {
-    (true, _) => Style::default().fg(Color::Black).bg(Color::Cyan),
-    (false, true) => Style::default().fg(Color::Green),
-    (false, false) => Style::default().fg(Color::DarkGray),
+    (true, _) => Style::default().fg(theme().ui.on_accent).bg(theme().ui.accent),
+    (false, true) => Style::default().fg(theme().ui.success),
+    (false, false) => Style::default().fg(theme().ui.muted),
   }
 }
 

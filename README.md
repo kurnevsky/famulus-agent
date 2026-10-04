@@ -102,6 +102,7 @@ MiniMax, Moonshot and Z.AI are a `--base-url` away.
 | `--graphics` | `FA_GRAPHICS` | `auto` | How images are drawn: `auto` (the terminal's own protocol if it has one), `kitty`, `sixel`, `iterm2`, `blocks` |
 | `--no-bell` | `FA_NO_BELL` | | Do not ring the terminal when `ask` puts a question up |
 | `--mcp-config` | `FA_MCP_CONFIG` | XDG search path | Read MCP servers from this file instead |
+| `--theme` | `FA_THEME` | XDG search path | Read colours from this file instead |
 | `--no-mcp` | | | Start no MCP servers this session |
 | `--tools` | `FA_TOOLS` | all of them | Offer the model only these of fa's own tools, by name |
 | `--no-tools` | `FA_NO_TOOLS` | | Keep these of fa's own tools from the model, by name |
@@ -132,8 +133,8 @@ own (`OPENAI_API_KEY` and the rest). It has ten seconds and no terminal, and
 one that fails says what it said for itself, never what it printed. Both in
 one file is refused.
 
-`~` at the front of `sessions-dir` or `mcp-config` is the home directory; there
-is no shell reading the file to say so.
+`~` at the front of `sessions-dir`, `mcp-config` or `theme` is the home
+directory; there is no shell reading the file to say so.
 
 It is found the way `mcp.toml` is: `$XDG_CONFIG_HOME/fa/config.toml`, then each
 of `$XDG_CONFIG_DIRS`, and never beside the project. Where two files both give
@@ -600,6 +601,66 @@ cargo build --release --no-default-features
 JavaScript injects them into its doc comments and its regex literals, so they
 only add colour to blocks that were already highlighted.
 
+## Theme
+
+Every colour fa draws with comes from `theme.toml`, found where `config.toml`
+is: `$XDG_CONFIG_HOME/fa/theme.toml`, then each of `$XDG_CONFIG_DIRS`, the
+nearer file winning key by key — or, given `--theme`, `FA_THEME` or `theme` in
+`config.toml`, from that one file alone, which then has to be there. A file
+only says what it changes:
+
+```toml
+# ~/.config/fa/theme.toml
+[ui]
+accent = "light-cyan"
+
+[markdown]
+link = "#5f87ff"
+
+[syntax]
+comment = "242"
+operator = "yellow"
+```
+
+A colour is a palette name (`red`, `dark-gray`, `light-blue`, …), an index
+into the 256 written as a string (`"242"`), a `#rrggbb`, or `reset` for the
+terminal's own foreground. The defaults are all palette names, so with no file
+fa follows whatever theme the terminal is wearing. Bold, italics and underlines
+are not colours and are not in it.
+
+| `[ui]` | Default | What it colours |
+|---|---|---|
+| `accent` | `cyan` | The prompt's `❯`, a picker's row and the letters a filter matched, a question's header and option |
+| `on-accent` | `black` | Text on an `accent` background |
+| `muted` | `dark-gray` | Placeholders, the input box while a turn runs, the scrollbar's track, an unanswered question |
+| `border` | `gray` | Every panel's box, the scrollbar's thumb |
+| `thinking` | `dark-gray` | Reasoning |
+| `working` | `yellow` | The spinner |
+| `warning` | `yellow` | Warnings, the context past 70% |
+| `error` | `red` | Errors, a failed tool's stripe, the context past 90% |
+| `success` | `green` | A finished tool's stripe, an answered question |
+| `tool` | `yellow` | A tool call's mark and name, and the cursor while it is written |
+| `summary` | `magenta` | The context summary's header |
+| `added`, `removed` | `green`, `red` | The two sides of a diff |
+
+`[markdown]` has `heading` (`yellow`), `code-block` (`green`, for a block with
+no grammar), `inline-code` (`cyan`), `link` (`blue`), `border` (`dark-gray`:
+fences, a quote's bar, rules, tables), `quote` (`dark-gray`), `bullet`
+(`green`) and `footnote` (`blue`).
+
+`[syntax]` is keyed by tree-sitter capture name. A capture uses the longest
+listed name whose dotted parts it all contains, so `function` colours
+`@function.method` too. Unlike the other two sections it takes names it does
+not already have: listing one is what makes that capture highlight at all. The
+defaults are `attribute`, `boolean`, `character`, `comment`, `constant`,
+`constant.builtin`, `constructor`, `escape`, `function`, `function.builtin`,
+`function.macro`, `keyword`, `keyword.function`, `label`, `module`, `number`,
+`property`, `punctuation.special`, `string`, `string.special`, `tag`, `type`,
+`type.builtin`, `variable.builtin` and `variable.member`.
+
+Any other key or section, or a colour fa cannot read, is an error naming the
+file and the line, and fa does not start, as with `config.toml`.
+
 ## Sessions
 
 Like pi, every conversation is saved as an append-only JSONL file and can be
@@ -817,8 +878,8 @@ tool, so a glance down the transcript reads as pass or fail without the text
 being recoloured, which the text has its own uses for. The stripe is a
 background rather than coloured text, and one cell wide: that is where the
 terminal's own red and green are right, saturated enough to read at a glance
-and carrying no text to be legible against, so it needs no colour of fa's own
-and follows whatever theme the terminal is wearing. A command's own line is
+and carrying no text to be legible against, so by default it needs no colour of
+fa's own and follows whatever theme the terminal is wearing. A command's own line is
 highlighted as bash, by the same tree-sitter grammar the code blocks use.
 
 All of it reads the same on a session reopened later, which takes the session
@@ -1110,13 +1171,16 @@ comes back to say otherwise.
   pixels and 4.5 MB of base64 (PNG first, then JPEG at decreasing quality).
 - `src/highlight.rs` – tree-sitter syntax highlighting for code blocks, a
   command's own line, and the JSON either half of an MCP call is: the
-  grammar registry (one cargo feature per language), the capture-name theme,
-  and the per-line spans the markdown renderer draws. Grammars ship their own
-  highlight queries and are used as they come, except Haskell, whose query is
-  written for neovim's pattern precedence and needs one of our own.
-- `src/config.rs` – `config.toml`: the XDG search both files are found by,
+  grammar registry (one cargo feature per language), the bold and italics the
+  theme's capture names are drawn with, and the per-line spans the markdown
+  renderer draws. Grammars ship their own highlight queries and are used as
+  they come, except Haskell, whose query is written for neovim's pattern
+  precedence and needs one of our own.
+- `src/config.rs` – `config.toml`: the XDG search every file is found by,
   the settings it holds and how the files are merged, and running the line of
   shell a value is written as instead of the value.
+- `src/theme.rs` – `theme.toml`: every colour fa draws with, their defaults,
+  and how the files are merged section by section.
 - `src/mcp.rs` – finding MCP servers and starting them: the
   table-per-server file `mcp.toml` is, the values it runs a command
   for rather than holding, and handing each server's tools to the agent. Rig

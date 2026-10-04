@@ -35,6 +35,7 @@ use crate::attach::{self, Prompt, Token};
 use crate::compaction::{DEFAULT_CONTEXT_WINDOW, estimate_tokens};
 use crate::modal::Modal;
 use crate::session::{Node, NodeKind, Outcome, Session, SessionInfo, Store};
+use crate::theme::theme;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
@@ -333,7 +334,7 @@ impl Filter {
     let mut field = TextArea::default();
     field.set_cursor_line_style(Style::default());
     field.set_placeholder_text("Type to filter.");
-    field.set_placeholder_style(Style::default().fg(Color::DarkGray));
+    field.set_placeholder_style(Style::default().fg(theme().ui.muted));
     Self {
       field,
       shown: (0..len).map(|at| (at, Vec::new())).collect(),
@@ -773,9 +774,9 @@ impl App {
     // Kept inside eighty columns, which is the narrowest terminal worth
     // drawing for: the hint is no use to anyone if its end is cut off.
     input.set_placeholder_text("Enter sends, Alt+Enter a newline, / commands, @ attach, Ctrl+C quits.");
-    // The terminal's own grey rather than a dimmed foreground, which some
-    // terminals ignore and others render as the text colour proper.
-    input.set_placeholder_style(Style::default().fg(Color::DarkGray));
+    // A colour rather than a dimmed foreground, which some terminals ignore
+    // and others render as the text colour proper.
+    input.set_placeholder_style(Style::default().fg(theme().ui.muted));
     input.set_wrap_mode(WrapMode::WordOrGlyph);
     let session = Session::new(store.as_ref(), &cwd, &model_label(&cfg));
     let mut app = Self {
@@ -2735,9 +2736,9 @@ impl App {
     // What was half-written in it is not lost — it is drawn again the moment
     // the list is gone.
     let border_color = if self.run.is_some() {
-      Color::DarkGray
+      theme().ui.muted
     } else {
-      Color::Gray
+      theme().ui.border
     };
     let mut block = frame(border_color);
     if let Some(filter) = self.overlay.as_mut().filter(|_| filtering).map(|o| &mut o.filter) {
@@ -2796,7 +2797,7 @@ impl App {
       width,
       height: (lines.len() as u16 + 2).min(area.height),
     };
-    let block = frame(Color::Gray).padding(Padding::horizontal(1));
+    let block = frame(theme().ui.border).padding(Padding::horizontal(1));
     f.render_widget(Clear, toast);
     f.render_widget(Paragraph::new(lines).block(block), toast);
     Some(toast)
@@ -2865,8 +2866,8 @@ impl App {
           .end_symbol(None)
           .track_symbol(Some("│"))
           .thumb_symbol("┃")
-          .track_style(Style::default().fg(Color::DarkGray))
-          .thumb_style(Style::default().fg(Color::Gray)),
+          .track_style(Style::default().fg(theme().ui.muted))
+          .thumb_style(Style::default().fg(theme().ui.border)),
         transcript_area,
         &mut state,
       );
@@ -2947,7 +2948,7 @@ impl App {
         spans.push(Span::styled(sigil, base));
         spans.extend(picked_out(&name, highlights, base));
         let shown = name.chars().count() + trailing.chars().count();
-        spans.push(Span::styled(trailing, base.fg(Color::Cyan)));
+        spans.push(Span::styled(trailing, base.fg(theme().ui.accent)));
         spans.push(Span::raw(" ".repeat(width.saturating_sub(shown))));
         spans.push(Span::styled(right, dim));
         Line::from(spans)
@@ -2960,7 +2961,7 @@ impl App {
     let Some(modal) = self.modals.front() else { return };
     // The dialog says which keys do what along its own bottom, where the
     // answer to that changes with the question.
-    let block = frame(Color::Gray).title(format!(" {} ", modal.title()));
+    let block = frame(theme().ui.border).title(format!(" {} ", modal.title()));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let height = inner.height as usize;
@@ -2976,7 +2977,7 @@ impl App {
 
   fn draw_overlay(&self, f: &mut Frame, area: Rect) {
     let Some(overlay) = &self.overlay else { return };
-    let block = frame(Color::Gray).title(overlay.title());
+    let block = frame(theme().ui.border).title(overlay.title());
     let inner = block.inner(area);
     f.render_widget(block, area);
     let height = inner.height as usize;
@@ -3131,7 +3132,9 @@ impl App {
         (false, true) => "pausing",
         (false, false) => "working",
       };
-      left.push(Span::raw(format!("{} {verb} — esc to abort", SPINNER[self.tick % SPINNER.len()])).fg(Color::Yellow));
+      left.push(
+        Span::raw(format!("{} {verb} — esc to abort", SPINNER[self.tick % SPINNER.len()])).fg(theme().ui.working),
+      );
       let queued = self.agents.control.waiting().len();
       if queued > 0 {
         left.push(Span::raw(format!("  ({queued} queued)")).dim());
@@ -3165,10 +3168,9 @@ impl App {
   /// reasoning are literal, and parsing them as markdown would mangle them.
   fn transcript_lines(&mut self, width: u16) -> Rows {
     let dim = Style::default().add_modifier(Modifier::DIM);
-    // Thinking is grey and italic rather than dimmed: grey on top of dim
-    // reads as noise on terminals that render faint text very faint. Bright
-    // black is the palette's own grey, so it tracks the terminal's theme.
-    let thinking = Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
+    // Thinking is coloured and italic rather than dimmed: a colour on top of
+    // dim reads as noise on terminals that render faint text very faint.
+    let thinking = Style::default().fg(theme().ui.thinking).add_modifier(Modifier::ITALIC);
     let mut cached = std::mem::take(&mut self.pictures);
     let mut kept = HashMap::with_capacity(cached.len());
     let mut drawn = std::mem::take(&mut self.drawn);
@@ -3235,7 +3237,7 @@ impl App {
           for (i, l) in text.lines().enumerate() {
             let prefix = if i == 0 { "❯ " } else { "  " };
             lines.push(Line::from(vec![
-              Span::styled(prefix, Style::default().fg(Color::Cyan).bold()),
+              Span::styled(prefix, Style::default().fg(theme().ui.accent).bold()),
               Span::styled(l.to_string(), Style::default().bold()),
             ]));
           }
@@ -3243,7 +3245,7 @@ impl App {
           // the same way a tool's picture is: at the width the transcript
           // has, folded, and cached by its bytes and that width.
           for image in images {
-            let gutter = Span::styled("│", Style::default().fg(Color::Cyan));
+            let gutter = Span::styled("│", Style::default().fg(theme().ui.accent));
             draw_image(image, gutter, width, self.tools_fold, &mut pictures, &mut lines);
           }
         }
@@ -3359,7 +3361,10 @@ impl App {
           lines.push(Line::default());
           for (i, l) in err.lines().enumerate() {
             let prefix = if i == 0 { "✗ " } else { "  " };
-            lines.push(Line::styled(format!("{prefix}{l}"), Style::default().fg(Color::Red)));
+            lines.push(Line::styled(
+              format!("{prefix}{l}"),
+              Style::default().fg(theme().ui.error),
+            ));
           }
         }
         Entry::Info(text) => {
@@ -3372,7 +3377,7 @@ impl App {
           lines.push(Line::default());
           lines.push(Line::styled(
             "▤ Context summary",
-            Style::default().fg(Color::Magenta).bold(),
+            Style::default().fg(theme().ui.summary).bold(),
           ));
           // Counted in lines as drawn, as a reasoning block is, so a long
           // paragraph cannot slip past the fold as one line.
@@ -3456,7 +3461,7 @@ impl App {
       if (body.is_empty() || self.tools_fold == Fold::Collapsed)
         && let Some(last) = header.last_mut()
       {
-        last.spans.push(Span::styled("▌", Style::default().fg(Color::Yellow)));
+        last.spans.push(Span::styled("▌", Style::default().fg(theme().ui.tool)));
       }
       lines.extend(header);
       Preview {
@@ -3601,7 +3606,7 @@ fn frame(color: Color) -> Block<'static> {
 fn pointer(selected: bool) -> Span<'static> {
   Span::styled(
     if selected { "› " } else { "  " },
-    Style::default().fg(Color::Cyan).bold(),
+    Style::default().fg(theme().ui.accent).bold(),
   )
 }
 
@@ -3612,7 +3617,7 @@ fn picked_out(text: &str, highlights: &[u32], base: Style) -> Vec<Span<'static>>
   if highlights.is_empty() {
     return vec![Span::styled(text.to_string(), base)];
   }
-  let hit = base.fg(Color::Cyan).underlined();
+  let hit = base.fg(theme().ui.accent).underlined();
   text
     .chars()
     .enumerate()
@@ -3803,9 +3808,9 @@ fn attachment_strip(tokens: &[Token], vision: bool, width: u16) -> Option<Line<'
       attach::State::Image { width, height } => (
         format!("▣ {} {width}×{height}", token.name()),
         match vision {
-          true => Style::default().fg(Color::Cyan),
+          true => Style::default().fg(theme().ui.accent),
           // It resolved, but this model will not be sent it.
-          false => Style::default().fg(Color::DarkGray),
+          false => Style::default().fg(theme().ui.muted),
         },
       ),
       // Not a mistake: a path still being completed reads as a directory
@@ -3817,11 +3822,11 @@ fn attachment_strip(tokens: &[Token], vision: bool, width: u16) -> Option<Line<'
       ),
       attach::State::Missing => (
         format!("⚠ {} not found", token.name()),
-        Style::default().fg(Color::Yellow),
+        Style::default().fg(theme().ui.warning),
       ),
       attach::State::NotAnImage => (
         format!("⚠ {} not an image", token.name()),
-        Style::default().fg(Color::Yellow),
+        Style::default().fg(theme().ui.warning),
       ),
     };
     let sep = if used == 0 { 0 } else { 2 };
@@ -3840,7 +3845,7 @@ fn attachment_strip(tokens: &[Token], vision: bool, width: u16) -> Option<Line<'
   if dropped > 0 {
     spans.push(Span::styled(
       format!(" +{dropped}"),
-      Style::default().fg(Color::DarkGray),
+      Style::default().fg(theme().ui.muted),
     ));
   }
   spans.push(Span::raw(" "));
@@ -4232,8 +4237,8 @@ fn marked_lines(text: &str, diff: bool) -> Vec<Vec<Span<'static>>> {
 /// left behind, or in the replacement it is still writing.
 fn mark_style(mark: Option<char>) -> Style {
   match mark {
-    Some('+') => Style::default().fg(Color::Green),
-    Some('-') => Style::default().fg(Color::Red),
+    Some('+') => Style::default().fg(theme().ui.added),
+    Some('-') => Style::default().fg(theme().ui.removed),
     _ => Style::default().add_modifier(Modifier::DIM),
   }
 }
@@ -4347,7 +4352,7 @@ impl Preview {
           let mut spans = vec![Span::raw("  "), gutter.clone()];
           spans.extend(piece);
           if tip && i == last {
-            spans.push(Span::styled("▌", Style::default().fg(Color::Yellow)));
+            spans.push(Span::styled("▌", Style::default().fg(theme().ui.tool)));
           }
           Line::from(spans)
         })
@@ -4530,8 +4535,8 @@ fn clip(line: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
 fn gutter(running: bool, is_error: bool) -> Span<'static> {
   match (running, is_error) {
     (true, _) => Span::styled("│", Style::default().add_modifier(Modifier::DIM)),
-    (false, true) => Span::styled(" ", Style::default().bg(Color::Red)),
-    (false, false) => Span::styled(" ", Style::default().bg(Color::Green)),
+    (false, true) => Span::styled(" ", Style::default().bg(theme().ui.error)),
+    (false, false) => Span::styled(" ", Style::default().bg(theme().ui.success)),
   }
 }
 
@@ -4597,8 +4602,8 @@ fn call_lines(name: &str, summary: &str, style: Style) -> Vec<Line<'static>> {
     .map(|(i, code)| {
       let mut spans = match i {
         0 => vec![
-          Span::styled(MARK, Style::default().fg(Color::Yellow)),
-          Span::styled(name.to_string(), Style::default().fg(Color::Yellow).bold()),
+          Span::styled(MARK, Style::default().fg(theme().ui.tool)),
+          Span::styled(name.to_string(), Style::default().fg(theme().ui.tool).bold()),
           Span::raw(" "),
         ],
         _ => vec![Span::raw(indent.clone())],
@@ -5066,8 +5071,8 @@ fn mcp_label(servers: usize, tools: usize) -> Option<String> {
 /// single turn too big to summarize.
 fn context_style(percent: u64) -> Style {
   match percent {
-    90.. => Style::default().fg(Color::Red),
-    70.. => Style::default().fg(Color::Yellow),
+    90.. => Style::default().fg(theme().ui.error),
+    70.. => Style::default().fg(theme().ui.warning),
     _ => Style::default().add_modifier(Modifier::DIM),
   }
 }

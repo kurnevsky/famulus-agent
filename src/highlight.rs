@@ -25,60 +25,35 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "syntax")]
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 #[cfg(feature = "syntax")]
 use tree_sitter::Language;
 #[cfg(feature = "syntax")]
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
-/// Capture names we recognise, each with the style it draws in.
-///
-/// A capture matches the entry whose dotted parts it all contains, the longest
-/// such entry winning and ties going to whichever is listed first. So
-/// `@function.method` lands on `function`, and `@keyword.function` — which
-/// matches both `keyword` and `function` by one part each — needs an entry of
-/// its own to stop the tie deciding it. Listing a name is also what makes it
-/// highlight at all: a capture with no entry here produces no event, and its
-/// text stays as the code's default foreground.
+/// What a capture is drawn in besides its colour, which the theme gives: the
+/// names here are among its own, matched exactly once a capture has settled
+/// on one of them.
 #[cfg(feature = "syntax")]
-const THEME: &[(&str, Style)] = &[
-  ("attribute", Style::new().fg(Color::Magenta)),
-  ("boolean", Style::new().fg(Color::Cyan)),
-  ("character", Style::new().fg(Color::Green)),
-  (
-    "comment",
-    Style::new().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
-  ),
-  ("constant", Style::new().fg(Color::Cyan)),
-  (
-    "constant.builtin",
-    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-  ),
-  ("constructor", Style::new().fg(Color::Yellow)),
-  ("escape", Style::new().fg(Color::Magenta)),
-  ("function", Style::new().fg(Color::Blue)),
-  (
-    "function.builtin",
-    Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD),
-  ),
-  ("function.macro", Style::new().fg(Color::Magenta)),
-  ("keyword", Style::new().fg(Color::Magenta)),
-  // `def`, `fun`, `fn` and friends: a keyword, not the function it introduces.
-  ("keyword.function", Style::new().fg(Color::Magenta)),
-  ("label", Style::new().fg(Color::Magenta)),
-  ("module", Style::new().fg(Color::Yellow)),
-  ("number", Style::new().fg(Color::Cyan)),
-  ("property", Style::new().fg(Color::Cyan)),
-  ("punctuation.special", Style::new().fg(Color::Magenta)),
-  ("string", Style::new().fg(Color::Green)),
-  ("string.special", Style::new().fg(Color::Magenta)),
-  ("tag", Style::new().fg(Color::Blue)),
-  ("type", Style::new().fg(Color::Yellow)),
-  ("type.builtin", Style::new().fg(Color::Yellow)),
-  ("variable.builtin", Style::new().fg(Color::Red)),
-  // A record field, as the neovim-flavoured queries name it.
-  ("variable.member", Style::new().fg(Color::Cyan)),
+const MODIFIERS: &[(&str, Modifier)] = &[
+  ("comment", Modifier::ITALIC),
+  ("constant.builtin", Modifier::BOLD),
+  ("function.builtin", Modifier::BOLD),
 ];
+
+/// The style of the theme's `index`th capture name, the order the highlighter
+/// was told them in.
+#[cfg(feature = "syntax")]
+fn capture_style(index: usize) -> Style {
+  let Some((name, colour)) = crate::theme::theme().syntax.0.get(index) else {
+    return Style::default();
+  };
+  let modifier = MODIFIERS
+    .iter()
+    .find(|(known, _)| known == name)
+    .map_or(Modifier::empty(), |(_, modifier)| *modifier);
+  Style::new().fg(*colour).add_modifier(modifier)
+}
 
 /// Above this many bytes a block is left plain. A transcript's code comes from
 /// the model and is small; a pasted file is not worth parsing on every frame.
@@ -450,7 +425,7 @@ fn parse(config: &HighlightConfiguration, source: &str) -> Option<Lines> {
   for event in events {
     match event.ok()? {
       HighlightEvent::HighlightStart(highlight) => {
-        open.push(THEME.get(highlight.0).map(|(_, style)| *style).unwrap_or_default());
+        open.push(capture_style(highlight.0));
       }
       HighlightEvent::HighlightEnd => {
         open.pop();
@@ -831,7 +806,12 @@ fn build(
       config.query.disable_pattern(pattern);
     }
   }
-  let names: Vec<&str> = THEME.iter().map(|(name, _)| *name).collect();
+  let names: Vec<&str> = crate::theme::theme()
+    .syntax
+    .0
+    .iter()
+    .map(|(name, _)| name.as_str())
+    .collect();
   config.configure(&names);
   Some(config)
 }
@@ -839,6 +819,7 @@ fn build(
 #[cfg(all(test, feature = "syntax"))]
 mod tests {
   use super::*;
+  use ratatui::style::Color;
 
   /// The text of a line, for asserting the source survived round-tripping.
   fn plain(line: &[Span<'static>]) -> String {
