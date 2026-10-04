@@ -172,8 +172,10 @@ pub enum Graphics {
 ///
 /// Asks the terminal, so it has to be called once the screen is in raw mode
 /// and before anything else is reading what the terminal sends: the answer
-/// comes back as input. A terminal that does not answer leaves `Auto` to
-/// half-blocks, and draws a protocol that was named at a guessed font size.
+/// comes back as input. A terminal that does not answer leaves `Auto` to what
+/// the environment says of it — the terminal around tmux, or iTerm2's
+/// variables — and half-blocks when it says nothing. A protocol that was named
+/// is drawn whatever the answer, at a guessed font size if there was none.
 pub fn picker(graphics: Graphics) -> Option<Picker> {
   let forced = match graphics {
     Graphics::Blocks => return None,
@@ -182,7 +184,7 @@ pub fn picker(graphics: Graphics) -> Option<Picker> {
     Graphics::Sixel => Some(ProtocolType::Sixel),
     Graphics::Iterm2 => Some(ProtocolType::Iterm2),
   };
-  let mut picker = Picker::from_query_stdio().ok()?;
+  let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
   if let Some(protocol) = forced {
     picker.set_protocol_type(protocol);
   }

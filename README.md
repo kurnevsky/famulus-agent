@@ -845,9 +845,10 @@ on for its own pane.
 Where there is no protocol, the picture is drawn in half-blocks. Every cell is
 `▄`: the upper pixel is its background and the lower one its foreground, so a
 cell carries one pixel across and two down — which is the shape of a terminal
-cell, and what keeps the picture's own proportions. The colours are the terminal's own 24-bit ones, and a transparent
-pixel is left without a colour at all, so an icon with no background of its own
-sits on whatever the terminal is wearing.
+cell, and what keeps the picture's own proportions. The colours are the
+terminal's own 24-bit ones, and a transparent pixel is left without a colour at
+all, so an icon with no background of its own sits on whatever the terminal is
+wearing.
 
 ```
 ⚙ read diagram.png
@@ -859,13 +860,13 @@ sits on whatever the terminal is wearing.
 Either way, the picture is drawn at the width the transcript has, which is as
 much detail as a terminal can hold, and folded at sixteen lines like every
 other block of a tool's output — so `Ctrl+O` shows the rest of it rather than a
-larger copy of it, and nothing already on screen moves when it does. Scaling it to fit a
-preview instead would cost the detail everywhere to save the scrolling in one
-place. It is never enlarged: a 16x16 icon is the eight lines it is in
-half-blocks, not blown up to the width of the transcript. Eighty lines is the
-ceiling on a drawn one, which binds only for the very tall and narrow. One the
-terminal draws is cut by the edge of the screen like text is, a row at a time,
-so scrolling past it shows the part still on screen.
+larger copy of it, and nothing already on screen moves when it does. Scaling
+it to fit a preview instead would cost the detail everywhere to save the
+scrolling in one place. It is never enlarged: a 16x16 icon is the eight lines
+it is in half-blocks, not blown up to the width of the transcript. Eighty lines
+is the ceiling on a drawn one, which binds only for the very tall and narrow.
+One the terminal draws is cut by the edge of the screen like text is, a row at
+a time, so scrolling past it shows the part still on screen.
 
 A drawn image is kept by its bytes and the width it was drawn at, the way
 rendered markdown is, because scaling one is more work than a frame has. The

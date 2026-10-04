@@ -55,6 +55,9 @@ const IMAGE_LINES: usize = 16;
 /// narrow — an image is drawn at the width it is given, and a 100x5000 one
 /// would otherwise be a thousand lines for `Ctrl+O` to unfold.
 const IMAGE_MAX_LINES: u16 = 80;
+/// The column an image starts on: two of indent and the gutter, as every other
+/// block of a tool's output is drawn.
+const IMAGE_INDENT: u16 = 3;
 /// Reasoning text is indented under its `· thinking…` header.
 const REASONING_INDENT: &str = "  ";
 /// Cache tag for a drawn picture.
@@ -643,14 +646,18 @@ pub struct App {
   /// What the terminal draws images with, or `None` when they are drawn as
   /// half-blocks.
   graphics: Option<Picker>,
-  /// Whether the last frame had the terminal draw a picture of its own.
-  pictured: bool,
-  /// Whether the last frame drew a toast.
-  toasted: bool,
-  /// Whether the next frame is to be drawn on a cleared screen. A sixel or
-  /// an iTerm2 picture is drawn once, from its corner, and the cells it covers
-  /// are left alone after that — so a toast drawn over one stays on the
-  /// screen once it is gone, until something sends the picture again.
+  /// Whether the terminal draws a picture once, from its corner, and leaves
+  /// the cells it covers alone after that — as a sixel or an iTerm2 one is. A
+  /// kitty picture is drawn as text, which a frame redraws like any other.
+  drawn_once: bool,
+  /// Where this frame had the terminal draw pictures of its own.
+  pictured: Vec<Rect>,
+  /// Whether the last frame drew something — a toast, the scrollbar — over a
+  /// picture that is drawn once.
+  covered: bool,
+  /// Whether the next frame is to be drawn on a cleared screen: what was drawn
+  /// over a picture that is drawn once stays on the screen when it is gone,
+  /// until something sends the picture again.
   repaint: bool,
   /// The conversation: history plus its on-disk file.
   session: Session,
@@ -782,9 +789,12 @@ impl App {
       toast: None,
       catalog,
       bell,
+      drawn_once: graphics
+        .as_ref()
+        .is_some_and(|picker| picker.protocol_type() != ProtocolType::Kitty),
       graphics,
-      pictured: false,
-      toasted: false,
+      pictured: Vec::new(),
+      covered: false,
       repaint: false,
       cwd,
       store,
@@ -2710,7 +2720,7 @@ impl App {
     }
 
     self.thumb = None;
-    self.pictured = false;
+    self.pictured.clear();
     if !self.modals.is_empty() {
       self.draw_modal(f, transcript_area);
     } else if self.overlay.is_some() {
@@ -2744,28 +2754,30 @@ impl App {
       f.render_widget(&self.input, input_area);
     }
     self.draw_footer(f, footer_area);
-    let toasted = self.draw_toast(f, transcript_area);
-    // A kitty picture is drawn as text, which a frame that leaves the toast
-    // out draws again; the others leave the cells they cover to the picture.
-    let drawn_once = self
-      .graphics
-      .as_ref()
-      .is_some_and(|picker| picker.protocol_type() != ProtocolType::Kitty);
-    if self.toasted && !toasted && self.pictured && drawn_once {
+    let toast = self.draw_toast(f, transcript_area);
+    // The scrollbar is drawn over the transcript's last column unless it has
+    // one of its own, and a wide picture reaches that column too.
+    let scrollbar = self.thumb.map(|thumb| thumb.track);
+    let covered = self.drawn_once
+      && toast
+        .into_iter()
+        .chain(scrollbar)
+        .any(|over| self.pictured.iter().any(|picture| picture.intersects(over)));
+    if self.covered && !covered {
       self.repaint = true;
     }
-    self.toasted = toasted;
+    self.covered = covered;
   }
 
   /// Drawn last, over whatever the transcript area holds, so it shows above a
   /// list or a question just as it does above the conversation.
   ///
-  /// Whether there was one to draw.
-  fn draw_toast(&mut self, f: &mut Frame, area: Rect) -> bool {
+  /// Where it was drawn, if there was one.
+  fn draw_toast(&mut self, f: &mut Frame, area: Rect) -> Option<Rect> {
     if self.toast.as_ref().is_some_and(|(_, until)| Instant::now() >= *until) {
       self.toast = None;
     }
-    let Some((text, _)) = &self.toast else { return false };
+    let (text, _) = self.toast.as_ref()?;
     // A list or a question is framed, and its top border says which keys do
     // what, so the toast goes inside the frame rather than over the hints.
     let area = match self.overlay.is_some() || !self.modals.is_empty() {
@@ -2787,7 +2799,7 @@ impl App {
     let block = frame(Color::Gray).padding(Padding::horizontal(1));
     f.render_widget(Clear, toast);
     f.render_widget(Paragraph::new(lines).block(block), toast);
-    true
+    Some(toast)
   }
 
   fn draw_transcript(&mut self, f: &mut Frame, transcript_area: Rect) {
@@ -2820,7 +2832,7 @@ impl App {
       })
       .collect();
     f.render_widget(Paragraph::new(visible), content_area);
-    self.pictured |= draw_graphics(f.buffer_mut(), content_area, offset, &rows.pictures, &self.pictures);
+    self.pictured = draw_graphics(f.buffer_mut(), content_area, offset, &rows.pictures, &self.pictures);
     self.rendered = rows;
     self.content = content_area;
     let overflows = total > viewport;
@@ -3501,10 +3513,7 @@ impl App {
 /// for the ones shown as they were written — a prompt, an error, a block
 /// unfolded — and it is what makes the list a list of rows.
 fn wrapped(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
-  lines
-    .into_iter()
-    .flat_map(|line| crate::markdown::wrap_line(line, width))
-    .collect()
+  wrapped_placing(lines, width, &mut [])
 }
 
 /// [`wrapped`], for an entry with pictures the terminal draws: each was placed
@@ -3636,18 +3645,16 @@ struct Placed {
   /// How many of its rows are shown, which is fewer than it has when it is
   /// folded.
   rows: usize,
-  /// The column its left edge is on.
-  column: u16,
   key: RenderKey,
 }
 
 /// The pictures the terminal draws itself, over the rows left blank for them
 /// in `area`, which shows the transcript from row `offset` on — only the slice
 /// of one that is on screen when the top or the bottom of it cuts through.
-/// Whether any of them was.
-fn draw_graphics(buf: &mut Buffer, area: Rect, offset: usize, placed: &[Placed], pictures: &RenderCache) -> bool {
+/// Where on the screen each of them was.
+fn draw_graphics(buf: &mut Buffer, area: Rect, offset: usize, placed: &[Placed], pictures: &RenderCache) -> Vec<Rect> {
   let bottom = offset + usize::from(area.height);
-  let mut drawn = false;
+  let mut drawn = Vec::new();
   for placed in placed.iter().filter(|p| p.row < bottom && p.row + p.rows > offset) {
     let Some(Picture::Graphic(graphic)) = pictures.get(&placed.key) else {
       continue;
@@ -3655,16 +3662,19 @@ fn draw_graphics(buf: &mut Buffer, area: Rect, offset: usize, placed: &[Placed],
     let top = placed.row.max(offset);
     let end = (placed.row + placed.rows).min(bottom);
     let shown = Rect {
-      x: area.x + placed.column,
+      x: area.x + IMAGE_INDENT,
       y: area.y + (top - offset) as u16,
-      width: area.width.saturating_sub(placed.column),
+      width: area.width.saturating_sub(IMAGE_INDENT),
       height: (end - top) as u16,
     };
     // Where its top is, which is above the rows it is given when the screen
     // cuts it: the rows below them it is not given are cut by that alone.
     let above = i16::try_from(top - placed.row).unwrap_or(i16::MAX);
     SlicedImage::new(graphic, SignedPosition { x: 0, y: -above }).render(shown, buf);
-    drawn = true;
+    drawn.push(Rect {
+      width: shown.width.min(graphic.size().width),
+      ..shown
+    });
   }
   drawn
 }
@@ -3696,10 +3706,7 @@ fn draw_image(
   pictures: &mut Pictures<'_>,
   lines: &mut Vec<Line<'static>>,
 ) {
-  // Two columns of indent and the gutter, as every other block of a tool's
-  // output is drawn.
-  const INDENT: u16 = 3;
-  let cols = width.saturating_sub(INDENT);
+  let cols = width.saturating_sub(IMAGE_INDENT);
   let key = (hash(IMAGE_KIND, image), cols, false);
   let picture = pictures.cached.remove(&key).unwrap_or_else(|| {
     let drawn = match pictures.graphics {
@@ -3732,12 +3739,7 @@ fn draw_image(
   }
   .draw(lines);
   if matches!(picture, Picture::Graphic(_)) && shown > 0 {
-    pictures.placed.push(Placed {
-      row,
-      rows: shown,
-      column: INDENT,
-      key,
-    });
+    pictures.placed.push(Placed { row, rows: shown, key });
   }
   pictures.live.insert(key, picture);
 }
@@ -6726,7 +6728,7 @@ mod tests {
     let [placed] = placed.as_slice() else {
       panic!("one picture placed: {}", placed.len())
     };
-    assert_eq!((placed.row, placed.rows, placed.column), (0, 3, 3));
+    assert_eq!((placed.row, placed.rows), (0, 3));
     let Some(Picture::Graphic(graphic)) = live.get(&placed.key) else {
       panic!("kept for the frame to draw")
     };
@@ -6790,14 +6792,20 @@ mod tests {
     // All three of its rows on screen, from the row it starts on, in the
     // columns after the gutter.
     let mut buf = Buffer::empty(area);
-    assert!(draw_graphics(&mut buf, area, 2, &placed, &live));
+    assert_eq!(
+      draw_graphics(&mut buf, area, 2, &placed, &live),
+      [Rect::new(3, 3, 4, 3)]
+    );
     assert!((3..6).all(|y| (3..7).all(|x| placeholder(&buf, x, y))));
     assert!(!placeholder(&buf, 2, 3) && !placeholder(&buf, 7, 3) && !placeholder(&buf, 3, 2));
 
     // Scrolled until its top row is off the screen: the rest is drawn from
     // the top, saying it is the picture's second row.
     let mut buf = Buffer::empty(area);
-    assert!(draw_graphics(&mut buf, area, 6, &placed, &live));
+    assert_eq!(
+      draw_graphics(&mut buf, area, 6, &placed, &live),
+      [Rect::new(3, 0, 4, 2)]
+    );
     assert!((0..2).all(|y| placeholder(&buf, 3, y)) && !placeholder(&buf, 3, 2));
     // The placeholder, then the row and the column of the picture it shows.
     assert!(
@@ -6808,7 +6816,7 @@ mod tests {
 
     // And scrolled away, nothing.
     let mut buf = Buffer::empty(area);
-    assert!(!draw_graphics(&mut buf, area, 8, &placed, &live));
+    assert!(draw_graphics(&mut buf, area, 8, &placed, &live).is_empty());
     assert!(buf.content.iter().all(|cell| cell.symbol() == " "));
   }
 }
