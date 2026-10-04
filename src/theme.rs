@@ -20,10 +20,13 @@
 //!
 //! A colour is a name from the terminal's palette (`red`, `dark-gray`,
 //! `light-blue`, …), an index into its 256 written as a string (`"242"`), a
-//! `#rrggbb`, or `reset` for the terminal's own foreground. The defaults are
-//! all palette names, so they follow whatever theme the terminal is wearing,
-//! light or dark. Bold, italics and underlines are not colours and stay where
-//! they are.
+//! `#rrggbb`, or `reset` for the terminal's own colour. The defaults are
+//! palette names, so they follow whatever theme the terminal is wearing, light
+//! or dark — all but a changed line's background, which no palette colour can
+//! be without drowning the text on it in its own hue. Those are dark tints,
+//! 24-bit where the terminal draws 24-bit colour and the nearest the 256 have
+//! where it does not. Bold, italics and underlines are not colours and stay
+//! where they are.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -97,10 +100,64 @@ pub struct Ui {
   pub added: Color,
   /// The `-` side of a diff.
   pub removed: Color,
+  /// What a `+` line is drawn on, the width of the transcript.
+  pub added_background: Color,
+  /// What a `-` line is drawn on, the width of the transcript.
+  pub removed_background: Color,
+}
+
+/// Which colours the terminal can draw, as far as the defaults are concerned:
+/// a colour a file gives is drawn as it is written either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Colors {
+  /// 24-bit if COLORTERM says the terminal has it, the 256 if not
+  Auto,
+  /// Any #rrggbb, as it is
+  Truecolor,
+  /// Only the 256-colour palette
+  #[value(name = "256")]
+  Palette,
+}
+
+impl Colors {
+  /// Whether `#rrggbb` reaches the screen as itself.
+  ///
+  /// `COLORTERM` is the one thing terminals agree to say it with, and it says
+  /// only yes: ssh and tmux both drop it, so a terminal that has 24-bit colour
+  /// can still look as though it does not — which is what naming it is for.
+  pub fn truecolor(self) -> bool {
+    match self {
+      Colors::Auto => says_truecolor(std::env::var("COLORTERM").ok().as_deref()),
+      Colors::Truecolor => true,
+      Colors::Palette => false,
+    }
+  }
+
+  /// What a changed line is drawn on unless a file says otherwise, added
+  /// then removed.
+  ///
+  /// Dark enough for the line's own colours to read on, which is a dark
+  /// terminal's background; a light one wants lighter ones. Without 24-bit
+  /// colour the tints are not left for the terminal to round, since the
+  /// nearest of the 256 to that green is a grey: the 256 have a darkest green
+  /// and red of their own, brighter than the tints, and those are used
+  /// instead.
+  fn diff_backgrounds(truecolor: bool) -> (Color, Color) {
+    match truecolor {
+      true => (Color::Rgb(0x00, 0x28, 0x00), Color::Rgb(0x3f, 0x00, 0x01)),
+      false => (Color::Indexed(22), Color::Indexed(52)),
+    }
+  }
+}
+
+/// What `COLORTERM` says when the terminal draws 24-bit colour.
+fn says_truecolor(colorterm: Option<&str>) -> bool {
+  colorterm.is_some_and(|value| value.eq_ignore_ascii_case("truecolor") || value.eq_ignore_ascii_case("24bit"))
 }
 
 impl Default for Ui {
   fn default() -> Self {
+    let (added_background, removed_background) = Colors::diff_backgrounds(true);
     Self {
       accent: Color::Cyan,
       on_accent: Color::Black,
@@ -117,6 +174,8 @@ impl Default for Ui {
       summary: Color::Magenta,
       added: Color::Green,
       removed: Color::Red,
+      added_background,
+      removed_background,
     }
   }
 }
@@ -229,8 +288,25 @@ fn syntax<'de, D: Deserializer<'de>>(de: D) -> Result<Syntax, D::Error> {
 /// A file that makes no sense is a failure, as `config.toml` is: it is read
 /// before the terminal is taken, where saying so costs nothing. `strict` is
 /// for a file asked for by name, where not being there is worth saying too.
-pub fn load(paths: &[PathBuf], strict: bool) -> Result<Theme> {
+///
+/// The defaults that depend on what the terminal can draw go in underneath
+/// every file, as the furthest of them, so any file saying otherwise wins.
+pub fn load(paths: &[PathBuf], strict: bool, colors: Colors) -> Result<Theme> {
+  let (added, removed) = Colors::diff_backgrounds(colors.truecolor());
   let mut merged = toml::Table::new();
+  overlay(
+    &mut merged,
+    toml::Table::from_iter([(
+      "ui".to_string(),
+      toml::Value::Table(toml::Table::from_iter([
+        ("added-background".to_string(), toml::Value::String(added.to_string())),
+        (
+          "removed-background".to_string(),
+          toml::Value::String(removed.to_string()),
+        ),
+      ])),
+    )]),
+  );
   for path in paths {
     let text = match std::fs::read_to_string(path) {
       Ok(text) => text,
@@ -240,17 +316,21 @@ pub fn load(paths: &[PathBuf], strict: bool) -> Result<Theme> {
     // Each file on its own first, so a mistake is placed by the line it is on
     // in the file it is in.
     toml::from_str::<Theme>(&text).with_context(|| format!("could not read {}", path.display()))?;
-    let table: toml::Table = toml::from_str(&text)?;
-    for (section, keys) in table {
-      match (merged.get_mut(&section), keys) {
-        (Some(toml::Value::Table(into)), toml::Value::Table(keys)) => into.extend(keys),
-        (_, keys) => {
-          merged.insert(section, keys);
-        }
+    overlay(&mut merged, toml::from_str(&text)?);
+  }
+  Ok(toml::Value::Table(merged).try_into()?)
+}
+
+/// `table` laid over `merged`, section by section.
+fn overlay(merged: &mut toml::Table, table: toml::Table) {
+  for (section, keys) in table {
+    match (merged.get_mut(&section), keys) {
+      (Some(toml::Value::Table(into)), toml::Value::Table(keys)) => into.extend(keys),
+      (_, keys) => {
+        merged.insert(section, keys);
       }
     }
   }
-  Ok(toml::Value::Table(merged).try_into()?)
 }
 
 #[cfg(test)]
@@ -315,19 +395,51 @@ mod tests {
     std::fs::write(&user, "[ui]\naccent = \"green\"").expect("a file");
 
     let missing = dir.join("nowhere.toml");
-    let read = load(&[system, user.clone(), missing.clone()], false).expect("both files");
+    let read = load(&[system, user.clone(), missing.clone()], false, Colors::Truecolor).expect("both files");
     assert_eq!(read.ui.accent, Color::Green, "read last, so it wins");
     assert_eq!(read.ui.error, Color::Magenta, "the rest of the section stays");
     // A file that is not there is only worth saying when it was asked for.
-    assert!(load(&[missing], true).is_err());
+    assert!(load(&[missing], true, Colors::Truecolor).is_err());
 
     let broken = dir.join("broken.toml");
     std::fs::write(&broken, "[ui]\naccent = \"green\"\nerror = \"nope\"").expect("a file");
-    let err = format!("{:#}", load(&[user, broken], false).expect_err("a broken file"));
+    let err = format!(
+      "{:#}",
+      load(&[user, broken], false, Colors::Truecolor).expect_err("a broken file")
+    );
     assert!(
       err.contains("broken.toml") && err.contains("line 3"),
       "where it went wrong: {err}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn the_diff_backgrounds_default_to_what_the_terminal_can_draw_and_a_file_still_wins() {
+    let backgrounds = |theme: &Theme| (theme.ui.added_background, theme.ui.removed_background);
+    let deep = load(&[], false, Colors::Truecolor).expect("no files");
+    assert_eq!(
+      backgrounds(&deep),
+      (Color::Rgb(0x00, 0x28, 0x00), Color::Rgb(0x3f, 0x00, 0x01))
+    );
+    assert_eq!(deep, Theme::default(), "which is what a test draws with");
+    let shallow = load(&[], false, Colors::Palette).expect("no files");
+    assert_eq!(backgrounds(&shallow), (Color::Indexed(22), Color::Indexed(52)));
+    assert_eq!(shallow.ui.accent, Color::Cyan, "and nothing else changes with it");
+
+    // A colour a file gives is drawn as written, whatever the terminal is
+    // thought to manage.
+    let dir = std::env::temp_dir().join(format!("fa-theme-colors-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("a directory");
+    let file = dir.join("theme.toml");
+    std::fs::write(&file, "[ui]\nadded-background = \"#102010\"").expect("a file");
+    let read = load(&[file], false, Colors::Palette).expect("a file");
+    assert_eq!(backgrounds(&read), (Color::Rgb(0x10, 0x20, 0x10), Color::Indexed(52)));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // COLORTERM only ever says yes.
+    assert!(says_truecolor(Some("truecolor")) && says_truecolor(Some("24bit")));
+    assert!(says_truecolor(Some("TrueColor")));
+    assert!(!says_truecolor(Some("yes")) && !says_truecolor(Some("")) && !says_truecolor(None));
   }
 }

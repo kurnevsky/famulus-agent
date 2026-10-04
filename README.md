@@ -100,6 +100,7 @@ MiniMax, Moonshot and Z.AI are a `--base-url` away.
 | `--sessions-dir` | `FA_SESSIONS_DIR` | `~/.local/share/fa/sessions` | Where session files live (global) |
 | `--scrollbar` | `FA_SCROLLBAR` | `auto` | Transcript scrollbar: `auto` (while scrolling), `always`, `hidden` |
 | `--graphics` | `FA_GRAPHICS` | `auto` | How images are drawn: `auto` (the terminal's own protocol if it has one), `kitty`, `sixel`, `iterm2`, `blocks` |
+| `--colors` | `FA_COLORS` | `auto` | Which colours the terminal draws, for the diff backgrounds' defaults: `auto` (24-bit if `COLORTERM` says so), `truecolor`, `256` |
 | `--no-bell` | `FA_NO_BELL` | | Do not ring the terminal when `ask` puts a question up |
 | `--mcp-config` | `FA_MCP_CONFIG` | XDG search path | Read MCP servers from this file instead |
 | `--theme` | `FA_THEME` | XDG search path | Read colours from this file instead |
@@ -624,9 +625,9 @@ operator = "yellow"
 
 A colour is a palette name (`red`, `dark-gray`, `light-blue`, …), an index
 into the 256 written as a string (`"242"`), a `#rrggbb`, or `reset` for the
-terminal's own foreground. The defaults are all palette names, so with no file
-fa follows whatever theme the terminal is wearing. Bold, italics and underlines
-are not colours and are not in it.
+terminal's own colour. The defaults are palette names, so with no file fa
+follows whatever theme the terminal is wearing — all but two, below. Bold,
+italics and underlines are not colours and are not in it.
 
 | `[ui]` | Default | What it colours |
 |---|---|---|
@@ -642,6 +643,33 @@ are not colours and are not in it.
 | `tool` | `yellow` | A tool call's mark and name, and the cursor while it is written |
 | `summary` | `magenta` | The context summary's header |
 | `added`, `removed` | `green`, `red` | The two sides of a diff |
+| `added-background`, `removed-background` | `#002800`, `#3f0001`, or `"22"`, `"52"` without 24-bit colour | What a changed line is drawn on, edge to edge |
+
+The two diff backgrounds are the exception to following the terminal. A palette
+colour cannot be one: green under a green line number drowns it in its own
+hue. So they are fixed dark tints, picked for a dark background, and they stay
+those tints whatever the terminal's theme says — on a light one they are dark
+bars under dark text.
+
+They are 24-bit when the terminal says it draws 24-bit colour, through
+`COLORTERM=truecolor` or `24bit`, and otherwise the 256-colour palette's own
+darkest green and red, `"22"` and `"52"`: brighter than the tints, but a green
+that stays green, where a terminal rounding `#002800` itself lands on a grey.
+ssh and tmux both tend to drop `COLORTERM`, so a terminal that has 24-bit colour
+can still get the 256; `--colors truecolor`, `FA_COLORS`, or
+`colors = "truecolor"` in `config.toml` says so instead, and `--colors 256` the
+other way round. That only picks the defaults: a colour a theme gives is drawn
+as it is written.
+
+Give them colours of your own, or `reset` to have a changed line drawn on the
+terminal's own background like the rest, with only its green or red line number
+saying what changed:
+
+```toml
+[ui]
+added-background = "reset"
+removed-background = "reset"
+```
 
 `[markdown]` has `heading` (`yellow`), `code-block` (`green`, for a block with
 no grammar), `inline-code` (`cyan`), `link` (`blue`), `border` (`dark-gray`:
@@ -863,8 +891,11 @@ lines, or kept out of the way. A command keeps the
 end of its output and a file the start of its contents, since that is the end
 that matters in each.
 
-`edit` shows what it changed as a diff. `write` shows the file it wrote, as the
-file it is: highlighted by the language its name gives, with none of a diff's
+`edit` shows what it changed as a diff, each line highlighted as the file it
+is in and a changed one laid on a tint of its own — green under what was added,
+red under what was taken out — to the edge of the transcript, so the change
+reads as a block while the code keeps its colours. `write` shows the file it
+wrote, as the file it is: highlighted by the language its name gives, with none of a diff's
 pluses and none of its green, because a write did not change lines, it put them
 there. Either way what the tool did is on screen, where "Successfully wrote to
 it" would only repeat the line above. The write costs the session nothing to

@@ -145,6 +145,11 @@ struct Cli {
   #[arg(long, env = "FA_GRAPHICS", value_enum)]
   graphics: Option<images::Graphics>,
 
+  /// Which colours the terminal draws, for the defaults that need more than
+  /// its palette: 24-bit if COLORTERM says so, the 256 if not [default: auto]
+  #[arg(long, env = "FA_COLORS", value_enum)]
+  colors: Option<theme::Colors>,
+
   /// Do not ring the terminal when the model asks a question
   #[arg(long, env = "FA_NO_BELL")]
   no_bell: bool,
@@ -186,6 +191,7 @@ async fn main() -> Result<()> {
   theme::set(theme::load(
     &config::files(theme::FILE, theme_file.as_deref()),
     theme_file.is_some(),
+    cli.colors.or(file.colors).unwrap_or(theme::Colors::Auto),
   )?);
   let provider = cli.provider.or(file.provider).unwrap_or(agent::Provider::OpenAi);
   let Some(model) = cli.model.take().or(file.model) else {

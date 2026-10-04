@@ -23,6 +23,7 @@ use serde::{Deserialize, Deserializer};
 
 use crate::agent::Provider;
 use crate::images::Graphics;
+use crate::theme::Colors;
 use crate::ui::ScrollbarMode;
 
 /// The name settings are kept under, in each configuration directory.
@@ -66,6 +67,8 @@ pub struct Settings {
   pub scrollbar: Option<ScrollbarMode>,
   #[serde(default, deserialize_with = "value_enum")]
   pub graphics: Option<Graphics>,
+  #[serde(default, deserialize_with = "value_enum")]
+  pub colors: Option<Colors>,
   #[serde(default)]
   pub no_bell: bool,
   #[serde(default, deserialize_with = "path")]
@@ -231,6 +234,7 @@ mod tests {
         max-tokens = 100
         scrollbar = "always"
         graphics = "sixel"
+        colors = "256"
         no-bell = true
         tools = ["read", "bash"]
         sessions-dir = "~/sessions"
@@ -242,6 +246,7 @@ mod tests {
     assert_eq!(read.max_tokens, Some(100));
     assert_eq!(read.scrollbar, Some(ScrollbarMode::Always));
     assert_eq!(read.graphics, Some(Graphics::Sixel));
+    assert_eq!(read.colors, Some(Colors::Palette));
     assert!(read.no_bell && !read.no_vision);
     assert_eq!(read.tools, Some(vec!["read".to_string(), "bash".to_string()]));
     if let Some(home) = std::env::var_os("HOME") {

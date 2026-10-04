@@ -3448,6 +3448,9 @@ impl App {
                 _ => Style::default(),
               };
               marked_code(&prefix, style, plain, language_of(&path), text)
+                .into_iter()
+                .map(|row| on_background(row, mark.chars().next()))
+                .collect::<Vec<_>>()
             })
             .collect()
         }
@@ -4182,7 +4185,7 @@ fn diff_lines(path: Option<&str>, diff: &str) -> Vec<Vec<Span<'static>>> {
         Some(spans) => row.extend(spans.iter().cloned()),
         None => row.push(Span::styled((*code).to_string(), plain)),
       }
-      row
+      on_background(row, mark)
     })
     .collect()
 }
@@ -4228,7 +4231,7 @@ fn marked_lines(text: &str, diff: bool) -> Vec<Vec<Span<'static>>> {
     .lines()
     .map(|line| {
       let mark = diff.then(|| line.chars().next()).flatten();
-      vec![Span::styled(format!(" {line}"), mark_style(mark))]
+      on_background(vec![Span::styled(format!(" {line}"), mark_style(mark))], mark)
     })
     .collect()
 }
@@ -4241,6 +4244,24 @@ fn mark_style(mark: Option<char>) -> Style {
     Some('-') => Style::default().fg(theme().ui.removed),
     _ => Style::default().add_modifier(Modifier::DIM),
   }
+}
+
+/// A `+` or `-` line laid on the background its mark gives it, under the
+/// grammar's colours rather than instead of them. The rest are left as they
+/// are.
+///
+/// Every span carries it, so a line cut or wrapped anywhere keeps it in each
+/// piece, and the block it is drawn in carries it on to the edge.
+fn on_background(row: Vec<Span<'static>>, mark: Option<char>) -> Vec<Span<'static>> {
+  let bg = match mark {
+    Some('+') => theme().ui.added_background,
+    Some('-') => theme().ui.removed_background,
+    _ => return row,
+  };
+  row
+    .into_iter()
+    .map(|span| span.patch_style(Style::default().bg(bg)))
+    .collect()
 }
 
 /// How much of a folding block is shown: nothing, the first or last few lines
@@ -4349,10 +4370,23 @@ impl Preview {
         .into_iter()
         .enumerate()
         .map(|(i, piece)| {
+          // A line on a background of its own, a changed one, has it to the
+          // edge of the block rather than to where its text happens to stop.
+          let bg = piece.first().and_then(|span| span.style.bg);
+          let used: usize = piece.iter().map(Span::width).sum();
           let mut spans = vec![Span::raw("  "), gutter.clone()];
           spans.extend(piece);
+          let mut fill = room.saturating_sub(used);
           if tip && i == last {
-            spans.push(Span::styled("▌", Style::default().fg(theme().ui.tool)));
+            let cursor = Style::default().fg(theme().ui.tool);
+            spans.push(Span::styled("▌", bg.map_or(cursor, |bg| cursor.bg(bg))));
+          } else if tip {
+            fill += 1;
+          }
+          if let Some(bg) = bg
+            && fill > 0
+          {
+            spans.push(Span::styled(" ".repeat(fill), Style::default().bg(bg)));
           }
           Line::from(spans)
         })
@@ -4521,7 +4555,11 @@ fn clip(line: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
       out.push(Span::styled(kept, last.style));
     }
   }
-  out.push(Span::styled("…", mark_style(None)));
+  // On whatever the line was on, so a changed line cut short is still the
+  // one colour to its end.
+  let ellipsis = mark_style(None);
+  let bg = out.first().and_then(|span| span.style.bg);
+  out.push(Span::styled("…", bg.map_or(ellipsis, |bg| ellipsis.bg(bg))));
   out
 }
 
@@ -5985,6 +6023,54 @@ mod tests {
     assert_eq!(drawn(&block(Fold::Full)), [row(17), row(17), row(6)]);
     // Collapsed, nothing at all.
     assert!(block(Fold::Collapsed).is_empty());
+  }
+
+  #[test]
+  fn a_changed_line_is_on_its_background_to_the_edge_and_context_is_not() {
+    let added = theme().ui.added_background;
+    let removed = theme().ui.removed_background;
+    let body = diff_lines(None, " 1 same\n-2 was\n+2 is");
+    let block = |cursor| {
+      let mut out = Vec::new();
+      Preview {
+        body: body.clone(),
+        gutter: gutter(false, false),
+        cap: TOOL_OUTPUT_LINES,
+        fold: Fold::Full,
+        width: 20,
+        from_end: false,
+        cursor,
+      }
+      .draw(&mut out);
+      out
+    };
+    // What follows the indent and the gutter, as each cell's background.
+    let backgrounds = |line: &Line<'static>| -> Vec<Option<Color>> {
+      line.spans[2..]
+        .iter()
+        .flat_map(|span| std::iter::repeat_n(span.style.bg, span.width()))
+        .collect()
+    };
+    let out = block(false);
+    assert!(
+      backgrounds(&out[0]).iter().all(Option::is_none),
+      "context is left alone"
+    );
+    assert_eq!(backgrounds(&out[1]), vec![Some(removed); 17]);
+    assert_eq!(backgrounds(&out[2]), vec![Some(added); 17]);
+    // Still being written, the cursor sits where the text stops, on the same
+    // background, and the row is no wider for it.
+    let out = block(true);
+    let last = &out[2];
+    let cursor = last
+      .spans
+      .iter()
+      .position(|span| span.content == "▌")
+      .expect("a cursor");
+    assert_eq!(last.spans[cursor - 1].content, "is");
+    assert_eq!(last.width(), 20);
+    assert_eq!(backgrounds(last), vec![Some(added); 17]);
+    assert_eq!(out[1].width(), 20, "a row without the cursor fills its column too");
   }
 
   #[test]
