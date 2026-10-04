@@ -1,3 +1,5 @@
+#[cfg(feature = "acp")]
+mod acp;
 mod agent;
 mod ask;
 mod attach;
@@ -173,6 +175,12 @@ struct Cli {
   /// Keep these of fa's own tools from the model, by name (comma-separated)
   #[arg(long, env = "FA_NO_TOOLS", value_delimiter = ',')]
   no_tools: Vec<String>,
+
+  /// Serve the Agent Client Protocol on stdin and stdout, for an editor to
+  /// drive, instead of starting the terminal UI
+  #[cfg(feature = "acp")]
+  #[arg(long, conflicts_with_all = ["continue_", "resume", "session"])]
+  acp: bool,
 }
 
 #[tokio::main]
@@ -247,6 +255,22 @@ async fn main() -> Result<()> {
 
   let store = (!(cli.no_session || file.no_session))
     .then(|| session::Store::new(sessions_dir.unwrap_or_else(session::Store::default_dir)));
+  // An editor starts a session of its own for each conversation, in the
+  // directory it names, so nothing past this point is decided yet: which
+  // servers come up, and which tools they leave the model, are worked out
+  // per session.
+  #[cfg(feature = "acp")]
+  if cli.acp {
+    return acp::serve(acp::Setup {
+      cfg,
+      store,
+      context_window,
+      mcp: (!no_mcp).then(|| (mcp::files(mcp_config.as_deref()), mcp_config.is_some())),
+      tools,
+      no_tools,
+    })
+    .await;
+  }
   let start = if let Some(wanted) = &cli.session {
     let found = store
       .as_ref()
@@ -282,31 +306,7 @@ async fn main() -> Result<()> {
     }
   };
 
-  // What `--tools` and `--no-tools` choose from: fa's own tools, and nothing
-  // a server brought — a server's tools are narrowed in its own table.
-  let theirs: Vec<String> = servers.catalog().tool_names();
-  let available: Vec<String> = tools::BUILT_IN
-    .iter()
-    .map(|name| name.to_string())
-    .chain(theirs.iter().filter(|name| tools::own(name)).cloned())
-    .collect();
-  let (allowed, unknown) = tools::choose(&available, &tools, &no_tools);
-  let (servers_own, unknown): (Vec<String>, Vec<String>) = unknown.into_iter().partition(|name| theirs.contains(name));
-  if !servers_own.is_empty() {
-    notes.push(format!(
-      "--tools and --no-tools are for fa's own tools, not {} — a server's are narrowed with `tools` or `except` in mcp.toml.",
-      servers_own.join(", ")
-    ));
-  }
-  if !unknown.is_empty() {
-    notes.push(format!(
-      "No tool named {} — nothing left in or out by it.",
-      unknown.join(", ")
-    ));
-  }
-  cfg.tools = tools::Rules {
-    refused: available.into_iter().filter(|name| !allowed.contains(name)).collect(),
-  };
+  cfg.tools = tools::rules(&servers.catalog().tool_names(), &tools, &no_tools, &mut notes);
 
   let agents = agent::build_agents(&cfg, &cwd, &host, &servers)?;
   // The terminal is asked what it can draw images with, which wants it in

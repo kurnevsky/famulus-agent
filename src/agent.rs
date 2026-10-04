@@ -222,7 +222,7 @@ struct Signals {
 impl Control {
   /// Start a run with nothing held against it — but keep anything typed
   /// while the last one was ending, which was meant for this one.
-  fn begin(&self) {
+  pub fn begin(&self) {
     self.0.cancelled.send_replace(false);
     self.0.paused.store(false, Ordering::Relaxed);
   }
@@ -249,7 +249,7 @@ impl Control {
 
   /// Resolves once the run should stop what it is doing — at once, when it
   /// already should.
-  async fn stopped(&self) {
+  pub async fn stopped(&self) {
     // The sender lives as long as `self`, so the wait can only end by the
     // value turning true.
     let _ = self.0.cancelled.subscribe().wait_for(|&cancelled| cancelled).await;

@@ -12,7 +12,10 @@ path = "src/main.rs"
 # of its own: `--no-default-features` builds with no tree-sitter at all, and
 # code blocks fall back to the single colour they had before.
 [features]
-default = ["languages", "mcp"]
+default = ["languages", "mcp", "acp"]
+# `fa --acp`: the agent served over the Agent Client Protocol on stdio, for
+# an editor to drive in place of the terminal UI.
+acp = ["dep:agent-client-protocol"]
 # Tools from MCP servers, over stdio or streamable HTTP. `rmcp` speaks the
 # protocol; this only finds the servers and hands their tools to
 # the agent, so `--no-default-features` leaves the four built-in tools alone.
@@ -109,6 +112,7 @@ lang-yaml = ["syntax", "dep:tree-sitter-yaml"]
 lang-zig = ["syntax", "dep:tree-sitter-zig"]
 
 [dependencies]
+agent-client-protocol = { version = "2.2", optional = true }
 anyhow = "1.0.104"
 # The shape rmcp gives the store an OAuth login is kept in.
 async-trait = { version = "0.1.92", optional = true }

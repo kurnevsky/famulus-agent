@@ -107,9 +107,10 @@ MiniMax, Moonshot and Z.AI are a `--base-url` away.
 | `--no-mcp` | | | Start no MCP servers this session |
 | `--tools` | `FA_TOOLS` | all of them | Offer the model only these of fa's own tools, by name |
 | `--no-tools` | `FA_NO_TOOLS` | | Keep these of fa's own tools from the model, by name |
+| `--acp` | | | Serve the Agent Client Protocol on stdin and stdout instead of starting the UI; see [Editors](#editors-acp) |
 
-Everything but the session flags (`-c`, `-r`, `--session`) can be kept in
-`config.toml` instead, under the flag's own name:
+Everything but the session flags (`-c`, `-r`, `--session`) and `--acp` can be
+kept in `config.toml` instead, under the flag's own name:
 
 ```toml
 # ~/.config/fa/config.toml
@@ -566,7 +567,61 @@ MCP is a feature, on by default:
 
 ```sh
 # No MCP support at all
-cargo build --release --no-default-features --features languages
+cargo build --release --no-default-features --features languages,acp
+```
+
+## Editors (ACP)
+
+`fa --acp` is fa without its terminal: it speaks the
+[Agent Client Protocol](https://agentclientprotocol.com) on stdin and stdout,
+so an editor that hosts ACP agents — Zed, or anything else that does — can
+drive it. In Zed:
+
+```json
+"agent_servers": {
+  "fa": {
+    "type": "custom",
+    "command": "fa",
+    "args": ["--acp", "--provider", "anthropic", "-m", "claude-sonnet-5"]
+  }
+}
+```
+
+Everything else is read as it always is: `config.toml`, the key variables,
+`mcp.toml`, `--tools`. Each session the editor opens is a session of fa's own,
+in the directory the editor names. Its tools work there, `AGENTS.md` is read
+from there, and its MCP servers are started for it: the ones `mcp.toml`
+declares, plus the ones the editor brings (a command, or a streamable HTTP
+endpoint; SSE is not spoken). An editor server with the same name as one in
+the file replaces it.
+
+What the run does reaches the editor as it happens. Text and reasoning stream,
+a tool call shows up while the model is still writing it, `bash` output
+updates live, and `edit` and `write` are shown as diffs of what they change.
+The context in use is reported after every model call. Cancelling stops the
+run the way `Esc` does: the call it was in the middle of is answered as
+aborted, and what it got through is kept.
+
+Sessions are saved to the same directory the terminal uses, so the editor can
+list them, load one back (its conversation is replayed into the editor's
+view), resume one, and delete one. A session started in the editor can be
+picked up with `fa -r`, and the other way round. The model is a session option
+the editor shows as a picker, filled from what the provider lists. `/compact`
+is offered as a command and compacts the conversation without sending anything
+to the model.
+
+Some things have no way across. Stable ACP has no free-form question for an
+agent to put to the user, so the `ask` tool is never offered to the model, and
+a form an MCP server brings up goes unanswered — the server hears it as
+declined. fa asks no permission before a tool runs, here or in the terminal.
+What fa has to say outside the conversation, like a server that did not come
+up, goes to stderr, which the editor keeps in its log of the agent.
+
+ACP is a feature, on by default:
+
+```sh
+# Without it
+cargo build --release --no-default-features --features languages,mcp
 ```
 
 ## Syntax highlighting
@@ -1266,6 +1321,9 @@ counting, so a resumed session picks up where the last one left off. Each test
 gets a tmux server of its own rather than the one you are working in: they set
 server options and read the clipboard back, and two tests sharing either would
 be reading each other's. Without tmux installed these skip rather than fail.
+
+The ACP tests in the same file need no terminal: they start `fa --acp` with
+pipes for stdin and stdout and talk JSON-RPC to it the way an editor would.
 
 `src/agent.rs` also has end-to-end tests against a mock server, gated on an
 environment variable each: `FA_TEST_BASE_URL` for the OpenAI-compatible ones

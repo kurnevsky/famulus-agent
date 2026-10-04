@@ -5125,7 +5125,9 @@ fn first_line(text: &str) -> String {
   }
 }
 
-fn summarize_args(name: &str, args: &serde_json::Value) -> String {
+/// What a call acts on, as the line it is drawn with says it: the command,
+/// the path, the question — or its arguments, for a tool fa knows nothing of.
+pub fn summarize_args(name: &str, args: &serde_json::Value) -> String {
   let get = |k: &str| args.get(k).and_then(|v| v.as_str()).map(str::to_string);
   let summary = match name {
     // Whole, however many lines it runs to: what a call is about to do is the

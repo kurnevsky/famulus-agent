@@ -4386,3 +4386,326 @@ fn an_unfolded_line_too_long_for_the_screen_wraps_inside_its_block() {
     "every row of it is under the gutter:\n{screen}"
   );
 }
+
+// ------------------------------------------------------------ ACP
+
+/// A running `fa --acp`, spoken to the way an editor speaks to it: one
+/// JSON-RPC message a line, each way, over its stdin and stdout.
+#[cfg(feature = "acp")]
+struct Editor {
+  child: std::process::Child,
+  stdin: std::process::ChildStdin,
+  lines: std::sync::mpsc::Receiver<serde_json::Value>,
+  dir: PathBuf,
+  next: u64,
+  /// Every notification read so far, in the order it arrived.
+  updates: Vec<serde_json::Value>,
+}
+
+#[cfg(feature = "acp")]
+impl Editor {
+  /// Start `fa --acp` against `provider`, in a directory of its own.
+  fn start(test: &str, provider: &Provider) -> Self {
+    let dir = std::env::temp_dir().join(format!("fa-e2e-{}-acp-{test}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    Self::open(dir, provider)
+  }
+
+  fn open(dir: PathBuf, provider: &Provider) -> Self {
+    let config = dir.join("config");
+    std::fs::create_dir_all(&config).expect("a configuration directory");
+    std::fs::create_dir_all(dir.join("sessions")).expect("a sessions directory");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_fa"))
+      .args(["--acp", "--base-url", &provider.base_url(), "-m", "mock"])
+      .current_dir(&dir)
+      .env("FA_SESSIONS_DIR", dir.join("sessions"))
+      .env("XDG_CONFIG_HOME", &config)
+      .env("XDG_CONFIG_DIRS", &config)
+      .stdin(std::process::Stdio::piped())
+      .stdout(std::process::Stdio::piped())
+      .stderr(std::process::Stdio::null())
+      .spawn()
+      .expect("fa to start");
+    let stdin = child.stdin.take().expect("its stdin");
+    let stdout = child.stdout.take().expect("its stdout");
+    let (tx, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+      for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        let message = serde_json::from_str(&line).unwrap_or_else(|err| panic!("not JSON ({err}): {line}"));
+        if tx.send(message).is_err() {
+          break;
+        }
+      }
+    });
+    Self {
+      child,
+      stdin,
+      lines,
+      dir,
+      next: 0,
+      updates: Vec::new(),
+    }
+  }
+
+  fn send(&mut self, message: serde_json::Value) {
+    writeln!(self.stdin, "{message}").expect("fa to read");
+    self.stdin.flush().expect("fa to read");
+  }
+
+  /// Ask, without waiting for the answer; the id it was asked under.
+  fn ask(&mut self, method: &str, params: serde_json::Value) -> u64 {
+    self.next += 1;
+    let id = self.next;
+    self.send(serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }));
+    id
+  }
+
+  /// The next message, failing the test if there is none in good time.
+  fn read(&mut self) -> serde_json::Value {
+    let message = self
+      .lines
+      .recv_timeout(Duration::from_secs(20))
+      .unwrap_or_else(|_| panic!("nothing from fa; so far: {:#?}", self.updates));
+    if message.get("method").is_some() && message.get("id").is_none() {
+      self.updates.push(message.clone());
+    }
+    message
+  }
+
+  /// The answer to `id`, keeping the notifications that came first.
+  fn answer(&mut self, id: u64) -> serde_json::Value {
+    loop {
+      let message = self.read();
+      if message["id"] == id && message.get("method").is_none() {
+        return message;
+      }
+    }
+  }
+
+  /// Ask and wait for the result, failing the test on an error.
+  fn call(&mut self, method: &str, params: serde_json::Value) -> serde_json::Value {
+    let id = self.ask(method, params);
+    let answer = self.answer(id);
+    assert!(answer.get("error").is_none(), "{method} failed: {answer}");
+    answer["result"].clone()
+  }
+
+  /// Read until an update satisfies `wanted`.
+  fn wait_for(&mut self, wanted: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
+    if let Some(update) = self.updates.iter().find(|update| wanted(&update["params"]["update"])) {
+      return update["params"]["update"].clone();
+    }
+    loop {
+      let message = self.read();
+      if message.get("id").is_none() && wanted(&message["params"]["update"]) {
+        return message["params"]["update"].clone();
+      }
+    }
+  }
+
+  fn initialize(&mut self) -> serde_json::Value {
+    self.call(
+      "initialize",
+      serde_json::json!({ "protocolVersion": 1, "clientCapabilities": {} }),
+    )
+  }
+
+  fn new_session(&mut self) -> String {
+    let cwd = self.dir.display().to_string();
+    let result = self.call("session/new", serde_json::json!({ "cwd": cwd, "mcpServers": [] }));
+    result["sessionId"].as_str().expect("a session id").to_string()
+  }
+
+  fn prompt(&mut self, session: &str, text: &str) -> serde_json::Value {
+    self.call(
+      "session/prompt",
+      serde_json::json!({ "sessionId": session, "prompt": [{ "type": "text", "text": text }] }),
+    )
+  }
+
+  /// The updates of one kind, in the order they came.
+  fn updates_of(&self, kind: &str) -> Vec<serde_json::Value> {
+    self
+      .updates
+      .iter()
+      .map(|update| update["params"]["update"].clone())
+      .filter(|update| update["sessionUpdate"] == kind)
+      .collect()
+  }
+
+  fn said(&self, kind: &str) -> String {
+    self
+      .updates_of(kind)
+      .iter()
+      .filter_map(|update| update["content"]["text"].as_str().map(str::to_string))
+      .collect()
+  }
+}
+
+#[cfg(feature = "acp")]
+impl Drop for Editor {
+  fn drop(&mut self) {
+    let _ = self.child.kill();
+    let _ = self.child.wait();
+  }
+}
+
+#[cfg(feature = "acp")]
+#[test]
+fn an_editor_is_told_the_run_as_it_goes_and_can_load_it_back() {
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "Looking.",
+      tool: "bash",
+      args: serde_json::json!({ "command": "echo from-the-shell" }),
+    },
+    Turn::Say("All done."),
+  ]);
+  let mut editor = Editor::start("run", &provider);
+  let init = editor.initialize();
+  assert_eq!(init["protocolVersion"], 1);
+  assert_eq!(init["agentCapabilities"]["loadSession"], true);
+
+  let session = editor.new_session();
+  let commands = editor.wait_for(|update| update["sessionUpdate"] == "available_commands_update");
+  assert_eq!(commands["availableCommands"][0]["name"], "compact");
+  let result = editor.prompt(&session, "run it");
+  assert_eq!(result["stopReason"], "end_turn");
+
+  assert_eq!(editor.said("agent_message_chunk"), "Looking.All done.");
+  let calls = editor.updates_of("tool_call");
+  assert_eq!(calls.len(), 1, "one call, announced once: {calls:#?}");
+  assert_eq!(calls[0]["kind"], "execute");
+  let id = calls[0]["toolCallId"].clone();
+  let updates: Vec<serde_json::Value> = editor
+    .updates_of("tool_call_update")
+    .into_iter()
+    .filter(|update| update["toolCallId"] == id)
+    .collect();
+  let last = updates.last().expect("the call to end");
+  assert_eq!(last["status"], "completed");
+  assert!(
+    last["content"][0]["content"]["text"]
+      .as_str()
+      .is_some_and(|text| text.contains("from-the-shell")),
+    "its output is shown: {last:#}"
+  );
+  assert_eq!(last["title"], serde_json::Value::Null, "the title is told once");
+  assert!(
+    updates
+      .iter()
+      .any(|update| update["title"] == "bash echo from-the-shell"),
+    "{updates:#?}"
+  );
+  assert_eq!(
+    editor.updates_of("session_info_update")[0]["title"],
+    "run it",
+    "the session is named after its first prompt"
+  );
+  assert!(!editor.updates_of("usage_update").is_empty());
+  // Nobody to answer a question, so the model is never offered the tool.
+  assert!(provider.sent("\"name\":\"bash\""));
+  assert!(!provider.sent("\"name\":\"ask\""));
+
+  let listed = editor.call("session/list", serde_json::json!({}));
+  assert_eq!(listed["sessions"][0]["sessionId"], session.as_str());
+  assert_eq!(listed["sessions"][0]["title"], "run it");
+
+  // Another editor, picking the session back up from its file.
+  let dir = editor.dir.clone();
+  drop(editor);
+  let mut editor = Editor::open(dir, &provider);
+  editor.initialize();
+  let cwd = editor.dir.display().to_string();
+  editor.call(
+    "session/load",
+    serde_json::json!({ "sessionId": session, "cwd": cwd, "mcpServers": [] }),
+  );
+  assert_eq!(editor.said("user_message_chunk"), "run it");
+  assert_eq!(editor.said("agent_message_chunk"), "Looking.All done.");
+  let calls = editor.updates_of("tool_call");
+  assert_eq!(calls.len(), 1, "{calls:#?}");
+  assert_eq!(calls[0]["status"], "completed");
+  assert_eq!(calls[0]["title"], "bash echo from-the-shell");
+
+  // And it goes on from where it was: the model is given what came before.
+  let result = editor.prompt(&session, "and again");
+  assert_eq!(result["stopReason"], "end_turn");
+  let last = provider.bodies().last().cloned().expect("a request");
+  assert!(last.contains("from-the-shell") && last.contains("and again"), "{last}");
+}
+
+#[cfg(feature = "acp")]
+#[test]
+fn a_cancel_stops_the_run_and_answers_the_call_it_was_on() {
+  let provider = Provider::start(vec![Turn::Call {
+    say: "",
+    tool: "bash",
+    args: serde_json::json!({ "command": "sleep 30" }),
+  }]);
+  let mut editor = Editor::start("cancel", &provider);
+  editor.initialize();
+  let session = editor.new_session();
+  let started = Instant::now();
+  let id = editor.ask(
+    "session/prompt",
+    serde_json::json!({ "sessionId": session, "prompt": [{ "type": "text", "text": "wait" }] }),
+  );
+  editor.wait_for(|update| update["sessionUpdate"] == "tool_call_update" && update["status"] == "in_progress");
+  editor.send(serde_json::json!({ "jsonrpc": "2.0", "method": "session/cancel", "params": { "sessionId": session } }));
+  let answer = editor.answer(id);
+  assert_eq!(answer["result"]["stopReason"], "cancelled", "{answer}");
+  assert!(
+    started.elapsed() < Duration::from_secs(20),
+    "it did not wait for the sleep"
+  );
+  let ended = editor.updates_of("tool_call_update");
+  assert_eq!(ended.last().expect("an update")["status"], "failed", "{ended:#?}");
+}
+
+#[cfg(feature = "acp")]
+#[test]
+fn a_model_is_picked_from_what_the_provider_lists() {
+  let provider = Provider::start(vec![Turn::Say("Hello.")]);
+  let mut editor = Editor::start("model", &provider);
+  editor.initialize();
+  let cwd = editor.dir.display().to_string();
+  let opened = editor.call("session/new", serde_json::json!({ "cwd": cwd, "mcpServers": [] }));
+  let option = &opened["configOptions"][0];
+  assert_eq!(option["id"], "model");
+  assert_eq!(option["currentValue"], "mock");
+  let offered: Vec<&str> = option["options"]
+    .as_array()
+    .expect("options")
+    .iter()
+    .filter_map(|choice| choice["value"].as_str())
+    .collect();
+  assert_eq!(offered, ["mock", "mock-mini", "other-model"]);
+
+  let session = opened["sessionId"].as_str().expect("an id").to_string();
+  let set = editor.call(
+    "session/set_config_option",
+    serde_json::json!({ "sessionId": session, "configId": "model", "value": "mock-mini" }),
+  );
+  assert_eq!(set["configOptions"][0]["currentValue"], "mock-mini");
+  editor.prompt(&session, "hi");
+  assert!(provider.sent("\"model\":\"mock-mini\""));
+}
+
+#[cfg(feature = "acp")]
+#[test]
+fn compact_is_a_command_and_never_reaches_the_model() {
+  let provider = Provider::start(vec![Turn::Say("Hello.")]);
+  let mut editor = Editor::start("compact", &provider);
+  editor.initialize();
+  let session = editor.new_session();
+  editor.prompt(&session, "hi");
+  let result = editor.prompt(&session, "/compact");
+  assert_eq!(result["stopReason"], "end_turn");
+  let said = editor.said("agent_message_chunk");
+  assert!(
+    said.contains("Compacted") || said.contains("Nothing to compact."),
+    "{said}"
+  );
+  assert!(!provider.sent("/compact"));
+}

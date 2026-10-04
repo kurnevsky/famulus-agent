@@ -81,6 +81,35 @@ pub fn choose(available: &[String], allow: &[String], deny: &[String]) -> (Vec<S
   (chosen, unknown)
 }
 
+/// What `--tools` and `--no-tools` come to for a session whose servers offer
+/// `theirs`: they choose from fa's own tools and nothing a server brought,
+/// since a server's tools are narrowed in its own table. What they named that
+/// is not one of those is said in `notes`.
+pub fn rules(theirs: &[String], allow: &[String], deny: &[String], notes: &mut Vec<String>) -> Rules {
+  let available: Vec<String> = BUILT_IN
+    .iter()
+    .map(|name| name.to_string())
+    .chain(theirs.iter().filter(|name| own(name)).cloned())
+    .collect();
+  let (allowed, unknown) = choose(&available, allow, deny);
+  let (servers_own, unknown): (Vec<String>, Vec<String>) = unknown.into_iter().partition(|name| theirs.contains(name));
+  if !servers_own.is_empty() {
+    notes.push(format!(
+      "--tools and --no-tools are for fa's own tools, not {} — a server's are narrowed with `tools` or `except` in mcp.toml.",
+      servers_own.join(", ")
+    ));
+  }
+  if !unknown.is_empty() {
+    notes.push(format!(
+      "No tool named {} — nothing left in or out by it.",
+      unknown.join(", ")
+    ));
+  }
+  Rules {
+    refused: available.into_iter().filter(|name| !allowed.contains(name)).collect(),
+  }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct ToolError(String);
