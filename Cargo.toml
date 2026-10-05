@@ -142,7 +142,7 @@ ratatui = { version = "0.30", features = ["serde"] }
 # goes on reading input after it has given up waiting, and takes the answer
 # to the next question anyone asks — which, inside a tmux that nothing outside
 # answers, is crossterm's, and fa never starts.
-ratatui-image = { version = "=12.0.0-rc.0", default-features = false, features = ["crossterm"] }
+ratatui-image = { version = "=12.0.0-rc.1", default-features = false, features = ["crossterm"] }
 # The client rmcp calls a server with once it is signed in to, and the address
 # the browser comes back to; both already in the tree through rmcp.
 reqwest = { version = "0.13", default-features = false, optional = true }
@@ -164,7 +164,7 @@ serde_json = "1.0.151"
 similar = "3.2.0"
 thiserror = "2.0.21"
 toml = { version = "1", default-features = false, features = ["parse", "serde"] }
-tokio = { version = "1.53.1", features = ["full"] }
+tokio = { version = "1.53.2", features = ["full"] }
 tree-sitter = { version = "0.27", optional = true }
 tree-sitter-bash = { version = "0.25", optional = true }
 tree-sitter-c = { version = "0.24", optional = true }
@@ -213,7 +213,7 @@ tree-sitter-zig = { version = "1.1", optional = true }
 unicode-normalization = "0.1.25"
 unicode-width = "0.2"
 url = { version = "2", optional = true }
-uuid = { version = "1.26.1", features = ["v4"] }
+uuid = { version = "1.27.0", features = ["v4"] }
 
 # The scripted model the run loop is tested against.
 [dev-dependencies]
