@@ -16,7 +16,7 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use rig_core::completion::Message;
-use rig_core::message::{AssistantContent, UserContent};
+use rig_core::message::{AssistantContent, AssistantMessage, UserContent};
 use rmcp::model::{
   ContentBlock, GetPromptRequestParams, Prompt, PromptArgument, PromptMessage, ResourceContents, Role,
 };
@@ -243,13 +243,12 @@ fn messages(written: Vec<PromptMessage>, server: &str, vision: bool) -> Vec<Mess
       (Role::User, _) => out.push(Message::User {
         content: user_parts(content, server, vision),
       }),
-      (Role::Assistant, Some(Message::Assistant { content: parts, .. })) => {
+      (Role::Assistant, Some(Message::Assistant(AssistantMessage { content: parts, .. }))) => {
         parts.push(AssistantContent::text(said(content, server)))
       }
-      (Role::Assistant, _) => out.push(Message::Assistant {
-        id: None,
-        content: vec![AssistantContent::text(said(content, server))],
-      }),
+      (Role::Assistant, _) => out.push(Message::Assistant(AssistantMessage::new(vec![AssistantContent::text(
+        said(content, server),
+      )]))),
     }
   }
   out

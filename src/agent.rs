@@ -20,18 +20,15 @@ use rig_agent::tool::server::{ToolServer, ToolServerHandle};
 use rig_agent::tool::{ToolContext, ToolExecutionError, ToolResult};
 use rig_core::DynModel;
 use rig_core::completion::{CompletionRequest, Message, ToolDefinition, Usage};
-use rig_core::message::{
-  AssistantContent, Issuer, Reasoning, ReasoningContent, ToolCall, ToolResultContent, UserContent,
-};
+use rig_core::message::{AssistantContent, AssistantMessage, Reasoning, ToolCall, ToolResultContent, UserContent};
 use rig_core::operation::Completion;
 use rig_core::providers::{anthropic, cohere, gemini, ollama, openai, xai};
-use rig_core::streaming::{CompletionStream, Item, Part, PartKind, StreamEvent};
+use rig_core::streaming::{Item, Part, PartKind, StreamEvent};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::attach::Prompt;
 use crate::compaction::{self, Compacted, Settings};
-use crate::drafts::{Fragment, drafting};
 use crate::modal::{Host, Modal};
 use crate::tools::{AskTool, BUILT_IN, BashTool, EditDiff, EditTool, Output, ReadTool, WriteTool};
 
@@ -68,8 +65,7 @@ pub enum AgentEvent {
     internal: String,
   },
   /// A tool call being written, before it is run. `args` is the JSON as far
-  /// as it has arrived, which is usually not yet parseable; `name` is empty
-  /// until the provider has said it.
+  /// as it has arrived, which is usually not yet parseable.
   ToolCallDelta {
     /// Correlates the fragments of one call, so two calls in the same turn
     /// do not run into each other.
@@ -350,28 +346,19 @@ pub struct Runtime {
   compaction: Settings,
   /// Which tools this session was held to.
   rules: crate::tools::Rules,
-  /// Chat completions will not carry an image inside a tool message, so a
-  /// `read` that answers with a screenshot has it relayed after the result.
-  relay_images: bool,
-  /// Who the readable part of reasoning another service produced is passed
-  /// off as, so it is sent here too; `None` where only what this service
-  /// signed itself may go back.
-  adopt_reasoning: Option<Adopter>,
   /// Cap on one answer, left to the provider when `None`.
   max_tokens: Option<u64>,
 }
 
 impl Runtime {
   fn new(cfg: &Config, tools: Tools, preamble: String) -> Result<Self> {
-    let (model, relay_images, adopt_reasoning) = build_model(cfg)?;
+    let model = build_model(cfg)?;
     Ok(Self {
       model,
       tools,
       preamble,
       compaction: cfg.compaction,
       rules: cfg.tools.clone(),
-      relay_images,
-      adopt_reasoning,
       max_tokens: cfg.max_tokens,
     })
   }
@@ -577,42 +564,20 @@ fn client(cfg: &Config) -> Result<Client> {
   })
 }
 
-/// The model `cfg.model` is reached through, whichever provider offers it,
-/// whether an image a tool answers with has to be relayed after the result
-/// rather than sent inside it, and who reasoning other services produced is
-/// passed off as ([`adopt_reasoning`]).
+/// The model `cfg.model` is reached through, whichever provider offers it.
 ///
 /// Summarizing asks the same model the same way, so it is the same model —
 /// what makes that call a summary is the preamble it carries, which belongs
 /// to the request rather than to the model.
-///
-/// Gemini takes an image inside a function response, Anthropic inside a tool
-/// result, and the Responses API inside a function call's output. Chat
-/// Completions refuses one in a tool message unless the server is one rig
-/// knows takes it, so which of the two endpoints the model is spoken to
-/// through is what decides — and for some providers that is the model's to
-/// say, so it is read off the endpoint rig chose.
-fn build_model(cfg: &Config) -> Result<(DynModel<Completion>, bool, Option<Adopter>)> {
+fn build_model(cfg: &Config) -> Result<DynModel<Completion>> {
   let model = cfg.model.clone();
-  let chat = |chat: &openai::wire::Chat| (!chat.provider.dialect.quirks.supports_image_tool_results, adopter(chat));
   Ok(match client(cfg)? {
     // The official endpoint answers on either API, and which one is what the
     // two providers are for.
     Client::OpenAi(client) => match cfg.provider {
-      Provider::OpenAi => {
-        let model = client.chat(model);
-        let (relay, adopt) = chat(&model.wire);
-        (drafting(model), relay, adopt)
-      }
-      Provider::OpenAiResponses => (drafting(client.responses(model)), false, None),
-      _ => {
-        let model = client.completion(model);
-        let (relay, adopt) = match &model.wire {
-          openai::wire::OpenAiWire::Chat(wire) => chat(wire),
-          openai::wire::OpenAiWire::Responses(_) => (false, None),
-        };
-        (drafting(model), relay, adopt)
-      }
+      Provider::OpenAi => client.chat(model).erase(),
+      Provider::OpenAiResponses => client.responses(model).erase(),
+      _ => client.completion(model).erase(),
     },
     // Anthropic refuses a request that names no `max_tokens`, so rig fills in
     // what the named model allows. One it does not know is given a small cap
@@ -621,45 +586,12 @@ fn build_model(cfg: &Config) -> Result<(DynModel<Completion>, bool, Option<Adopt
     Client::Anthropic(client) => {
       let mut model = client.completion(model);
       model.wire.default_max_tokens.get_or_insert(2048);
-      (drafting(model), false, None)
+      model.erase()
     }
-    Client::Gemini(client) => (drafting(client.completion(model)), false, None),
-    Client::Ollama(client) => (drafting(client.completion(model)), true, None),
-    Client::Cohere(client) => (drafting(client.completion(model)), true, None),
+    Client::Gemini(client) => client.completion(model).erase(),
+    Client::Ollama(client) => client.completion(model).erase(),
+    Client::Cohere(client) => client.completion(model).erase(),
   })
-}
-
-/// What a Chat Completions endpoint makes of reasoning from elsewhere: who
-/// it is passed off as, and whose it sends back as it is already.
-pub struct Adopter {
-  /// The endpoint's own name, which is always among those it sends reasoning
-  /// back for.
-  issuer: Issuer,
-  /// Whose reasoning goes back untouched, signed and sealed: the endpoint's
-  /// own and, behind a gateway, the family of the model asked for.
-  native: Vec<Issuer>,
-}
-
-/// What reasoning from elsewhere becomes on its way out over `wire`.
-///
-/// Chat Completions carries a thought as plain text, which any server on it
-/// reads whoever thought it, and a server that takes none has it dropped by
-/// rig. Claude is the exception, behind a gateway as anywhere: it refuses a
-/// thought it did not sign, so it is given only its own. The Responses API
-/// and the native wires replay reasoning as items of their own service, and
-/// get nothing from elsewhere either.
-fn adopter(wire: &openai::wire::Chat) -> Option<Adopter> {
-  let dialect = &wire.provider.dialect;
-  let issuer = Issuer::from_static(dialect.name);
-  let mut native = vec![issuer.clone()];
-  if dialect.quirks.upstream_reasoning_issuer {
-    let upstream = openai::wire::upstream_reasoning_issuer(dialect.name, &wire.model);
-    if upstream == "anthropic" {
-      return None;
-    }
-    native.push(Issuer::from(upstream));
-  }
-  Some(Adopter { issuer, native })
 }
 
 /// Ask the provider what models it offers, alphabetically.
@@ -945,12 +877,6 @@ async fn run(
     let mut chat = Vec::with_capacity(history.len() + made.len());
     chat.extend_from_slice(history);
     chat.extend(made.iter().cloned());
-    if rt.relay_images {
-      relay_tool_images(&mut chat);
-    }
-    if let Some(adopter) = &rt.adopt_reasoning {
-      adopt_reasoning(&mut chat, adopter);
-    }
 
     // Weighed before it is sent rather than once the answer comes back: a
     // tool can return a file the size of the window, and the request
@@ -988,17 +914,16 @@ async fn run(
       // Nothing of this turn has run, so the half of it that was written is
       // kept for the transcript's sake and no more.
       let Some(item) = stopped else {
-        made.extend(partial.cut_off(&stream));
+        made.extend(partial.cut_off());
         return Some(Stop::Cancelled);
       };
       let Some(item) = item else { break };
       let event = match item {
         Ok(Item::Event(event)) => partial.saw(event),
-        // A piece of a call being written, or something the provider sent
-        // that rig has no word for.
-        Ok(Item::Unknown(payload)) => Fragment::from_payload(&payload).map(|piece| partial.drafted(piece)),
+        // Something the provider sent that rig has no word for.
+        Ok(Item::Unknown(_)) => None,
         Err(err) => {
-          made.extend(partial.cut_off(&stream));
+          made.extend(partial.cut_off());
           return Some(Stop::Failed(err.to_string()));
         }
       };
@@ -1072,34 +997,28 @@ struct Partial {
   turn: uuid::Uuid,
   /// What each part has said, in the order the parts opened.
   parts: Vec<Said>,
-  /// The calls being written, by the provider's number for each: rig says
-  /// nothing of a call until it is whole, so these come from what the
-  /// provider sent, read on the way in.
-  drafts: HashMap<u64, Draft>,
-  /// Which of those a provider's id names, once it has named one.
-  named: HashMap<String, u64>,
   /// The line a call was written on, by the id the finished call was given.
   ///
-  /// The line is keyed from the call's first piece, before anything says
-  /// what the finished call will be called. Without the pairing, dispatching
-  /// the call would leave that line on screen with nothing to take it away.
+  /// The line is keyed by the call's part, which is all the stream names it
+  /// by while it is written. Without the pairing, dispatching the call would
+  /// leave that line on screen with nothing to take it away.
   written: HashMap<String, String>,
-}
-
-/// A call still being written, as far as it has got.
-struct Draft {
-  line: String,
-  name: String,
-  args: String,
 }
 
 /// One part of a turn, as far as it has got.
 enum Said {
   Text(String),
   Thought(String),
+  /// A call being written: the tool it names, and its arguments as far as
+  /// they have arrived, which is usually not yet JSON that parses.
+  Call {
+    name: String,
+    args: String,
+  },
   /// A part that ended, as rig finished it.
   Done(Box<AssistantContent>),
-  /// A part that says nothing until it ends: a call, or an image.
+  /// A part that says nothing until it ends: an image, or an item only its
+  /// provider reads.
   Pending,
 }
 
@@ -1108,8 +1027,6 @@ impl Partial {
     Self {
       turn: uuid::Uuid::new_v4(),
       parts: Vec::new(),
-      drafts: HashMap::new(),
-      named: HashMap::new(),
       written: HashMap::new(),
     }
   }
@@ -1119,60 +1036,37 @@ impl Partial {
     format!("{}:{}", self.turn, part.index())
   }
 
-  /// A piece of a call being written. Arguments arrive a few characters at
-  /// a time and each piece carries only what is new, so the UI is sent the
-  /// whole of what has arrived, with nothing to reassemble.
-  fn drafted(&mut self, piece: Fragment) -> AgentEvent {
-    let line = format!("{}:draft:{}", self.turn, piece.index);
-    let draft = self.drafts.entry(piece.index).or_insert(Draft {
-      line,
-      name: String::new(),
-      args: String::new(),
-    });
-    if let Some(name) = piece.name {
-      draft.name = name;
-    }
-    draft.args.push_str(&piece.args);
-    if let Some(id) = piece.id {
-      self.named.insert(id, piece.index);
-    }
-    AgentEvent::ToolCallDelta {
-      id: draft.line.clone(),
-      name: draft.name.clone(),
-      args: draft.args.clone(),
-    }
-  }
-
-  /// The line the finished `call` was being written on: the draft its id
-  /// names, or — for a provider that gave it none, and has it named by rig —
-  /// the first one of its name still unclaimed.
-  fn claim(&mut self, call: &ToolCall) -> Option<String> {
-    let index = self
-      .named
-      .get(&call.id.to_string())
-      .copied()
-      .filter(|index| self.drafts.contains_key(index))
-      .or_else(|| {
-        self
-          .drafts
-          .iter()
-          .filter(|(_, draft)| draft.name == call.function.name.as_str())
-          .map(|(index, _)| *index)
-          .min()
-      })?;
-    self.drafts.remove(&index).map(|draft| draft.line)
+  /// The call `part` as far as it has been written, for the UI to draw.
+  /// Arguments arrive a few characters at a time and each piece carries only
+  /// what is new, so the UI is sent the whole of what has arrived, with
+  /// nothing to reassemble.
+  fn drafted(&self, part: Part) -> Option<AgentEvent> {
+    let Some(Said::Call { name, args }) = self.parts.get(part.index()) else {
+      return None;
+    };
+    Some(AgentEvent::ToolCallDelta {
+      id: self.line(part),
+      name: name.clone(),
+      args: args.clone(),
+    })
   }
 
   /// What the UI should be told about what the stream said.
   fn saw(&mut self, event: StreamEvent) -> Option<AgentEvent> {
     match event {
-      StreamEvent::Start { kind, .. } => {
+      // A call opens once its tool is named, so its line can say which tool
+      // it is before a character of its arguments has arrived.
+      StreamEvent::Start { part, kind, name } => {
         self.parts.push(match kind {
           PartKind::Text => Said::Text(String::new()),
           PartKind::Reasoning => Said::Thought(String::new()),
-          PartKind::ToolCall | PartKind::Image => Said::Pending,
+          PartKind::ToolCall => Said::Call {
+            name: name.map(|name| name.to_string()).unwrap_or_default(),
+            args: String::new(),
+          },
+          _ => Said::Pending,
         });
-        None
+        self.drafted(part)
       }
       StreamEvent::Text { part, text } => {
         if let Some(Said::Text(said)) = self.parts.get_mut(part.index()) {
@@ -1186,9 +1080,12 @@ impl Partial {
         }
         Some(AgentEvent::Reasoning(text))
       }
-      // Rig's own copy of a call's arguments arrives whole, just before the
-      // call ends: what the provider sent was drawn as it came.
-      StreamEvent::Arguments { .. } => None,
+      StreamEvent::Arguments { part, json } => {
+        if let Some(Said::Call { args, .. }) = self.parts.get_mut(part.index()) {
+          args.push_str(&json);
+        }
+        self.drafted(part)
+      }
       StreamEvent::End { part, content } => {
         let said = self
           .parts
@@ -1196,21 +1093,19 @@ impl Partial {
           .map(|said| std::mem::replace(said, Said::Done(Box::new(content.clone()))));
         match content {
           // Reasoning that arrived whole, with nothing said along the way.
-          AssistantContent::Reasoning(reasoning) if matches!(&said, Some(Said::Thought(so_far)) if so_far.is_empty()) =>
-          {
-            let text = compaction::reasoning_text(&reasoning);
-            (!text.is_empty()).then_some(AgentEvent::Reasoning(text))
+          AssistantContent::Reasoning(reasoning) if matches!(&said, Some(Said::Thought(so_far)) if so_far.is_empty()) => {
+            (!reasoning.text.is_empty()).then_some(AgentEvent::Reasoning(reasoning.text))
           }
           // Written but not yet run — the loop reports it when it starts it.
           // Showing it whole in the meantime is what the finished line will
           // say, so nothing jumps when the two swap over.
           AssistantContent::ToolCall(call) => {
-            let line = self.claim(&call).unwrap_or_else(|| self.line(part));
+            let line = self.line(part);
             self.written.insert(call.id.to_string(), line.clone());
             Some(AgentEvent::ToolCallDelta {
               id: line,
               name: call.function.name.to_string(),
-              args: call.function.arguments.to_string(),
+              args: call.function.arguments_value().to_string(),
             })
           }
           _ => None,
@@ -1225,28 +1120,25 @@ impl Partial {
   ///
   /// The calls are left out, finished or not — a call nobody ran is one
   /// nothing would answer — and so is text with nothing in it.
-  fn cut_off(self, stream: &CompletionStream) -> Option<Message> {
-    let issuer = stream.reasoning_issuer();
+  fn cut_off(self) -> Option<Message> {
     let content: Vec<AssistantContent> = self
       .parts
       .into_iter()
       .filter_map(|said| match said {
         Said::Text(text) => (!text.trim().is_empty()).then(|| AssistantContent::text(text)),
-        Said::Thought(text) => {
-          (!text.is_empty()).then(|| AssistantContent::Reasoning(Reasoning::new(&text).sealed(issuer.clone())))
-        }
+        Said::Thought(text) => (!text.is_empty()).then(|| AssistantContent::Reasoning(Reasoning::new(text))),
         Said::Done(content) => match *content {
           AssistantContent::ToolCall(_) => None,
           AssistantContent::Text(text) if text.text.trim().is_empty() => None,
           content => Some(content),
         },
-        Said::Pending => None,
+        Said::Call { .. } | Said::Pending => None,
       })
       .collect();
-    // No id: the provider never finished the message it would name, and
-    // replaying a half of it under that name is asking to be told it is not
-    // one.
-    (!content.is_empty()).then_some(Message::Assistant { id: None, content })
+    // No origin: the provider never finished the reply, and what arrived of
+    // it goes back as what it said rather than as the provider's own items —
+    // the way a turn written by hand does.
+    (!content.is_empty()).then(|| Message::Assistant(AssistantMessage::new(content)))
   }
 }
 
@@ -1275,7 +1167,7 @@ impl Runtime {
     let id = call.id.to_string();
     let _ = tx.send(AgentEvent::ToolCall {
       name: name.clone(),
-      args: call.function.arguments.clone(),
+      args: call.function.arguments_value(),
       call: id.clone(),
       internal: written.cloned().unwrap_or_else(|| id.clone()),
     });
@@ -1295,18 +1187,26 @@ impl Runtime {
     // the list the model was shown is the boundary, not a hint. It is
     // answered as a tool that is not there, which is all the model was ever
     // told about it.
-    let result = match self.rules.permits(&name) {
-      true => {
-        self
-          .tools
-          .now()
-          .execute(&name, &call.function.arguments.to_string(), &mut context)
-          .await
-      }
-      false => ToolResult::failed(
+    //
+    // Arguments that are not an object are not guessed at either: what could
+    // be read of them is a call cut short, and running a `write` on half a
+    // file is worse than asking again.
+    let result = match (self.rules.permits(&name), &call.function.invalid_arguments) {
+      (false, _) => ToolResult::failed(
         ToolExecutionError::not_found(format!("`{name}` is not offered in this session"))
           .with_model_feedback(format!("tool `{name}` not found")),
       ),
+      (true, Some(raw)) => ToolResult::failed(
+        ToolExecutionError::invalid_args(format!("`{name}` was called with arguments that are not an object"))
+          .with_model_feedback(rig_core::transcript::invalid_arguments_feedback(&name, raw)),
+      ),
+      (true, None) => {
+        self
+          .tools
+          .now()
+          .execute(&name, &call.function.arguments_value().to_string(), &mut context)
+          .await
+      }
     };
 
     // A built-in tool holds itself to a size as it makes its output; a
@@ -1331,97 +1231,6 @@ impl Runtime {
     // bytes: there is one copy of a result, not a shown one and a sent one.
     UserContent::ToolResult(call.result(content))
   }
-}
-
-/// Reasoning another service produced, passed off as the adopter's so that
-/// it goes out with the rest rather than being left behind.
-///
-/// Only what reads as a thought travels: its text and summaries. Signatures,
-/// ciphertext and the reasoning's id mean something only to the service that
-/// issued them, so they are dropped, and reasoning that was nothing but those
-/// stays its issuer's. What the endpoint sends back as it is already is left
-/// alone, and so is the transcript: this is the copy the request is made
-/// from.
-fn adopt_reasoning(history: &mut [Message], adopter: &Adopter) {
-  for message in history {
-    let Message::Assistant { content, .. } = message else {
-      continue;
-    };
-    for part in content {
-      let AssistantContent::Reasoning(sealed) = part else {
-        continue;
-      };
-      if sealed.open_for(&adopter.native).is_some() {
-        continue;
-      }
-      let Some(reasoning) = sealed.open(sealed.issuer()) else {
-        continue;
-      };
-      let readable: Vec<ReasoningContent> = reasoning
-        .content
-        .iter()
-        .filter_map(|block| match block {
-          ReasoningContent::Text { text, .. } => Some(ReasoningContent::Text {
-            text: text.clone(),
-            signature: None,
-          }),
-          ReasoningContent::Summary(summary) => Some(ReasoningContent::Summary(summary.clone())),
-          ReasoningContent::Encrypted(_) | ReasoningContent::Redacted { .. } => None,
-        })
-        .collect();
-      if !readable.is_empty() {
-        *sealed = Reasoning {
-          id: None,
-          content: readable,
-        }
-        .sealed(adopter.issuer.clone());
-      }
-    }
-  }
-}
-
-/// The OpenAI chat completions API only accepts text in tool messages, so
-/// this strips images out of tool results and re-sends them in a user
-/// message right after, so `read` can return screenshots.
-fn relay_tool_images(history: &mut Vec<Message>) {
-  *history = std::mem::take(history)
-    .into_iter()
-    .flat_map(|message| {
-      let (message, relay) = relay(message);
-      std::iter::once(message).chain(relay)
-    })
-    .collect();
-}
-
-/// One message with the images taken out of its tool results, and the
-/// message that carries them instead — when it had any to take.
-fn relay(message: Message) -> (Message, Option<Message>) {
-  let Message::User { mut content } = message else {
-    return (message, None);
-  };
-  let mut images = Vec::new();
-  for item in &mut content {
-    let UserContent::ToolResult(result) = item else {
-      continue;
-    };
-    let (found, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut result.content)
-      .into_iter()
-      .partition(|c| matches!(c, ToolResultContent::Image(_)));
-    result.content = match found.is_empty() || !rest.is_empty() {
-      true => rest,
-      false => vec![ToolResultContent::text("(see attached image)")],
-    };
-    images.extend(found.into_iter().filter_map(|c| match c {
-      ToolResultContent::Image(image) => Some(UserContent::Image(image)),
-      _ => None,
-    }));
-  }
-  let relay = (!images.is_empty()).then(|| {
-    let mut relay = vec![UserContent::text("Attached image(s) from tool result:")];
-    relay.extend(images);
-    Message::User { content: relay }
-  });
-  (Message::User { content }, relay)
 }
 
 fn default_system_prompt(cwd: &Path) -> String {
@@ -1588,8 +1397,6 @@ mod tests {
       preamble: String::new(),
       compaction: TEST_SETTINGS,
       rules: Default::default(),
-      relay_images: false,
-      adopt_reasoning: None,
       max_tokens: None,
     })
   }
@@ -1644,11 +1451,11 @@ mod tests {
           })
           .collect::<Vec<_>>()
           .join(" + "),
-        Message::Assistant { content, .. } => content
+        Message::Assistant(AssistantMessage { content, .. }) => content
           .iter()
           .map(|c| match c {
             AssistantContent::Text(text) => format!("said {:?}", text.text),
-            AssistantContent::Reasoning(reasoning) => format!("thought {:?}", compaction::reasoning_text(reasoning)),
+            AssistantContent::Reasoning(reasoning) => format!("thought {:?}", reasoning.text),
             AssistantContent::ToolCall(call) => format!("call {}", call.id),
             _ => "?".into(),
           })
@@ -1675,6 +1482,86 @@ mod tests {
     })
     .await;
     assert_eq!(shapes(&messages), ["user look", "said \"Let me look. \""]);
+  }
+
+  /// A call is drawn while it is written: its tool as soon as it is named,
+  /// then its arguments as they grow, all on the one line the finished call
+  /// takes over.
+  #[tokio::test]
+  async fn a_call_is_shown_as_it_is_written() {
+    let runtime = scripted(
+      vec![
+        vec![
+          MockStreamEvent::tool_call_name_delta("call_1", "bash"),
+          MockStreamEvent::tool_call_arguments_delta("call_1", r#"{"command":"#),
+          MockStreamEvent::tool_call_arguments_delta("call_1", r#" "echo one"}"#),
+          MockStreamEvent::ToolCallEnd { id: "call_1".into() },
+        ],
+        vec![said("Done.")],
+      ],
+      false,
+    );
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let events = collect(&runtime, Vec::new(), "go", &mut rx, &tx).await;
+    let drafts: Vec<(&str, &str, &str)> = events
+      .iter()
+      .filter_map(|event| match event {
+        AgentEvent::ToolCallDelta { id, name, args } => Some((id.as_str(), name.as_str(), args.as_str())),
+        _ => None,
+      })
+      .collect();
+    let line = drafts.first().expect("the call drawn before it ended").0;
+    assert!(drafts.iter().all(|(id, ..)| *id == line), "{drafts:?}");
+    assert_eq!(
+      drafts
+        .iter()
+        .map(|(_, name, args)| (*name, *args))
+        .take(3)
+        .collect::<Vec<_>>(),
+      [
+        ("bash", ""),
+        ("bash", r#"{"command":"#),
+        ("bash", r#"{"command": "echo one"}"#),
+      ]
+    );
+    let internal = events.iter().find_map(|event| match event {
+      AgentEvent::ToolCall { internal, .. } => Some(internal.as_str()),
+      _ => None,
+    });
+    assert_eq!(internal, Some(line));
+  }
+
+  /// A call whose arguments are not an object is not run on what could be
+  /// read of them: the model is told, and asked to call it again.
+  #[tokio::test]
+  async fn a_call_cut_short_is_answered_without_running() {
+    let runtime = scripted(
+      vec![
+        vec![
+          MockStreamEvent::tool_call_name_delta("call_1", "bash"),
+          MockStreamEvent::tool_call_arguments_delta("call_1", r#"{"command": "touch /tmp/never"#),
+          MockStreamEvent::ToolCallEnd { id: "call_1".into() },
+        ],
+        vec![said("Sorry.")],
+      ],
+      false,
+    );
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let events = collect(&runtime, Vec::new(), "go", &mut rx, &tx).await;
+    assert!(
+      !events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::ToolOutput { .. }))
+    );
+    let (output, is_error) = events
+      .iter()
+      .find_map(|event| match event {
+        AgentEvent::ToolResult { output, is_error, .. } => Some((output.as_str(), *is_error)),
+        _ => None,
+      })
+      .expect("the call answered");
+    assert!(is_error);
+    assert!(output.contains("not a JSON object"), "{output}");
   }
 
   /// What the model was thinking when it was stopped stays with what it had
@@ -2076,7 +1963,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",")
         ),
-        Message::Assistant { content, .. } => format!(
+        Message::Assistant(AssistantMessage { content, .. }) => format!(
           "assistant[{}]",
           content
             .iter()
@@ -2212,14 +2099,10 @@ mod tests {
     // The provider's figure covers the message it was sent and the answer
     // it gave, so the next request estimates neither: only the result that
     // came back after it.
-    weigh.answered(
-      &Usage {
-        input_tokens: Some(500),
-        output_tokens: Some(20),
-        ..Usage::default()
-      },
-      1,
-    );
+    let mut usage = Usage::default();
+    usage.input_tokens = Some(500);
+    usage.output_tokens = Some(20);
+    weigh.answered(&usage, 1);
     let chat = vec![asked.clone(), answered.clone(), result(&"z".repeat(800))];
     assert_eq!(weigh.request(&chat), 520 + 200);
     // Two results in the same turn: both are estimated, and still nothing
@@ -2243,78 +2126,20 @@ mod tests {
   /// the prompt and the answer — and a counter nobody reported is nothing.
   #[test]
   fn the_context_is_the_prompt_and_the_answer() {
-    let cached = Usage {
-      input_tokens: Some(32_012),
-      output_tokens: Some(40),
-      cached_input_tokens: Some(30_000),
-      cache_creation_input_tokens: Some(2_000),
-      total_tokens: Some(32_052),
-      ..Usage::default()
-    };
+    let mut cached = Usage::default();
+    cached.input_tokens = Some(32_012);
+    cached.output_tokens = Some(40);
+    cached.cached_input_tokens = Some(30_000);
+    cached.cache_creation_input_tokens = Some(2_000);
+    cached.total_tokens = Some(32_052);
     assert_eq!(weight(&cached), 32_052);
 
     // A provider that reports only the prompt is taken at its word for that.
-    let prompt = Usage {
-      input_tokens: Some(500),
-      ..Usage::default()
-    };
+    let mut prompt = Usage::default();
+    prompt.input_tokens = Some(500);
     assert_eq!(weight(&prompt), 500);
 
     assert_eq!(weight(&Usage::default()), 0);
-  }
-
-  #[test]
-  fn relay_moves_tool_images_into_a_following_user_message() {
-    use rig_core::message::{CallId, LocalCallId, ToolName};
-    let result = |content: Vec<ToolResultContent>| {
-      UserContent::tool_result(
-        CallId::from(LocalCallId::new()),
-        ToolName::new("read").unwrap(),
-        content,
-      )
-    };
-    let mut history = vec![
-      Message::user("look"),
-      Message::assistant("reading"),
-      Message::User {
-        content: vec![
-          result(vec![ToolResultContent::text("plain")]),
-          result(vec![ToolResultContent::image_base64(
-            "AAAA",
-            Some(rig_core::message::ImageMediaType::PNG),
-            None,
-          )]),
-        ],
-      },
-      Message::assistant("done"),
-    ];
-    let untouched = history[..2].to_vec();
-    relay_tool_images(&mut history);
-    assert_eq!(history.len(), 5);
-    assert_eq!(&history[..2], &untouched[..]);
-    let Message::User { content } = &history[2] else {
-      panic!("tool results stay a user message");
-    };
-    let texts: Vec<Option<&str>> = content
-      .iter()
-      .map(|c| match c {
-        UserContent::ToolResult(r) => r.content[0].as_text(),
-        _ => None,
-      })
-      .collect();
-    assert_eq!(texts, [Some("plain"), Some("(see attached image)")]);
-    let Message::User { content } = &history[3] else {
-      panic!("relay message follows the tool results");
-    };
-    assert!(matches!(&content[0], UserContent::Text(t) if t.text == "Attached image(s) from tool result:"));
-    assert!(matches!(&content[1], UserContent::Image(_)));
-    assert_eq!(history[4], Message::assistant("done"));
-
-    // Nothing to do for text-only histories.
-    let mut plain = vec![Message::user("a"), Message::assistant("b")];
-    let before = plain.clone();
-    relay_tool_images(&mut plain);
-    assert_eq!(plain, before);
   }
 
   /// A cap travels with the run's requests and the summarizer's alike —
@@ -2331,8 +2156,6 @@ mod tests {
       preamble: String::new(),
       compaction: TEST_SETTINGS,
       rules: Default::default(),
-      relay_images: false,
-      adopt_reasoning: None,
       max_tokens: Some(99),
     });
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -2343,40 +2166,38 @@ mod tests {
     assert_eq!(*recording.caps.lock().unwrap(), vec![Some(99), Some(99)]);
   }
 
-  /// Every provider there is, and whether an image it is sent inside a tool
-  /// result has to be relayed after it instead.
-  const PROVIDERS: [(Provider, bool); 24] = [
-    (Provider::OpenAi, true),
-    (Provider::OpenAiResponses, false),
-    (Provider::Azure, true),
-    (Provider::OpenRouter, true),
-    (Provider::Ollama, true),
-    (Provider::Gemini, false),
-    (Provider::Anthropic, false),
-    (Provider::Cohere, true),
-    (Provider::DeepSeek, true),
-    (Provider::Doubleword, true),
-    (Provider::Groq, true),
-    (Provider::HuggingFace, true),
-    (Provider::Hyperbolic, true),
-    (Provider::LlamaCpp, false),
-    (Provider::MiniMax, true),
-    (Provider::Mira, true),
-    (Provider::Mistral, true),
-    (Provider::Moonshot, true),
-    (Provider::Perplexity, true),
-    (Provider::Together, true),
-    (Provider::Venice, true),
-    (Provider::XAi, false),
-    (Provider::XiaomiMimo, true),
-    (Provider::ZAi, true),
+  /// Every provider there is.
+  const PROVIDERS: [Provider; 24] = [
+    Provider::OpenAi,
+    Provider::OpenAiResponses,
+    Provider::Azure,
+    Provider::OpenRouter,
+    Provider::Ollama,
+    Provider::Gemini,
+    Provider::Anthropic,
+    Provider::Cohere,
+    Provider::DeepSeek,
+    Provider::Doubleword,
+    Provider::Groq,
+    Provider::HuggingFace,
+    Provider::Hyperbolic,
+    Provider::LlamaCpp,
+    Provider::MiniMax,
+    Provider::Mira,
+    Provider::Mistral,
+    Provider::Moonshot,
+    Provider::Perplexity,
+    Provider::Together,
+    Provider::Venice,
+    Provider::XAi,
+    Provider::XiaomiMimo,
+    Provider::ZAi,
   ];
 
-  /// Every provider builds, with a key and without one, and only the ones
-  /// that take an image inside a tool result skip the relay.
+  /// Every provider builds, with a key and without one.
   #[test]
   fn each_provider_builds_a_model() {
-    for (provider, relay) in PROVIDERS {
+    for provider in PROVIDERS {
       for (key, base_url) in [("", None), ("k", Some("http://127.0.0.1:1/v1/".to_string()))] {
         // Azure has no endpoint to fall back on; that refusal is tested on
         // its own.
@@ -2395,9 +2216,8 @@ mod tests {
           tools: Default::default(),
         };
         let (tx, _rx) = mpsc::unbounded_channel();
-        let agents = build_agents(&cfg, Path::new("/tmp"), &Host::new(tx), &Default::default())
+        build_agents(&cfg, Path::new("/tmp"), &Host::new(tx), &Default::default())
           .unwrap_or_else(|e| panic!("{provider:?} with key {key:?}: {e}"));
-        assert_eq!(agents.runtime.relay_images, relay, "{provider:?}");
       }
     }
   }
@@ -2424,112 +2244,6 @@ mod tests {
     assert!(format!("{err:#}").contains("--base-url"), "{err:#}");
   }
 
-  /// Chat Completions takes thoughts from anywhere, as its own; Claude, and
-  /// the wires that replay reasoning as items of their own, do not.
-  #[test]
-  fn chat_completions_adopts_reasoning() {
-    for (provider, model, adopter) in [
-      (Provider::LlamaCpp, "mock", Some("llamacpp")),
-      (Provider::OpenAi, "mock", Some("openai")),
-      (Provider::DeepSeek, "deepseek-reasoner", Some("deepseek")),
-      (Provider::OpenRouter, "deepseek/deepseek-r1", Some("openrouter")),
-      (Provider::OpenRouter, "anthropic/claude-sonnet-4.5", None),
-      (Provider::OpenAiResponses, "mock", None),
-      (Provider::Anthropic, "claude-sonnet-4-5", None),
-      (Provider::Gemini, "mock", None),
-      (Provider::Ollama, "mock", None),
-    ] {
-      let cfg = Config {
-        provider,
-        base_url: Some("http://127.0.0.1:1/v1".to_string()),
-        api_key: "k".into(),
-        model: model.into(),
-        system_prompt: None,
-        max_tokens: None,
-        compaction: TEST_SETTINGS,
-        vision: true,
-        tools: Default::default(),
-      };
-      let (_, _, adopt) = build_model(&cfg).unwrap();
-      assert_eq!(
-        adopt.as_ref().map(|adopt| adopt.issuer.as_str()),
-        adopter,
-        "{provider:?} {model}"
-      );
-    }
-  }
-
-  /// What reads as a thought is passed off as the adopter's, without what only
-  /// its issuer could check; the rest, and what the endpoint sends back as it
-  /// is already, is left as it was.
-  #[test]
-  fn adopted_reasoning_keeps_what_reads() {
-    let reasoning = |issuer: &'static str, id: Option<&str>, content: Vec<ReasoningContent>| {
-      AssistantContent::Reasoning(
-        Reasoning {
-          id: id.map(String::from),
-          content,
-        }
-        .sealed(issuer),
-      )
-    };
-    let signed = ReasoningContent::Text {
-      text: "think".into(),
-      signature: Some("sig".into()),
-    };
-    let foreign = reasoning(
-      "llamacpp",
-      Some("r1"),
-      vec![
-        signed.clone(),
-        ReasoningContent::Encrypted("blob".into()),
-        ReasoningContent::Summary("in short".into()),
-      ],
-    );
-    let sealed_shut = reasoning("anthropic", None, vec![ReasoningContent::Redacted { data: "x".into() }]);
-    let upstream = reasoning("openrouter/deepseek", Some("mine"), vec![signed]);
-    let mut history = vec![
-      Message::user("hi"),
-      Message::Assistant {
-        id: None,
-        content: vec![
-          foreign,
-          sealed_shut.clone(),
-          upstream.clone(),
-          AssistantContent::text("done"),
-        ],
-      },
-    ];
-    let adopter = Adopter {
-      issuer: Issuer::from_static("openrouter"),
-      native: vec![
-        Issuer::from_static("openrouter"),
-        Issuer::from_static("openrouter/deepseek"),
-      ],
-    };
-    adopt_reasoning(&mut history, &adopter);
-    let Message::Assistant { content, .. } = &history[1] else {
-      panic!("not an answer")
-    };
-    assert_eq!(
-      content[0],
-      reasoning(
-        "openrouter",
-        None,
-        vec![
-          ReasoningContent::Text {
-            text: "think".into(),
-            signature: None,
-          },
-          ReasoningContent::Summary("in short".into()),
-        ],
-      )
-    );
-    assert_eq!(content[1], sealed_shut);
-    assert_eq!(content[2], upstream);
-    assert_eq!(content[3], AssistantContent::text("done"));
-  }
-
   /// The key is read from the variable the provider's own tools use.
   #[test]
   fn each_provider_reads_its_own_key_variable() {
@@ -2545,7 +2259,7 @@ mod tests {
   /// client built for an endpoint that is not there could.
   #[tokio::test]
   async fn every_provider_answers_being_asked_for_its_models() {
-    for (provider, _) in PROVIDERS {
+    for provider in PROVIDERS {
       let cfg = Config {
         provider,
         // Nothing is listening, so a provider with an arm fails to reach it
@@ -2590,9 +2304,9 @@ mod tests {
       .unwrap()
       .runtime;
     // The mock turns "image <path>" into a `read` tool call for that path,
-    // then answers the follow-up request with plain text. If the relay did
-    // not work, rig would reject the image in the tool message and the run
-    // would end with an error instead of a Done.
+    // then answers the follow-up request with plain text. If rig did not
+    // move the image out of the tool message, the server would reject it and
+    // the run would end with an error instead of a Done.
     let events = collect(&agent, vec![], &format!("image {}", path.display()), &mut rx, &tx).await;
     let result = events
       .iter()
@@ -2610,7 +2324,7 @@ mod tests {
   }
 
   /// Same scenario as `mock_image_read`, but through the Gemini provider,
-  /// where the image travels inside the function response with no relay.
+  /// where the image travels inside the function response.
   #[tokio::test]
   async fn mock_gemini_image_read() {
     let Ok(base_url) = std::env::var("FA_TEST_GEMINI_BASE_URL") else {

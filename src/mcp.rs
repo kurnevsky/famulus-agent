@@ -544,7 +544,7 @@ impl Catalog {
         offer
           .tools
           .iter()
-          .map(|tool| {
+          .filter_map(|tool| {
             crate::call::tool(
               tool,
               offer.peer.clone(),

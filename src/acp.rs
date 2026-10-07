@@ -36,7 +36,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use rig_agent::tool::Tool;
 use rig_core::completion::Message;
-use rig_core::message::{AssistantContent, ImageMediaType, MimeType, UserContent};
+use rig_core::message::{AssistantContent, AssistantMessage, ImageMediaType, MimeType, UserContent};
 use tokio::sync::mpsc;
 
 use crate::agent::{self, AgentEvent, Agents, Control, ModelInfo, start_compaction, start_run};
@@ -970,9 +970,6 @@ impl Turn {
   /// whole arguments — not at every character, which would be a message
   /// for each.
   fn writing(&mut self, id: String, name: String, args: &str) {
-    if name.is_empty() {
-      return;
-    }
     let parsed = match args.trim_end().ends_with('}') {
       true => serde_json::from_str::<serde_json::Value>(args).ok(),
       false => None,
@@ -1184,7 +1181,7 @@ fn replay(session: &Session, cwd: &Path) -> Vec<SessionUpdate> {
           }
         }
       }
-      Message::Assistant { content, .. } => {
+      Message::Assistant(AssistantMessage { content, .. }) => {
         for part in content {
           match part {
             AssistantContent::Text(text) => {
@@ -1193,15 +1190,16 @@ fn replay(session: &Session, cwd: &Path) -> Vec<SessionUpdate> {
               )));
             }
             AssistantContent::Reasoning(reasoning) => {
-              let text = crate::compaction::reasoning_text(reasoning);
-              if !text.is_empty() {
-                updates.push(SessionUpdate::AgentThoughtChunk(ContentChunk::new(text.into())));
+              if !reasoning.text.is_empty() {
+                updates.push(SessionUpdate::AgentThoughtChunk(ContentChunk::new(
+                  reasoning.text.clone().into(),
+                )));
               }
             }
             AssistantContent::ToolCall(call) => {
               let (name, args, id) = (
                 call.function.name.as_str(),
-                &call.function.arguments,
+                &call.function.arguments_value(),
                 call.id.to_string(),
               );
               let mut told = ToolCall::new(id.clone(), title(name, Some(args)))
@@ -1217,7 +1215,7 @@ fn replay(session: &Session, cwd: &Path) -> Vec<SessionUpdate> {
               }
               updates.push(SessionUpdate::ToolCall(told));
             }
-            AssistantContent::Image(_) => {}
+            _ => {}
           }
         }
       }

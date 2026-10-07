@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local};
 use rig_core::completion::Message;
-use rig_core::message::{AssistantContent, UserContent};
+use rig_core::message::{AssistantContent, AssistantMessage, UserContent};
 use serde::{Deserialize, Serialize};
 
 use crate::compaction;
@@ -660,7 +660,7 @@ impl Session {
   pub fn delete_branch(&mut self, id: &str) -> Result<usize> {
     let mut root = self.node(id).with_context(|| format!("no entry {id}"))?;
     while let Some(parent) = root.parent.as_deref().and_then(|p| self.node(p)) {
-      let calls = matches!(&parent.kind, NodeKind::Message(Message::Assistant { content, .. })
+      let calls = matches!(&parent.kind, NodeKind::Message(Message::Assistant(AssistantMessage { content, .. }))
         if content.iter().any(|c| matches!(c, AssistantContent::ToolCall(_))));
       let alone = self
         .nodes
@@ -978,14 +978,11 @@ mod tests {
     let mut session = Session::new(None, Path::new("/work"), "mock");
     session.append(vec![Message::user("look")]).unwrap();
     let prompt = session.leaf().unwrap().to_string();
-    let call = Message::Assistant {
-      id: None,
-      content: vec![AssistantContent::tool_call(
-        "1",
-        rig_core::message::ToolName::new("read").unwrap(),
-        serde_json::json!({}),
-      )],
-    };
+    let call = Message::Assistant(AssistantMessage::new(vec![AssistantContent::tool_call(
+      "1",
+      rig_core::message::ToolName::new("read").unwrap(),
+      serde_json::json!({}),
+    )]));
     session.append(vec![call, tool_result("1", "fn main() {}")]).unwrap();
     let result = session.leaf().unwrap().to_string();
     session.go_to(Some(prompt)).unwrap();

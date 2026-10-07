@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rig_agent::tool::{DynamicTool, ToolContext, ToolExecutionError, ToolOutput};
-use rig_core::message::{ImageMediaType, MimeType, ToolResultContent};
+use rig_core::message::{ImageMediaType, MimeType, ToolName, ToolResultContent};
 use rmcp::ServiceError;
 use rmcp::model::{
   CallToolRequest, CallToolRequestParams, CallToolResult, ClientRequest, ContentBlock, ProgressNotificationParam,
@@ -145,12 +145,18 @@ fn said(note: &ProgressNotificationParam) -> String {
 
 /// One of a server's tools, as the agent calls it: waited on for up to
 /// `timeout` of silence from the server, with what it says of its progress
-/// shown under the call's line.
-pub fn tool(tool: &rmcp::model::Tool, peer: ServerSink, timeout: Option<Duration>, progress: Progress) -> DynamicTool {
+/// shown under the call's line. A tool with no name is not one a model could
+/// call, so there is none.
+pub fn tool(
+  tool: &rmcp::model::Tool,
+  peer: ServerSink,
+  timeout: Option<Duration>,
+  progress: Progress,
+) -> Option<DynamicTool> {
   let name = tool.name.to_string();
   let description = tool.description.as_deref().unwrap_or_default().to_string();
-  DynamicTool::new_with_context(
-    name.clone(),
+  Some(DynamicTool::new_with_context(
+    ToolName::new(name.clone()).ok()?,
     description,
     tool.schema_as_json_value(),
     move |context: &mut ToolContext, args: serde_json::Value| {
@@ -182,7 +188,7 @@ pub fn tool(tool: &rmcp::model::Tool, peer: ServerSink, timeout: Option<Duration
         }
       })
     },
-  )
+  ))
 }
 
 /// Why a call came to nothing, for the model to make what it can of.

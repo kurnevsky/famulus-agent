@@ -26,7 +26,7 @@ use ratatui_textarea::{CursorMove, TextArea, WrapMode};
 use rig_core::completion::{Message, Usage};
 #[cfg(test)]
 use rig_core::message::ToolResultContent;
-use rig_core::message::{AssistantContent, ToolResult, UserContent};
+use rig_core::message::{AssistantContent, AssistantMessage, ToolResult, UserContent};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -470,8 +470,12 @@ impl Overlay {
 struct Writing {
   id: String,
   name: String,
-  /// The JSON so far, usually not yet parseable.
-  args: String,
+  /// What its JSON says so far, read once as it arrives rather than on every
+  /// frame: the object as far as it goes, with a string still being written
+  /// read as far as it has got.
+  so_far: serde_json::Value,
+  /// Whether the JSON has arrived whole.
+  whole: bool,
 }
 
 #[derive(Hash)]
@@ -2530,10 +2534,13 @@ impl App {
         Some(Entry::Reasoning(text)) => text.push_str(&delta),
         _ => self.entries.push(Entry::Reasoning(delta)),
       },
-      AgentEvent::ToolCallDelta { id, name, args } => match self.writing.iter_mut().find(|w| w.id == id) {
-        Some(writing) => (writing.name, writing.args) = (name, args),
-        None => self.writing.push(Writing { id, name, args }),
-      },
+      AgentEvent::ToolCallDelta { id, name, args } => {
+        let writing = Writing::new(id, name, &args);
+        match self.writing.iter_mut().find(|w| w.id == writing.id) {
+          Some(was) => *was = writing,
+          None => self.writing.push(writing),
+        }
+      }
       AgentEvent::ToolCall {
         name,
         args,
@@ -3415,8 +3422,8 @@ impl App {
     let mut lines = Vec::new();
     for writing in &self.writing {
       lines.push(Line::default());
-      let summary = writing_summary(&writing.name, &writing.args);
-      let blocks = writing_body(&writing.name, &writing.args);
+      let summary = writing.summary();
+      let blocks = writing.body();
       let body: Vec<Vec<Span<'static>>> = match (writing.name.as_str(), blocks.as_slice()) {
         // A file arriving is shown as the file it will be, highlighted the
         // same way — so nothing recolours when the call is finally made.
@@ -3432,7 +3439,7 @@ impl App {
         // left plain.
         _ => {
           let path = (writing.name == "edit")
-            .then(|| writing_path(&writing.args))
+            .then(|| writing.path())
             .flatten()
             .unwrap_or_default();
           blocks
@@ -4835,22 +4842,22 @@ fn entries_from_history(session: &Session) -> Vec<Entry> {
         let i = results.index(&r.call.to_string())?;
         answered.insert(i).then(|| results.entry(i, session, now))
       })),
-      Message::Assistant { content, .. } => {
+      Message::Assistant(AssistantMessage { content, .. }) => {
         for c in content {
           match c {
             AssistantContent::Text(t) => entries.push(Entry::Assistant(t.text.clone())),
             AssistantContent::Reasoning(r) => {
-              let text = crate::compaction::reasoning_text(r);
-              if !text.is_empty() {
-                entries.push(Entry::Reasoning(text));
+              if !r.text.is_empty() {
+                entries.push(Entry::Reasoning(r.text.clone()));
               }
             }
             AssistantContent::ToolCall(call) => {
+              let args = call.function.arguments_value();
               entries.push(Entry::ToolCall {
-                wrote: wrote_content(&call.function.name, &call.function.arguments),
-                edited: edited_path(&call.function.name, &call.function.arguments),
+                wrote: wrote_content(&call.function.name, &args),
+                edited: edited_path(&call.function.name, &args),
                 name: call.function.name.to_string(),
-                summary: summarize_args(&call.function.name, &call.function.arguments),
+                summary: summarize_args(&call.function.name, &args),
                 call: call.id.to_string(),
                 started: now,
               });
@@ -4862,7 +4869,7 @@ fn entries_from_history(session: &Session) -> Vec<Entry> {
                 entries.push(results.entry(i, session, now));
               }
             }
-            AssistantContent::Image(_) => {}
+            _ => {}
           }
         }
       }
@@ -4921,7 +4928,7 @@ fn prompt_entries(text: String, images: Vec<Vec<u8>>, expanded: &[Message]) -> V
   for message in expanded {
     match message {
       Message::User { content } => entries.extend(user_entries(content, |_| None)),
-      Message::Assistant { content, .. } => entries.extend(content.iter().filter_map(|c| match c {
+      Message::Assistant(AssistantMessage { content, .. }) => entries.extend(content.iter().filter_map(|c| match c {
         AssistantContent::Text(t) => Some(Entry::Assistant(t.text.clone())),
         _ => None,
       })),
@@ -4982,13 +4989,13 @@ fn classify(message: &Message) -> Kind {
         true => Kind::Step("▤ Context summary".into()),
       }
     }
-    Message::Assistant { content, .. } => {
+    Message::Assistant(AssistantMessage { content, .. }) => {
       if content.iter().any(|c| matches!(c, AssistantContent::ToolCall(_))) {
         return Kind::ToolCalls;
       }
       let text = content.iter().find_map(|c| match c {
         AssistantContent::Text(t) => Some(first_line(&t.text)),
-        AssistantContent::Reasoning(r) => Some(format!("· {}", first_line(&crate::compaction::reasoning_text(r)))),
+        AssistantContent::Reasoning(r) => Some(format!("· {}", first_line(&r.text))),
         _ => None,
       });
       Kind::Step(text.unwrap_or_else(|| "(no text)".into()))
@@ -5128,8 +5135,14 @@ fn first_line(text: &str) -> String {
 /// What a call acts on, as the line it is drawn with says it: the command,
 /// the path, the question — or its arguments, for a tool fa knows nothing of.
 pub fn summarize_args(name: &str, args: &serde_json::Value) -> String {
+  summary(name, args).unwrap_or_else(|| first_line(&args.to_string()))
+}
+
+/// What a call to one of fa's own tools acts on; `None` for any other tool,
+/// and for arguments that do not say yet.
+fn summary(name: &str, args: &serde_json::Value) -> Option<String> {
   let get = |k: &str| args.get(k).and_then(|v| v.as_str()).map(str::to_string);
-  let summary = match name {
+  match name {
     // Whole, however many lines it runs to: what a call is about to do is the
     // part worth reading in full. The trailing newline a heredoc ends on is
     // not a line of it.
@@ -5164,56 +5177,58 @@ pub fn summarize_args(name: &str, args: &serde_json::Value) -> String {
       }
     }),
     _ => None,
-  };
-  summary.unwrap_or_else(|| first_line(&args.to_string()))
-}
-
-/// What to show of a call the model is still writing.
-///
-/// Once the arguments parse, the finished summary is exact and is used as-is.
-/// Until then only the field that summary would lead with is worth showing —
-/// the command, or the path — which is the part being typed anyway.
-fn writing_summary(name: &str, args: &str) -> String {
-  if let Ok(value) = serde_json::from_str::<serde_json::Value>(args) {
-    return summarize_args(name, &value);
-  }
-  let key = match name {
-    "bash" => "command",
-    "read" | "write" | "edit" => "path",
-    _ => return String::new(),
-  };
-  partial_str(args, key).unwrap_or_default()
-}
-
-/// The file a call is writing into its arguments, as far as it has arrived —
-/// which is what says how to colour the text arriving with it.
-fn writing_path(args: &str) -> Option<String> {
-  match serde_json::from_str::<serde_json::Value>(args) {
-    Ok(value) => value.get("path").and_then(|p| p.as_str()).map(str::to_string),
-    Err(_) => partial_str(args, "path"),
   }
 }
 
-/// The text a call is carrying in its arguments, as far as it has arrived,
-/// in blocks with the mark each is drawn under.
-///
-/// `bash` says all it has to say on its one line, but `write` and `edit` put
-/// a file's worth of text in their arguments — the slow part of the call, and
-/// the part worth watching arrive. An edit's two halves are marked the way
-/// the diff it becomes will mark them.
-fn writing_body(name: &str, args: &str) -> Vec<(&'static str, String)> {
-  // Once the arguments parse, read them as arguments. Scanning the text is
-  // only for what is still half-written, and that has to assume the halves of
-  // an edit arrive in the order they were written — which stops being true
-  // the moment anything re-serializes them, since that sorts the keys.
-  if let Ok(value) = serde_json::from_str::<serde_json::Value>(args) {
+impl Writing {
+  /// A call to `name` whose JSON has got as far as `args`.
+  fn new(id: String, name: String, args: &str) -> Self {
+    Self {
+      id,
+      name,
+      so_far: serde_json::Value::Object(rig_core::streaming::parse_partial_arguments(args)),
+      whole: serde_json::from_str::<serde::de::IgnoredAny>(args).is_ok(),
+    }
+  }
+
+  /// What to show of the call on its line: what the finished call's line
+  /// will say, as far as it has arrived. Until the field that line leads
+  /// with has begun — the command, or the path — it says nothing rather than
+  /// show the JSON around it, and a tool fa knows nothing of says nothing
+  /// until its arguments are whole.
+  fn summary(&self) -> String {
+    match summary(&self.name, &self.so_far) {
+      Some(summary) => summary,
+      None if self.whole => first_line(&self.so_far.to_string()),
+      None => String::new(),
+    }
+  }
+
+  /// The file the call is writing into its arguments, as far as it has
+  /// arrived — which is what says how to colour the text arriving with it.
+  fn path(&self) -> Option<String> {
+    self.so_far.get("path").and_then(|p| p.as_str()).map(str::to_string)
+  }
+
+  /// The text the call is carrying in its arguments, as far as it has
+  /// arrived, in blocks with the mark each is drawn under.
+  ///
+  /// `bash` says all it has to say on its one line, but `write` and `edit`
+  /// put a file's worth of text in their arguments — the slow part of the
+  /// call, and the part worth watching arrive. An edit's two halves are
+  /// marked the way the diff it becomes will mark them.
+  fn body(&self) -> Vec<(&'static str, String)> {
     let text = |value: &serde_json::Value, key| value.get(key).and_then(|v| v.as_str()).map(str::to_string);
-    return match name {
-      "write" => text(&value, "content").map(|body| ("│", body)).into_iter().collect(),
+    match self.name.as_str() {
+      "write" => text(&self.so_far, "content")
+        .map(|body| ("│", body))
+        .into_iter()
+        .collect(),
       // Every replacement the call makes, not only the one it is on: a call
       // is the whole set of them, and the ones already written are still
       // part of what it will do.
-      "edit" => value
+      "edit" => self
+        .so_far
         .get("edits")
         .and_then(|edits| edits.as_array())
         .map(|edits| {
@@ -5230,85 +5245,8 @@ fn writing_body(name: &str, args: &str) -> Vec<(&'static str, String)> {
         })
         .unwrap_or_default(),
       _ => Vec::new(),
-    };
-  }
-  match name {
-    "write" => args
-      .find("\"content\"")
-      .and_then(|at| value_after(args, at + 9))
-      .map(|body| ("│", body))
-      .into_iter()
-      .collect(),
-    "edit" => replacements(args),
-    _ => Vec::new(),
-  }
-}
-
-/// The replacements written so far, in the order they were written, the last
-/// of them as far as it has got.
-///
-/// Read by scanning because there is nothing parseable yet. A replacement
-/// whose own text contained `"newText":` would fool it, which costs a wrongly
-/// drawn line until the call finishes and is read properly.
-fn replacements(args: &str) -> Vec<(&'static str, String)> {
-  let mut out = Vec::new();
-  let mut from = 0;
-  loop {
-    let next = [("-", "oldText"), ("+", "newText")]
-      .into_iter()
-      .filter_map(|(mark, key)| {
-        let at = args[from..].find(&format!("\"{key}\""))? + from;
-        Some((at, mark, key.len()))
-      })
-      .min_by_key(|(at, ..)| *at);
-    let Some((at, mark, len)) = next else { return out };
-    from = at + len + 2;
-    // A value that has not opened yet, or a key with nothing after it, is
-    // where the writing has got to.
-    let Some(text) = value_after(args, from) else {
-      return out;
-    };
-    out.push((mark, text));
-  }
-}
-
-/// The value of a string field in a JSON object that is still being written,
-/// including one whose closing quote has not arrived yet.
-///
-/// The key is found by text rather than by parsing, since there is nothing
-/// parseable yet. A tool argument that itself contained `"command":` would
-/// fool it, which costs a wrong half-drawn line and nothing else.
-fn partial_str(json: &str, key: &str) -> Option<String> {
-  value_after(json, json.find(&format!("\"{key}\""))? + key.len() + 2)
-}
-
-/// Reads the string value that follows a key, from `at`.
-fn value_after(json: &str, at: usize) -> Option<String> {
-  let rest = json.get(at..)?.trim_start().strip_prefix(':')?.trim_start();
-  let mut chars = rest.strip_prefix('"')?.chars();
-  let mut out = String::new();
-  while let Some(c) = chars.next() {
-    match c {
-      '"' => break,
-      '\\' => match chars.next() {
-        Some('n') => out.push('\n'),
-        Some('t') => out.push('\t'),
-        Some('r') => {}
-        Some('u') => {
-          // Four hex digits, which may not all have arrived.
-          let hex: String = chars.by_ref().take(4).collect();
-          if let Some(c) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
-            out.push(c);
-          }
-        }
-        Some(escaped) => out.push(escaped),
-        // The escape itself is only half here; the rest is on its way.
-        None => break,
-      },
-      c => out.push(c),
     }
   }
-  Some(out)
 }
 
 fn shorten_home(path: &Path) -> String {
@@ -5696,10 +5634,10 @@ mod tests {
     );
     vec![
       Message::user("look at a.rs"),
-      Message::Assistant {
-        id: None,
-        content: vec![AssistantContent::text("Let me read it."), call],
-      },
+      Message::Assistant(AssistantMessage::new(vec![
+        AssistantContent::text("Let me read it."),
+        call,
+      ])),
       Message::User { content: vec![result] },
       Message::assistant("It is a hello world."),
     ]
@@ -5826,13 +5764,18 @@ mod tests {
     );
   }
 
+  /// A call to `name` whose arguments have got as far as `args`.
+  fn writing(name: &str, args: &str) -> Writing {
+    Writing::new(String::new(), name.into(), args)
+  }
+
   #[test]
   fn a_command_reads_back_as_it_is_written() {
     // What the model sends, a few characters at a time. Every prefix of it
     // has to render as the command so far and nothing else.
     let whole = r#"{"command":"cargo test --all"}"#;
     let seen: Vec<String> = (0..=whole.len())
-      .map(|n| writing_summary("bash", &whole[..n]))
+      .map(|n| writing("bash", &whole[..n]).summary())
       .collect();
     assert_eq!(seen.first().unwrap(), "");
     assert_eq!(seen.last().unwrap(), "cargo test --all");
@@ -5846,11 +5789,12 @@ mod tests {
 
   #[test]
   fn a_half_written_command_keeps_its_escapes_whole() {
-    let quote = |args: &str| writing_summary("bash", args);
+    let quote = |args: &str| writing("bash", args).summary();
     assert_eq!(quote(r#"{"command":"echo \"hi"#), "echo \"hi");
     // An escape that is itself half here waits rather than showing a stray
-    // backslash.
-    assert_eq!(quote(r#"{"command":"echo \"#), "echo ");
+    // backslash — and the space before it is trimmed, as the finished line
+    // trims it.
+    assert_eq!(quote(r#"{"command":"echo \"#), "echo");
     // Every line of it, exactly as the finished summary shows the same
     // command.
     assert_eq!(quote(r#"{"command":"one\ntwo"#), "one\ntwo");
@@ -5866,8 +5810,8 @@ mod tests {
     // The path is on the first line from early on; the content grows under it.
     let at = |n: usize| {
       (
-        writing_summary("write", &whole[..n]),
-        writing_body("write", &whole[..n]),
+        writing("write", &whole[..n]).summary(),
+        writing("write", &whole[..n]).body(),
       )
     };
     assert_eq!(at(whole.find("\"content\"").unwrap()).1, []);
@@ -5877,9 +5821,9 @@ mod tests {
     assert_eq!(body, [("│", "fn main() {\n    body".to_string())]);
     assert_eq!(at(whole.len()).1, [("│", "fn main() {\n    body();\n}".to_string())]);
     // Every prefix is a prefix of the whole, so the block only ever grows.
-    let full = writing_body("write", whole)[0].1.clone();
+    let full = writing("write", whole).body()[0].1.clone();
     for n in 0..=whole.len() {
-      if let [(_, text)] = writing_body("write", &whole[..n]).as_slice() {
+      if let [(_, text)] = writing("write", &whole[..n]).body().as_slice() {
         assert!(full.starts_with(text), "{text:?}");
       }
     }
@@ -5889,12 +5833,12 @@ mod tests {
   fn an_edit_shows_its_two_halves_marked_as_the_diff_will_mark_them() {
     let one = r#"{"path":"a.rs","edits":[{"oldText":"was","newText":"is"#;
     assert_eq!(
-      writing_body("edit", one),
+      writing("edit", one).body(),
       [("-", "was".to_string()), ("+", "is".to_string())]
     );
     // Before the new text arrives there is only the old.
     let half = r#"{"path":"a.rs","edits":[{"oldText":"wa"#;
-    assert_eq!(writing_body("edit", half), [("-", "wa".to_string())]);
+    assert_eq!(writing("edit", half).body(), [("-", "wa".to_string())]);
   }
 
   #[test]
@@ -5904,7 +5848,7 @@ mod tests {
     // what the call will do.
     let two = r#"{"edits":[{"oldText":"one","newText":"1"},{"oldText":"tw"#;
     assert_eq!(
-      writing_body("edit", two),
+      writing("edit", two).body(),
       [
         ("-", "one".to_string()),
         ("+", "1".to_string()),
@@ -5915,7 +5859,7 @@ mod tests {
     // displacing the ones before it.
     let two = format!("{two}o\",\"newText\":\"2");
     assert_eq!(
-      writing_body("edit", &two),
+      writing("edit", &two).body(),
       [
         ("-", "one".to_string()),
         ("+", "1".to_string()),
@@ -5929,7 +5873,7 @@ mod tests {
   fn a_command_has_nothing_to_show_below_its_line() {
     // A command is drawn on the call's own lines; the block under them is for
     // the tools that carry a file in their arguments.
-    assert_eq!(writing_body("bash", r#"{"command":"ls -la"#), []);
+    assert_eq!(writing("bash", r#"{"command":"ls -la"#).body(), []);
   }
 
   /// A run of spans as the text it draws.
@@ -6195,12 +6139,12 @@ mod tests {
     // jumps when the call starts running.
     let args = serde_json::json!({ "path": "src/main.rs", "offset": 10, "limit": 5 });
     assert_eq!(
-      writing_summary("read", &args.to_string()),
+      writing("read", &args.to_string()).summary(),
       summarize_args("read", &args)
     );
     // A tool with nothing worth showing early says nothing, rather than
     // guessing.
-    assert_eq!(writing_summary("mystery", r#"{"a":"b"#), "");
+    assert_eq!(writing("mystery", r#"{"a":"b"#).summary(), "");
   }
 
   /// Each entry as one line, for asserting what the transcript reads like.
@@ -6241,14 +6185,11 @@ mod tests {
     };
     let session = session_of(vec![
       Message::user("build and test"),
-      Message::Assistant {
-        id: None,
-        content: vec![
-          AssistantContent::text("Doing both."),
-          call("1", "cargo build"),
-          call("2", "cargo test"),
-        ],
-      },
+      Message::Assistant(AssistantMessage::new(vec![
+        AssistantContent::text("Doing both."),
+        call("1", "cargo build"),
+        call("2", "cargo test"),
+      ])),
       Message::User {
         content: vec![result("2", "test output"), result("1", "build output")],
       },
@@ -6593,15 +6534,19 @@ mod tests {
   #[test]
   fn a_path_is_read_from_arguments_that_are_still_arriving() {
     assert_eq!(
-      writing_path(r#"{"path":"src/main.rs","edits":[]}"#).as_deref(),
+      writing("edit", r#"{"path":"src/main.rs","edits":[]}"#)
+        .path()
+        .as_deref(),
       Some("src/main.rs")
     );
     assert_eq!(
-      writing_path(r#"{"path":"src/main.rs","edits":[{"oldText":"a"#).as_deref(),
+      writing("edit", r#"{"path":"src/main.rs","edits":[{"oldText":"a"#)
+        .path()
+        .as_deref(),
       Some("src/main.rs"),
       "half an edit still says which file it is in"
     );
-    assert_eq!(writing_path(r#"{"pat"#), None);
+    assert_eq!(writing("edit", r#"{"pat"#).path(), None);
   }
 
   #[test]

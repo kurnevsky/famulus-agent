@@ -5,7 +5,7 @@
 
 use crate::agent::Runtime;
 use rig_core::completion::Message;
-use rig_core::message::{AssistantContent, Reasoning, Sealed, ToolResultContent, UserContent};
+use rig_core::message::{AssistantContent, AssistantMessage, ToolResultContent, UserContent};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
@@ -157,15 +157,6 @@ fn message_tokens(message: &Message) -> u64 {
   (message_chars(message) as u64).div_ceil(4)
 }
 
-/// What a model thought, as it reads: the text of reasoning sealed to the
-/// service that produced it, which is the one place a client reads it from.
-pub fn reasoning_text(reasoning: &Sealed<Reasoning>) -> String {
-  reasoning
-    .open(reasoning.issuer())
-    .map(Reasoning::display_text)
-    .unwrap_or_default()
-}
-
 fn message_chars(message: &Message) -> usize {
   match message {
     Message::System { content } => content.len(),
@@ -177,13 +168,16 @@ fn message_chars(message: &Message) -> usize {
         _ => ESTIMATED_IMAGE_CHARS,
       })
       .sum(),
-    Message::Assistant { content, .. } => content
+    Message::Assistant(AssistantMessage { content, .. }) => content
       .iter()
       .map(|c| match c {
         AssistantContent::Text(t) => t.text.len(),
-        AssistantContent::ToolCall(call) => call.function.name.len() + call.function.arguments.to_string().len(),
-        AssistantContent::Reasoning(r) => reasoning_text(r).len(),
+        AssistantContent::ToolCall(call) => {
+          call.function.name.len() + call.function.arguments_value().to_string().len()
+        }
+        AssistantContent::Reasoning(r) => r.text.len(),
         AssistantContent::Image(_) => ESTIMATED_IMAGE_CHARS,
+        _ => 0,
       })
       .sum(),
   }
@@ -325,26 +319,25 @@ pub fn serialize(messages: &[Message]) -> String {
           }
         }
       }
-      Message::Assistant { content, .. } => {
+      Message::Assistant(AssistantMessage { content, .. }) => {
         let mut thinking = Vec::new();
         let mut text = Vec::new();
         let mut calls = Vec::new();
         for c in content {
           match c {
-            AssistantContent::Reasoning(r) => thinking.push(reasoning_text(r)),
+            AssistantContent::Reasoning(r) => thinking.push(r.text.clone()),
             AssistantContent::Text(t) => text.push(t.text.as_str()),
             AssistantContent::ToolCall(call) => {
-              let args = match &call.function.arguments {
-                serde_json::Value::Object(map) => map
-                  .iter()
-                  .map(|(k, v)| format!("{k}={v}"))
-                  .collect::<Vec<_>>()
-                  .join(", "),
-                other => other.to_string(),
-              };
+              let args = call
+                .function
+                .arguments
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(", ");
               calls.push(format!("{}({args})", call.function.name));
             }
-            AssistantContent::Image(_) => {}
+            _ => {}
           }
         }
         if !thinking.is_empty() {
@@ -478,10 +471,7 @@ mod tests {
     );
     let result = call.result(vec![ToolResultContent::text("a\nb")]);
     (
-      Message::Assistant {
-        id: None,
-        content: vec![AssistantContent::ToolCall(call)],
-      },
+      Message::Assistant(AssistantMessage::new(vec![AssistantContent::ToolCall(call)])),
       Message::User {
         content: vec![UserContent::ToolResult(result)],
       },
