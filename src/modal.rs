@@ -98,18 +98,46 @@ pub struct Host {
   /// Asking for the UI itself rather than for a run, so what it shows is
   /// shown whether or not a run is going.
   own: bool,
+  /// Where a server's form goes instead of being drawn here, when the user
+  /// is somewhere else — in the editor fa is serving.
+  #[cfg(feature = "mcp")]
+  forward: Option<crate::elicit::Forward>,
 }
 
 impl Host {
   pub fn new(tx: mpsc::UnboundedSender<AgentEvent>) -> Self {
-    Self { tx, own: false }
+    Self {
+      tx,
+      own: false,
+      #[cfg(feature = "mcp")]
+      forward: None,
+    }
   }
 
   /// A host for what the UI asks on its own account — the arguments of a
   /// server's prompt, say — which no run is waiting on.
   #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
   pub fn own(tx: mpsc::UnboundedSender<AgentEvent>) -> Self {
-    Self { tx, own: true }
+    Self {
+      own: true,
+      ..Self::new(tx)
+    }
+  }
+
+  /// The same host, with the forms servers send handed to `forward` rather
+  /// than drawn.
+  #[cfg(all(feature = "mcp", feature = "acp"))]
+  pub fn forwarding(self, forward: crate::elicit::Forward) -> Self {
+    Self {
+      forward: Some(forward),
+      ..self
+    }
+  }
+
+  /// Where a server's form goes, if not to the UI.
+  #[cfg(feature = "mcp")]
+  pub fn forward(&self) -> Option<&crate::elicit::Forward> {
+    self.forward.as_ref()
   }
 
   /// Show `component`, and wait for however long the user takes to finish

@@ -4709,3 +4709,103 @@ fn compact_is_a_command_and_never_reaches_the_model() {
   );
   assert!(!provider.sent("/compact"));
 }
+
+/// An editor at work on a call to the booking server's `book`, which stops to
+/// ask the user how many seats: the prompt's id, still unanswered.
+#[cfg(all(feature = "acp", feature = "mcp"))]
+fn booking(editor: &mut Editor, capabilities: serde_json::Value) -> (String, u64) {
+  editor.call(
+    "initialize",
+    serde_json::json!({ "protocolVersion": 1, "clientCapabilities": capabilities }),
+  );
+  let server = editor.dir.join("server.py");
+  std::fs::write(&server, MCP_SERVER).expect("a server to run");
+  let cwd = editor.dir.display().to_string();
+  let opened = editor.call(
+    "session/new",
+    serde_json::json!({
+      "cwd": cwd,
+      "mcpServers": [{ "name": "booking", "command": "python3", "args": [server], "env": [] }],
+    }),
+  );
+  let session = opened["sessionId"].as_str().expect("a session id").to_string();
+  let id = editor.ask(
+    "session/prompt",
+    serde_json::json!({ "sessionId": session, "prompt": [{ "type": "text", "text": "book me in" }] }),
+  );
+  (session, id)
+}
+
+/// A form a server sends in the middle of a call goes to an editor that says
+/// it draws forms, as an elicitation of the session the call is in, and what
+/// the editor answers is what the server is told.
+#[cfg(all(feature = "acp", feature = "mcp"))]
+#[test]
+fn a_servers_form_is_put_to_an_editor_that_draws_them() {
+  if !have_python() {
+    return;
+  }
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "Booking. ",
+      tool: "book",
+      args: serde_json::json!({}),
+    },
+    Turn::Say("Booked."),
+  ]);
+  let mut editor = Editor::start("elicit", &provider);
+  let (session, id) = booking(&mut editor, serde_json::json!({ "elicitation": { "form": {} } }));
+
+  let asked = loop {
+    let message = editor.read();
+    if message["method"] == "elicitation/create" {
+      break message;
+    }
+  };
+  let params = &asked["params"];
+  assert_eq!(params["mode"], "form", "{asked}");
+  assert_eq!(params["sessionId"], session.as_str(), "{asked}");
+  assert_eq!(params["message"], "booking is asking: How many seats, and where?");
+  assert_eq!(params["requestedSchema"]["properties"]["seats"]["type"], "integer");
+  assert_eq!(params["requestedSchema"]["required"], serde_json::json!(["seats"]));
+  editor.send(serde_json::json!({
+    "jsonrpc": "2.0",
+    "id": asked["id"],
+    "result": { "action": "accept", "content": { "seats": 3, "window": true } },
+  }));
+
+  let answer = editor.answer(id);
+  assert_eq!(answer["result"]["stopReason"], "end_turn", "{answer}");
+  assert!(provider.sent(r#"\"action\": \"accept\""#), "accepted");
+  assert!(provider.sent(r#"\"seats\": 3"#), "a number");
+  assert!(provider.sent(r#"\"window\": true"#), "a boolean");
+}
+
+/// An editor that does not say it draws forms is never sent one: the server
+/// is told the user walked away, and the call goes on without them.
+#[cfg(all(feature = "acp", feature = "mcp"))]
+#[test]
+fn a_servers_form_goes_unanswered_in_an_editor_that_cannot_draw_it() {
+  if !have_python() {
+    return;
+  }
+  let provider = Provider::start(vec![
+    Turn::Call {
+      say: "Booking. ",
+      tool: "book",
+      args: serde_json::json!({}),
+    },
+    Turn::Say("Not booked."),
+  ]);
+  let mut editor = Editor::start("no-elicit", &provider);
+  let (_, id) = booking(&mut editor, serde_json::json!({}));
+  let answer = loop {
+    let message = editor.read();
+    assert_ne!(message["method"], "elicitation/create", "{message}");
+    if message["id"] == id && message.get("method").is_none() {
+      break message;
+    }
+  };
+  assert_eq!(answer["result"]["stopReason"], "end_turn", "{answer}");
+  assert!(provider.sent(r#"\"action\": \"cancel\""#), "cancelled");
+}

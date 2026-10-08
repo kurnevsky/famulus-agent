@@ -8,10 +8,17 @@
 //! is not one, or a required field left blank, is said above the form rather
 //! than sent for the server to refuse.
 //!
+//! Served to an editor, the user is in the editor rather than here: when it
+//! says it can draw a form, the form goes to it as it came, and its answer
+//! comes back the same way.
+//!
 //! Only forms are taken. A server that wants the user sent to a URL is told
 //! no, since a terminal cannot be relied on to open one.
 
 use std::borrow::Cow;
+use std::sync::Arc;
+
+use futures::future::BoxFuture;
 
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::style::Style;
@@ -30,6 +37,10 @@ use crate::markdown::wrap_text;
 use crate::modal::Component;
 use crate::theme::theme;
 
+/// Somewhere else to put a form: given who is asking, what they say and the
+/// schema to fill in, it comes back with the answer the server gets.
+pub type Forward = Arc<dyn Fn(String, String, ElicitationSchema) -> BoxFuture<'static, ElicitResult> + Send + Sync>;
+
 /// The client side of one server's connection: what it says it can do, and
 /// what it does when asked.
 impl rmcp::ClientHandler for crate::mcp::Watch {
@@ -46,6 +57,9 @@ impl rmcp::ClientHandler for crate::mcp::Watch {
     else {
       return Ok(ElicitResult::new(ElicitationAction::Decline));
     };
+    if let Some(forward) = self.host.forward() {
+      return Ok(forward(self.server.clone(), message, requested_schema).await);
+    }
     let form = Form::new(&self.server, message, &requested_schema);
     // Put away unanswered — the run was stopped — is the user walking away,
     // which the protocol has its own word for.

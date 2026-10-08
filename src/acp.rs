@@ -7,13 +7,13 @@
 //! saves them — so a session started in an editor can be resumed in the
 //! terminal, and the other way round.
 //!
-//! What the terminal asks the user directly has no way to be asked here:
-//! stable ACP has no free-form question for an agent to put to the user, so
-//! the `ask` tool is kept from the model, and a form an MCP server brings up
-//! goes unanswered.
+//! A form an MCP server brings up is put to the user as an elicitation, when
+//! the editor says it can draw one; when it cannot, the form goes unanswered.
+//! The `ask` tool is kept from the model either way.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -75,6 +75,7 @@ pub async fn serve(setup: Setup) -> Result<()> {
     setup,
     sessions: Mutex::default(),
     models: tokio::sync::OnceCell::new(),
+    forms: AtomicBool::new(false),
   });
   // Asked once, as early as possible: the first session to open is the one
   // that would otherwise wait for it.
@@ -100,8 +101,8 @@ pub async fn serve(setup: Setup) -> Result<()> {
     .builder()
     .name("fa")
     .on_receive_request(
-      async move |_: InitializeRequest, responder: Responder<InitializeResponse>, _: ConnectionTo<Client>| {
-        responder.respond(fa.initialize())
+      async move |request: InitializeRequest, responder: Responder<InitializeResponse>, _: ConnectionTo<Client>| {
+        responder.respond(fa.initialize(&request))
       },
       agent_client_protocol::on_receive_request!(),
     )
@@ -112,7 +113,7 @@ pub async fn serve(setup: Setup) -> Result<()> {
       async move |request: NewSessionRequest, responder: Responder<NewSessionResponse>, cx: ConnectionTo<Client>| {
         let fa = on_new.clone();
         tokio::spawn(async move {
-          let result = fa.new_session(request).await;
+          let result = fa.new_session(request, &cx).await;
           let opened = result.as_ref().ok().map(|response| response.session_id.clone());
           let _ = responder.respond_with_result(result);
           if let Some(id) = opened {
@@ -146,7 +147,7 @@ pub async fn serve(setup: Setup) -> Result<()> {
         let fa = on_resume.clone();
         tokio::spawn(async move {
           let id = request.session_id.clone();
-          let result = fa.resume_session(request).await;
+          let result = fa.resume_session(request, &cx).await;
           let opened = result.is_ok();
           let _ = responder.respond_with_result(result);
           if opened {
@@ -224,6 +225,8 @@ struct Fa {
   sessions: Mutex<HashMap<String, Arc<Live>>>,
   /// What the provider said it offers, or nothing when it would not say.
   models: tokio::sync::OnceCell<Vec<ModelInfo>>,
+  /// Whether the editor said it draws the forms an elicitation sends.
+  forms: AtomicBool,
 }
 
 /// One open session.
@@ -248,7 +251,13 @@ struct State {
 }
 
 impl Fa {
-  fn initialize(&self) -> InitializeResponse {
+  fn initialize(&self, request: &InitializeRequest) -> InitializeResponse {
+    let forms = request
+      .client_capabilities
+      .elicitation
+      .as_ref()
+      .is_some_and(|it| it.form.is_some());
+    self.forms.store(forms, Ordering::Relaxed);
     let saved = self.setup.store.is_some();
     let mut sessions = SessionCapabilities::new()
       .resume(SessionResumeCapabilities::new())
@@ -325,13 +334,28 @@ impl Fa {
 
   /// Make `session` one the editor can talk to, in `cwd`, with the servers
   /// fa's own files declare and the ones the editor brought.
-  async fn open(&self, cwd: PathBuf, servers: Vec<McpServer>, session: Option<Session>) -> Result<String, Error> {
+  async fn open(
+    &self,
+    cwd: PathBuf,
+    servers: Vec<McpServer>,
+    session: Option<Session>,
+    cx: &ConnectionTo<Client>,
+  ) -> Result<String, Error> {
     if !cwd.is_absolute() {
       return Err(Error::invalid_params().data(format!("{} is not an absolute path", cwd.display())));
     }
-    // What a server asks the user has nobody to put it to, so it is put
-    // away unanswered — which the server hears as a decline — and what it
-    // has to say goes where the editor keeps the agent's log.
+    let mut session = match session {
+      Some(session) => session,
+      None => Session::new(self.setup.store.as_ref(), &cwd, &label(&self.setup.cfg)),
+    };
+    if self.setup.store.is_none() {
+      session.disable_persistence();
+    }
+
+    // A form a server sends goes to the editor when it draws them; anything
+    // else a server asks the user has nobody to put it to, so it is put away
+    // unanswered — which the server hears as a cancel. What a server has to
+    // say goes where the editor keeps the agent's log.
     let (tx, mut rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
       while let Some(event) = rx.recv().await {
@@ -341,6 +365,13 @@ impl Fa {
       }
     });
     let host = Host::new(tx);
+    #[cfg(feature = "mcp")]
+    let host = match self.forms.load(Ordering::Relaxed) {
+      true => host.forwarding(elicitation(cx.clone(), SessionId::new(session.id.clone()))),
+      false => host,
+    };
+    #[cfg(not(feature = "mcp"))]
+    let _ = cx;
 
     let (mut config, mut notes) = match &self.setup.mcp {
       Some((files, named)) => mcp::load(files, *named),
@@ -362,13 +393,6 @@ impl Fa {
       eprintln!("{note}");
     }
 
-    let mut session = match session {
-      Some(session) => session,
-      None => Session::new(self.setup.store.as_ref(), &cwd, &label(&cfg)),
-    };
-    if self.setup.store.is_none() {
-      session.disable_persistence();
-    }
     cfg.compaction.context_window = self.window(&cfg.model).await;
     let agents = agent::build_agents(&cfg, &cwd, &host, &servers).map_err(failed)?;
     let id = session.id.clone();
@@ -392,8 +416,12 @@ impl Fa {
     Ok(id)
   }
 
-  async fn new_session(&self, request: NewSessionRequest) -> Result<NewSessionResponse, Error> {
-    let id = self.open(request.cwd, request.mcp_servers, None).await?;
+  async fn new_session(
+    &self,
+    request: NewSessionRequest,
+    cx: &ConnectionTo<Client>,
+  ) -> Result<NewSessionResponse, Error> {
+    let id = self.open(request.cwd, request.mcp_servers, None, cx).await?;
     let options = self.options_of(&id).await?;
     Ok(NewSessionResponse::new(id).config_options(options))
   }
@@ -406,7 +434,7 @@ impl Fa {
     cx: &ConnectionTo<Client>,
   ) -> Result<LoadSessionResponse, Error> {
     let session = self.saved(&request.session_id)?;
-    let id = self.open(request.cwd, request.mcp_servers, Some(session)).await?;
+    let id = self.open(request.cwd, request.mcp_servers, Some(session), cx).await?;
     let live = self.live(&request.session_id)?;
     {
       let state = live.state.lock().await;
@@ -419,9 +447,13 @@ impl Fa {
   }
 
   /// The same, for an editor that already has the conversation on screen.
-  async fn resume_session(&self, request: ResumeSessionRequest) -> Result<ResumeSessionResponse, Error> {
+  async fn resume_session(
+    &self,
+    request: ResumeSessionRequest,
+    cx: &ConnectionTo<Client>,
+  ) -> Result<ResumeSessionResponse, Error> {
     let session = self.saved(&request.session_id)?;
-    let id = self.open(request.cwd, request.mcp_servers, Some(session)).await?;
+    let id = self.open(request.cwd, request.mcp_servers, Some(session), cx).await?;
     let options = self.options_of(&id).await?;
     Ok(ResumeSessionResponse::new().config_options(options))
   }
@@ -674,6 +706,82 @@ fn quoted(word: &str) -> String {
   match !word.is_empty() && word.chars().all(plain) {
     true => word.to_string(),
     false => format!("'{}'", word.replace('\'', r"'\''")),
+  }
+}
+
+// ---------------------------------------------------------------- forms
+
+/// Where the forms a session's servers send go: to the editor, as an
+/// elicitation of that session, and what it answers is what the server is
+/// told. An editor that fails to answer at all is the user walking away.
+#[cfg(feature = "mcp")]
+fn elicitation(cx: ConnectionTo<Client>, id: SessionId) -> crate::elicit::Forward {
+  use agent_client_protocol::schema::v1::{CreateElicitationRequest, ElicitationFormMode, ElicitationSessionScope};
+  use rmcp::model::{ElicitResult, ElicitationAction};
+
+  Arc::new(move |server, message, schema| {
+    let (cx, id) = (cx.clone(), id.clone());
+    Box::pin(async move {
+      let Some(schema) = form(&schema) else {
+        eprintln!("MCP {server}: sent a form that could not be put to the editor");
+        return ElicitResult::new(ElicitationAction::Cancel);
+      };
+      let mode = ElicitationFormMode::new(ElicitationSessionScope::new(id), schema);
+      let request = CreateElicitationRequest::new(mode, format!("{server} is asking: {message}"));
+      match cx.send_request(request).block_task().await {
+        Ok(response) => answer(response.action),
+        Err(err) => {
+          eprintln!("MCP {server}: its form went unanswered: {err}");
+          ElicitResult::new(ElicitationAction::Cancel)
+        }
+      }
+    })
+  })
+}
+
+/// A server's form as the editor is sent it. The two protocols write a form
+/// the same way, but for a choice whose values are named in `enumNames`
+/// beside them, which MCP keeps for the servers that still send one and ACP
+/// never had: it becomes the titled options both of them know.
+#[cfg(feature = "mcp")]
+fn form(schema: &rmcp::model::ElicitationSchema) -> Option<agent_client_protocol::schema::v1::ElicitationSchema> {
+  let mut schema = serde_json::to_value(schema).ok()?;
+  if let Some(properties) = schema.get_mut("properties").and_then(|it| it.as_object_mut()) {
+    for property in properties.values_mut().filter_map(|it| it.as_object_mut()) {
+      let (Some(serde_json::Value::Array(values)), Some(serde_json::Value::Array(names))) =
+        (property.get("enum"), property.get("enumNames"))
+      else {
+        continue;
+      };
+      if values.len() != names.len() {
+        continue;
+      }
+      let titled = values.iter().zip(names);
+      let options: Vec<_> = titled
+        .map(|(value, title)| serde_json::json!({ "const": value, "title": title }))
+        .collect();
+      property.remove("enum");
+      property.remove("enumNames");
+      property.insert("oneOf".into(), options.into());
+    }
+  }
+  serde_json::from_value(schema).ok()
+}
+
+/// What the editor answered, as the server is told it. An answer of a kind
+/// this does not know is no answer.
+#[cfg(feature = "mcp")]
+fn answer(action: agent_client_protocol::schema::v1::ElicitationAction) -> rmcp::model::ElicitResult {
+  use agent_client_protocol::schema::v1::ElicitationAction as Answered;
+  use rmcp::model::{ElicitResult, ElicitationAction};
+
+  match action {
+    Answered::Accept(accepted) => match serde_json::to_value(accepted.content.unwrap_or_default()) {
+      Ok(content) => ElicitResult::new(ElicitationAction::Accept).with_content(content),
+      Err(_) => ElicitResult::new(ElicitationAction::Cancel),
+    },
+    Answered::Decline => ElicitResult::new(ElicitationAction::Decline),
+    _ => ElicitResult::new(ElicitationAction::Cancel),
   }
 }
 
@@ -1288,5 +1396,67 @@ mod tests {
     assert_eq!(quoted("npx"), "npx");
     assert_eq!(quoted("it's here"), r"'it'\''s here'");
     assert_eq!(quoted(""), "''");
+  }
+
+  #[cfg(feature = "mcp")]
+  #[test]
+  fn a_servers_form_reaches_the_editor_with_its_choices_titled() {
+    use agent_client_protocol::schema::v1::ElicitationPropertySchema;
+
+    let schema: rmcp::model::ElicitationSchema = serde_json::from_value(serde_json::json!({
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "title": "Name", "minLength": 1 },
+        "age": { "type": "integer", "minimum": 0 },
+        "colour": { "type": "string", "enum": ["r", "g"], "enumNames": ["Red", "Green"] },
+        "size": { "type": "string", "enum": ["s", "l"] },
+        "tags": { "type": "array", "items": { "type": "string", "enum": ["a", "b"] } },
+      },
+      "required": ["name"],
+    }))
+    .unwrap();
+    let form = form(&schema).unwrap();
+    assert_eq!(form.required.as_deref(), Some(&["name".to_string()][..]));
+    let ElicitationPropertySchema::String(name) = &form.properties["name"] else {
+      panic!("a string: {:?}", form.properties["name"]);
+    };
+    assert_eq!((name.title.as_deref(), name.min_length), (Some("Name"), Some(1)));
+    assert!(matches!(form.properties["age"], ElicitationPropertySchema::Integer(_)));
+    assert!(matches!(form.properties["tags"], ElicitationPropertySchema::Array(_)));
+    let ElicitationPropertySchema::String(colour) = &form.properties["colour"] else {
+      panic!("a choice: {:?}", form.properties["colour"]);
+    };
+    let options = colour.one_of.as_deref().unwrap_or_default();
+    let options: Vec<_> = options
+      .iter()
+      .map(|it| (it.value.as_str(), it.title.as_str()))
+      .collect();
+    assert_eq!(options, [("r", "Red"), ("g", "Green")]);
+    assert_eq!(colour.enum_values, None);
+    let ElicitationPropertySchema::String(size) = &form.properties["size"] else {
+      panic!("a choice: {:?}", form.properties["size"]);
+    };
+    assert_eq!(size.enum_values, Some(vec!["s".to_string(), "l".to_string()]));
+  }
+
+  #[cfg(feature = "mcp")]
+  #[test]
+  fn what_the_editor_answers_is_what_the_server_is_told() {
+    use agent_client_protocol::schema::v1::{ElicitationAcceptAction, ElicitationAction as Answered};
+    use rmcp::model::ElicitationAction;
+
+    let content = std::collections::BTreeMap::from([
+      ("name".to_string(), "fa".into()),
+      ("age".to_string(), 3.into()),
+      ("tags".to_string(), vec!["a"].into()),
+    ]);
+    let accepted = answer(Answered::Accept(ElicitationAcceptAction::new().content(content)));
+    assert_eq!(accepted.action, ElicitationAction::Accept);
+    assert_eq!(
+      accepted.content,
+      Some(serde_json::json!({ "name": "fa", "age": 3, "tags": ["a"] }))
+    );
+    assert_eq!(answer(Answered::Decline).action, ElicitationAction::Decline);
+    assert_eq!(answer(Answered::Cancel).action, ElicitationAction::Cancel);
   }
 }
