@@ -4,6 +4,9 @@
 //! What to say is read off the request rather than counted, so a test can
 //! hand it any history it likes:
 //!
+//! - a conversation that ends with the assistant's own words gets them
+//!   carried on, as a local server takes a trailing assistant message for
+//!   the start of its answer;
 //! - a conversation that already holds a tool's answer gets a thought and a
 //!   reply about it;
 //! - `run it` gets a `bash` call that echoes `hello from mock`;
@@ -144,7 +147,14 @@ fn openai(stream: &mut TcpStream, body: &Value) -> std::io::Result<()> {
     ]
   };
 
-  let events = if messages.iter().any(|message| message["role"] == "tool") {
+  let events = if let Some(said) = messages.last().filter(|message| message["role"] == "assistant") {
+    let carried = format!("{} — carried on.", said["content"].as_str().unwrap_or_default());
+    vec![
+      chunk(json!({ "role": "assistant", "content": carried }), None),
+      chunk(json!({}), Some("stop")),
+      usage(1, 1),
+    ]
+  } else if messages.iter().any(|message| message["role"] == "tool") {
     vec![
       chunk(
         json!({ "role": "assistant", "reasoning_content": "The tool has answered." }),

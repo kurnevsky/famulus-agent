@@ -874,9 +874,7 @@ async fn run(
       return Some(Stop::Paused);
     }
 
-    let mut chat = Vec::with_capacity(history.len() + made.len());
-    chat.extend_from_slice(history);
-    chat.extend(made.iter().cloned());
+    let chat: Vec<Message> = history.iter().chain(made.iter()).filter_map(shown).collect();
 
     // Weighed before it is sent rather than once the answer comes back: a
     // tool can return a file the size of the window, and the request
@@ -1140,6 +1138,28 @@ impl Partial {
     // the way a turn written by hand does.
     (!content.is_empty()).then(|| Message::Assistant(AssistantMessage::new(content)))
   }
+}
+
+/// `message` as the model is shown it, or nothing if it has nothing left to
+/// show.
+///
+/// A turn that was cut off has no origin, and its thinking is kept for the
+/// transcript and no further. A provider replays a turn of no origin as
+/// another model's, with its thinking as plain text: the model would read
+/// its own abandoned thoughts as something it had said, and — with the turn
+/// last, where a provider carries it on — go on thinking out loud. A turn
+/// that was nothing but thinking goes altogether, so `/continue` asks for
+/// the answer afresh.
+fn shown(message: &Message) -> Option<Message> {
+  let Message::Assistant(turn) = message else {
+    return Some(message.clone());
+  };
+  if turn.origin.is_some() || !turn.content.iter().any(|c| matches!(c, AssistantContent::Reasoning(_))) {
+    return Some(message.clone());
+  }
+  let mut turn = turn.clone();
+  turn.content.retain(|c| !matches!(c, AssistantContent::Reasoning(_)));
+  (!turn.content.is_empty()).then_some(Message::Assistant(turn))
 }
 
 /// A call answered without being run.
@@ -1998,6 +2018,60 @@ mod tests {
       failure.contains("/nonexistent/file") && failure.contains("No such file"),
       "model should see the real reason: {failure}"
     );
+  }
+
+  /// A run stopped mid-thought and picked back up with `/continue` thinks
+  /// afresh: what it had been thinking is not sent as words it said, which
+  /// a provider would carry on as the answer.
+  #[tokio::test]
+  async fn mock_continue_after_a_cut_off_thought() {
+    let thinking = MockStreamEvent::ReasoningDelta {
+      id: "r1".to_string(),
+      reasoning: "Where to look".to_string(),
+    };
+    let cut = stop_at(
+      scripted(vec![vec![thinking]], true),
+      Control::default(),
+      "hi",
+      |event| matches!(event, AgentEvent::Reasoning(_)),
+    )
+    .await;
+    assert_eq!(shapes(&cut), ["user hi", "thought \"Where to look\""]);
+
+    let base_url = crate::mock::Mock::start().openai_url();
+    let cfg = Config {
+      provider: Provider::OpenAi,
+      base_url: Some(base_url),
+      api_key: "test".into(),
+      model: "mock".into(),
+      system_prompt: None,
+      max_tokens: None,
+      compaction: TEST_SETTINGS,
+      vision: true,
+      tools: Default::default(),
+    };
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let agent = build_agents(&cfg, Path::new("/tmp"), &Host::new(tx.clone()), &Default::default())
+      .unwrap()
+      .runtime;
+    let handle = start_run(agent, Control::default(), cut, Vec::new(), tx);
+    let mut text = String::new();
+    let made = loop {
+      let event = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+        .await
+        .expect("an event within 10s")
+        .expect("the channel open");
+      match event {
+        AgentEvent::Text(said) => text.push_str(&said),
+        AgentEvent::Done { messages } => break messages,
+        AgentEvent::Ended { .. } => panic!("the run ended short: {text:?}"),
+        _ => {}
+      }
+    };
+    handle.await.expect("the run to finish");
+    // The system prompt and the question, and nothing after them.
+    assert_eq!(text, "Hello there! I see 2 messages in history.");
+    assert_eq!(shapes(&made), ["said \"Hello there! I see 2 messages in history.\""]);
   }
 
   #[tokio::test]
