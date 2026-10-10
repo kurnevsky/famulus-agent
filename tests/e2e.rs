@@ -7,8 +7,7 @@
 //!
 //! tmux does the terminal emulation, so what `capture-pane` returns is what a
 //! person would have seen — wrapping, overwriting and all. Without tmux
-//! installed the tests skip rather than fail, like the mock-server test in
-//! `src/agent.rs`.
+//! installed the tests skip rather than fail.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -796,10 +795,11 @@ impl Term {
   fn overlay(&self) -> (Vec<String>, usize) {
     let screen = self.screen();
     let lines: Vec<&str> = screen.lines().collect();
-    // Every overlay says how to leave it, on its top border.
+    // Every overlay says how to leave it, on its top border — or how to go
+    // back to the one it was opened from.
     let top = lines
       .iter()
-      .position(|line| line.contains("Esc cancel"))
+      .position(|line| line.contains("Esc cancel") || line.contains("Esc back"))
       .unwrap_or_else(|| panic!("an open overlay:\n{screen}"));
     let bottom = lines[top..]
       .iter()
@@ -2658,6 +2658,72 @@ fn a_context_full_of_a_single_turn_stops_rather_than_compacting_forever() {
   // not, and it is the model's own next step rather than another summary.
   term.submit("/continue");
   term.wait_for("all done");
+}
+
+/// `/mcp` goes from the servers to what one of them offers to what one of its
+/// tools takes, and `Esc` comes back up the way it went down.
+#[test]
+#[cfg(feature = "mcp")]
+fn mcp_browses_servers_then_tools_then_what_a_tool_takes() {
+  if !have_tmux() || !have_python() {
+    return;
+  }
+  let dir = scratch("mcp-browse");
+  let server = dir.join("server.py");
+  std::fs::write(&server, MCP_SERVER).expect("a server to run");
+  let config = dir.join("mcp.toml");
+  std::fs::write(
+    &config,
+    format!(
+      "[weather]\ncommand = \"python3 '{}' prompts\"\ntimeout = 10\ntools = [\"weather\", \"flood\", \"book\"]\n",
+      server.display()
+    ),
+  )
+  .expect("a config to read");
+  let provider = Provider::start(vec![]);
+  let term = Term::start(
+    "mcp-browse",
+    &provider,
+    &["--no-session", "--mcp-config", &shell(&config)],
+  );
+  term.wait_for("MCP weather: 3 tools");
+
+  term.submit("/mcp");
+  term.wait_for("Enter tools");
+  let (rows, on) = term.overlay();
+  assert!(
+    rows[on].contains("weather") && rows[on].contains("3 tools · 2 prompts"),
+    "{rows:?}"
+  );
+
+  // A server's tools, each with what it says it does.
+  term.type_in("Enter");
+  term.wait_for("Enter details");
+  term.wait_for("More than anyone asked for.");
+  let (rows, _) = term.overlay();
+  let listed = rows.iter().filter(|row| !row.trim_start_matches('│').trim().is_empty());
+  assert_eq!(listed.count(), 3, "only the tools the table kept: {rows:?}");
+
+  // One tool, whole: what it does and what it takes.
+  term.choose("flood");
+  let screen = term.wait_for("Arguments");
+  assert!(screen.contains("weather · flood"), "{screen}");
+  assert!(screen.contains("lines  integer  required"), "{screen}");
+
+  // Back to the tools, on the one that was opened; then to the servers.
+  term.type_in("Escape");
+  term.wait_for("Enter details");
+  let (rows, on) = term.overlay();
+  assert!(rows[on].contains("flood"), "{rows:?}");
+  term.type_in("Escape");
+  term.wait_for("Enter tools");
+  term.type_in("Escape");
+  term.settle();
+  assert!(
+    !term.screen().contains("Enter tools"),
+    "the list is gone:\n{}",
+    term.screen()
+  );
 }
 
 /// MCP is a feature, and a build without it is a build with four tools and no

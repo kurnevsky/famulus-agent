@@ -2,6 +2,7 @@
 //! one-line footer.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -33,6 +34,7 @@ use tokio::task::JoinHandle;
 use crate::agent::{self, AgentEvent, Agents, ModelInfo, start_compaction, start_run};
 use crate::attach::{self, Prompt, Token};
 use crate::compaction::{DEFAULT_CONTEXT_WINDOW, estimate_tokens};
+use crate::mcp::{Listing, ToolListing};
 use crate::modal::Modal;
 use crate::session::{Node, NodeKind, Outcome, Session, SessionInfo, Store};
 use crate::theme::theme;
@@ -226,6 +228,7 @@ const COMMANDS: &[(&str, &str, bool)] = &[
   ("continue", "Resume the loop without a new message", false),
   ("fork", "Start a new session from an earlier message", false),
   ("goto", "Scroll to an earlier prompt", false),
+  ("mcp", "Browse MCP servers, their tools and what the tools take", false),
   ("model", "Choose the model, or name one: /model <id>", true),
   ("name", "Set session display name", true),
   ("new", "Start a new session", false),
@@ -306,6 +309,9 @@ struct Overlay {
   /// waiting to be confirmed. What either list deletes is gone for good, so
   /// it is asked about first.
   confirming: bool,
+  /// The list this one was opened from, as it was left, for `Esc` to go back
+  /// to rather than closing the lot.
+  back: Option<Box<Overlay>>,
 }
 
 /// The query a list is being narrowed by, and what it leaves.
@@ -359,6 +365,21 @@ enum OverlayList {
   Models(Vec<ModelInfo>),
   /// `/goto`: the prompts on screen, to scroll the transcript to one of them.
   Goto(Vec<Mark>),
+  /// `/mcp`: the servers that came up, to look through what each offers.
+  Servers(Vec<Listing>),
+  /// The tools one of them offers.
+  Tools(Listing),
+  /// One of those tools, read whole. Not a list: what is said about it is
+  /// prose that wraps to the width it is drawn at, so it is laid out as it is
+  /// drawn, and the keys that move through a list scroll it instead.
+  Tool {
+    server: String,
+    tool: ToolListing,
+    /// Rows scrolled past.
+    scroll: usize,
+    /// The most there is to scroll past, as the last draw laid it out.
+    room: Cell<usize>,
+  },
 }
 
 impl OverlayList {
@@ -379,6 +400,11 @@ impl OverlayList {
       // itself.
       OverlayList::Models(models) => models.iter().map(|m| Cow::Borrowed(m.id.as_str())).collect(),
       OverlayList::Goto(marks) => marks.iter().map(|m| Cow::Borrowed(m.label.as_str())).collect(),
+      OverlayList::Servers(servers) => servers.iter().map(|s| Cow::Borrowed(s.server.as_str())).collect(),
+      // Names alone: a description is too long to be worth matching, and
+      // would rank a tool for the words it happens to use.
+      OverlayList::Tools(listing) => listing.tools.iter().map(|t| Cow::Borrowed(t.name.as_str())).collect(),
+      OverlayList::Tool { .. } => Vec::new(),
     }
   }
 
@@ -424,7 +450,14 @@ impl Overlay {
       list,
       selected,
       confirming: false,
+      back: None,
     }
+  }
+
+  /// This list, opened from `parent`.
+  fn over(mut self, parent: Overlay) -> Self {
+    self.back = Some(Box::new(parent));
+    self
   }
 
   /// Rows the list is showing, which is what the filter left of it.
@@ -458,6 +491,11 @@ impl Overlay {
       OverlayList::Fork(_) => " Fork — ↑↓ PgUp/PgDn select · Enter fork · Esc cancel ".into(),
       OverlayList::Models(_) => " Model — ↑↓ select · Enter use · Esc cancel ".into(),
       OverlayList::Goto(_) => " Go to — ↑↓ PgUp/PgDn select · Enter scroll there · Esc cancel ".into(),
+      OverlayList::Servers(_) => " MCP — ↑↓ select · Enter tools · Esc cancel ".into(),
+      OverlayList::Tools(listing) => format!(" {} — ↑↓ PgUp/PgDn select · Enter details · Esc back ", listing.server),
+      OverlayList::Tool { server, tool, .. } => {
+        format!(" {server} · {} — ↑↓ PgUp/PgDn scroll · Esc back ", tool.name)
+      }
     }
   }
 }
@@ -1470,12 +1508,15 @@ impl App {
   }
 
   fn handle_overlay_key(&mut self, key: KeyEvent, ctrl: bool) {
+    if self.handle_reading_key(key.code, ctrl) {
+      return;
+    }
     let len = self.overlay.as_ref().map_or(0, Overlay::len);
     if self.handle_delete_key(key.code, ctrl) {
       return;
     }
     match key.code {
-      KeyCode::Esc => self.overlay = None,
+      KeyCode::Esc => self.close_overlay(),
       KeyCode::Char('c') if ctrl => self.quit = true,
       KeyCode::Up => {
         if let Some(o) = &mut self.overlay {
@@ -1510,6 +1551,22 @@ impl App {
         let Some(at) = overlay.at() else {
           return;
         };
+        // Looking into what a server offers goes a level down, and leaves
+        // the list it came from as it was, for `Esc` to come back up to.
+        let deeper = match &overlay.list {
+          OverlayList::Servers(servers) => servers.get(at).map(|listing| OverlayList::Tools(listing.clone())),
+          OverlayList::Tools(listing) => listing.tools.get(at).map(|tool| OverlayList::Tool {
+            server: listing.server.clone(),
+            tool: tool.clone(),
+            scroll: 0,
+            room: Cell::new(0),
+          }),
+          _ => None,
+        };
+        if let Some(list) = deeper {
+          self.overlay = Some(Overlay::new(list, 0).over(overlay));
+          return;
+        }
         match overlay.list {
           OverlayList::Sessions(sessions) => {
             if let Some(info) = sessions.get(at) {
@@ -1535,6 +1592,38 @@ impl App {
       // is holding the query.
       _ => self.handle_filter_key(key),
     }
+  }
+
+  /// Close the list on screen, back to the one it was opened from if it was
+  /// opened from one.
+  fn close_overlay(&mut self) {
+    self.overlay = self.overlay.take().and_then(|overlay| overlay.back).map(|back| *back);
+  }
+
+  /// The keys of a tool being read, answering whether one was up: there is
+  /// nothing to pick in it and no query to narrow it by, so every key is its
+  /// own, and the ones that move through a list scroll it.
+  fn handle_reading_key(&mut self, code: KeyCode, ctrl: bool) -> bool {
+    let Some(Overlay {
+      list: OverlayList::Tool { scroll, room, .. },
+      ..
+    }) = &mut self.overlay
+    else {
+      return false;
+    };
+    let room = room.get();
+    match code {
+      KeyCode::Up => *scroll = scroll.saturating_sub(1),
+      KeyCode::Down => *scroll = (*scroll + 1).min(room),
+      KeyCode::PageUp => *scroll = scroll.saturating_sub(OVERLAY_PAGE),
+      KeyCode::PageDown => *scroll = (*scroll + OVERLAY_PAGE).min(room),
+      KeyCode::Home => *scroll = 0,
+      KeyCode::End => *scroll = room,
+      KeyCode::Esc => self.close_overlay(),
+      KeyCode::Char('c') if ctrl => self.quit = true,
+      _ => {}
+    }
+    true
   }
 
   /// A key the list did not claim, which is the query's.
@@ -1984,6 +2073,7 @@ impl App {
       }
       "/session" => self.session_info(),
       "/goto" => self.open_marks(),
+      "/mcp" => self.open_servers(),
       t if t == "/model" || t.starts_with("/model ") => {
         let named = t["/model".len()..].trim().to_string();
         match named.is_empty() {
@@ -2259,6 +2349,20 @@ impl App {
     }
     let selected = marks.len() - 1;
     self.overlay = Some(Overlay::new(OverlayList::Goto(marks), selected));
+  }
+
+  /// List the MCP servers, to look through what each of them offers.
+  ///
+  /// Taken from the catalog as it is now, so a server whose tools changed
+  /// since is shown as it changed. Nothing here touches the session, which
+  /// is why it is open while a run is going.
+  fn open_servers(&mut self) {
+    let servers = self.catalog.listings();
+    if servers.is_empty() {
+      self.notify("No MCP servers are connected.");
+      return;
+    }
+    self.overlay = Some(Overlay::new(OverlayList::Servers(servers), 0));
   }
 
   /// Scroll the transcript so the prompt at `entry` is at the top of it.
@@ -2748,7 +2852,15 @@ impl App {
       theme().ui.border
     };
     let mut block = frame(border_color);
-    if let Some(filter) = self.overlay.as_mut().filter(|_| filtering).map(|o| &mut o.filter) {
+    let reading = self
+      .overlay
+      .as_ref()
+      .is_some_and(|o| matches!(o.list, OverlayList::Tool { .. }));
+    if filtering && reading {
+      // A tool being read has nothing to narrow, and the prompt the box is
+      // holding is not what the keys go to.
+      f.render_widget(block, input_area);
+    } else if let Some(filter) = self.overlay.as_mut().filter(|_| filtering).map(|o| &mut o.filter) {
       filter.field.set_block(block.title(" filter "));
       f.render_widget(&filter.field, input_area);
     } else {
@@ -2987,6 +3099,18 @@ impl App {
     let block = frame(theme().ui.border).title(overlay.title());
     let inner = block.inner(area);
     f.render_widget(block, area);
+    if let OverlayList::Tool { tool, scroll, room, .. } = &overlay.list {
+      let lines = tool_lines(tool, inner.width);
+      room.set(lines.len().saturating_sub(inner.height as usize));
+      // Clamped here as well as where it is scrolled: a terminal grown
+      // taller since has less to scroll past.
+      let first = (*scroll).min(room.get());
+      f.render_widget(
+        Paragraph::new(lines).scroll((u16::try_from(first).unwrap_or(u16::MAX), 0)),
+        inner,
+      );
+      return;
+    }
     let height = inner.height as usize;
     let width = inner.width as usize;
     // Only the rows the filter left, which is all of them until something is
@@ -2999,6 +3123,11 @@ impl App {
       OverlayList::Models(_) => "  No model matches.",
       OverlayList::Sessions(_) => "  No session matches.",
       OverlayList::Goto(_) => "  No prompt matches.",
+      OverlayList::Servers(_) => "  No server matches.",
+      // A server can come up with nothing for the model to call — prompts
+      // or resources only, or every tool narrowed away by its table.
+      OverlayList::Tools(listing) if listing.tools.is_empty() => "  It offers no tools.",
+      OverlayList::Tools(_) => "  No tool matches.",
       _ => "  No point matches.",
     });
     if let Some(text) = emptied {
@@ -3075,6 +3204,28 @@ impl App {
           (format!("{}{}", model.id, if here { "  (in use)" } else { "" }), note)
         })
         .collect(),
+      OverlayList::Servers(servers) => shown
+        .iter()
+        .filter_map(|(at, _)| servers.get(*at))
+        .map(|listing| {
+          let mut note = vec![counted(listing.tools.len(), "tool")];
+          if listing.prompts > 0 {
+            note.push(counted(listing.prompts, "prompt"));
+          }
+          if listing.resources {
+            note.push("resources".into());
+          }
+          (listing.server.clone(), note.join(" · "))
+        })
+        .collect(),
+      // What a tool does, as far as half the row lets it say: enough to
+      // tell two tools apart, with the rest for `Enter` to show.
+      OverlayList::Tools(listing) => shown
+        .iter()
+        .filter_map(|(at, _)| listing.tools.get(*at))
+        .map(|tool| (tool.name.clone(), clipped(&first_line(&tool.description), width / 2)))
+        .collect(),
+      OverlayList::Tool { .. } => Vec::new(),
     };
     let dim = Style::default().add_modifier(Modifier::DIM);
     let mut lines = Vec::new();
@@ -5076,6 +5227,76 @@ fn point(session: &Session, node: &Node, depth: usize) -> Option<Point> {
 }
 
 /// `1 message` or `4 messages`.
+/// `n` of `what`, in the plural unless there is one.
+fn counted(n: usize, what: &str) -> String {
+  match n {
+    1 => format!("1 {what}"),
+    n => format!("{n} {what}s"),
+  }
+}
+
+/// `text` cut to `most` characters, with an ellipsis where it was cut.
+fn clipped(text: &str, most: usize) -> String {
+  match text.chars().count() > most {
+    true => {
+      let mut cut: String = text.chars().take(most.saturating_sub(1)).collect();
+      cut.push('…');
+      cut
+    }
+    false => text.to_string(),
+  }
+}
+
+/// What `/mcp` says about one tool, laid out at `width`: the name it gives
+/// itself, what it does, and then each argument — its name and what it is,
+/// whether it must be given, and what it is for.
+///
+/// Descriptions are markdown as often as not, written for a model to read,
+/// so they are rendered the way an answer is.
+fn tool_lines(tool: &ToolListing, width: u16) -> Vec<Line<'static>> {
+  let dim = Style::default().fg(theme().ui.muted);
+  let render = |text: &str, width: u16| crate::markdown::render(&crate::markdown::printable(text), width, false);
+  let mut lines = Vec::new();
+  if let Some(title) = &tool.title {
+    lines.push(Line::from(Span::styled(title.clone(), Style::default().bold())));
+    lines.push(Line::default());
+  }
+  match tool.description.is_empty() {
+    true => lines.push(Line::from(Span::styled("It says nothing of what it does.", dim))),
+    false => lines.extend(render(&tool.description, width)),
+  }
+  lines.push(Line::default());
+  if tool.arguments.is_empty() {
+    lines.push(Line::from(Span::styled("It takes no arguments.", dim)));
+    return lines;
+  }
+  lines.push(Line::from(Span::styled("Arguments", Style::default().bold())));
+  const INDENT: &str = "    ";
+  for argument in &tool.arguments {
+    lines.push(Line::default());
+    let mut head = vec![
+      Span::raw("  "),
+      Span::styled(argument.name.clone(), Style::default().fg(theme().ui.accent).bold()),
+      Span::raw("  "),
+      Span::raw(argument.kind.clone()),
+    ];
+    if argument.required {
+      head.push(Span::styled("  required", Style::default().fg(theme().ui.warning)));
+    }
+    if let Some(default) = &argument.default {
+      head.push(Span::styled(format!("  default {default}"), dim));
+    }
+    lines.extend(crate::markdown::wrap_line(Line::from(head), width));
+    let room = width.saturating_sub(INDENT.len() as u16).max(1);
+    lines.extend(render(&argument.description, room).into_iter().map(|line| {
+      let mut spans = vec![Span::raw(INDENT)];
+      spans.extend(line.spans);
+      Line::from(spans).style(line.style)
+    }));
+  }
+  lines
+}
+
 fn messages(n: usize) -> String {
   match n {
     1 => "1 message".into(),
@@ -5567,6 +5788,64 @@ mod tests {
     // the letters the row draws: two spaces, then I-t, and p a space later.
     let matched = list.filter(&mut matcher, "itp");
     assert_eq!(matched[0].1, [2, 3, 5]);
+  }
+
+  #[test]
+  fn a_tool_is_read_with_each_argument_and_what_it_is_for() {
+    let tool = ToolListing {
+      name: "search".into(),
+      title: Some("Search notes".into()),
+      description: "Find notes by **text**.".into(),
+      arguments: vec![
+        crate::mcp::Argument {
+          name: "query".into(),
+          kind: "string".into(),
+          required: true,
+          default: None,
+          description: "What to look for.".into(),
+        },
+        crate::mcp::Argument {
+          name: "limit".into(),
+          kind: "integer".into(),
+          required: false,
+          default: Some("10".into()),
+          description: String::new(),
+        },
+      ],
+    };
+    let text: Vec<String> = tool_lines(&tool, 60)
+      .iter()
+      .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+      .collect();
+    assert_eq!(
+      text,
+      [
+        "Search notes",
+        "",
+        "Find notes by text.",
+        "",
+        "Arguments",
+        "",
+        "  query  string  required",
+        "    What to look for.",
+        "",
+        "  limit  integer  default 10",
+      ]
+    );
+    let bare = ToolListing {
+      name: "ping".into(),
+      title: None,
+      description: String::new(),
+      arguments: Vec::new(),
+    };
+    let text: Vec<String> = tool_lines(&bare, 60).iter().map(|line| line.to_string()).collect();
+    assert_eq!(text, ["It says nothing of what it does.", "", "It takes no arguments."]);
+  }
+
+  #[test]
+  fn a_long_note_is_cut_with_an_ellipsis() {
+    assert_eq!(clipped("short", 10), "short");
+    assert_eq!(clipped("a much longer note", 7), "a much…");
   }
 
   #[test]

@@ -270,6 +270,24 @@ impl Catalog {
     (0, 0)
   }
 
+  /// What each server offers, in the order the file names them, for `/mcp`
+  /// to look through.
+  pub fn listings(&self) -> Vec<Listing> {
+    #[cfg(feature = "mcp")]
+    return self
+      .offers()
+      .iter()
+      .map(|offer| Listing {
+        server: offer.server.clone(),
+        tools: offer.tools.iter().map(ToolListing::of).collect(),
+        prompts: offer.prompts.as_ref().map_or(0, Vec::len),
+        resources: offer.resources.as_ref().is_some(),
+      })
+      .collect();
+    #[cfg(not(feature = "mcp"))]
+    Vec::new()
+  }
+
   /// Every tool the servers offer, and the two that read what they hold
   /// when one of them holds anything, for a list that names tools without
   /// knowing where each came from.
@@ -656,6 +674,124 @@ impl Catalog {
         Err(err) => offer.resources.get_or_insert_default().failed = Some(err),
       }
     }
+  }
+}
+
+/// One server as `/mcp` shows it: the tools it offers, and how much else it
+/// has besides.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Listing {
+  pub server: String,
+  /// Narrowed to what its table asked for, since those are the tools the
+  /// model is given.
+  pub tools: Vec<ToolListing>,
+  pub prompts: usize,
+  /// Whether it said it has resources to read.
+  pub resources: bool,
+}
+
+/// One tool as `/mcp` shows it: its name, what it says it does, and what it
+/// takes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolListing {
+  pub name: String,
+  /// The name it gives itself for a person to read, where that is not the
+  /// one it is called by.
+  pub title: Option<String>,
+  pub description: String,
+  /// In the order its schema declares them.
+  pub arguments: Vec<Argument>,
+}
+
+/// One argument of a tool, read out of its input schema.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Argument {
+  pub name: String,
+  /// What the schema says it is: a type, the values it may be, or `any`.
+  pub kind: String,
+  pub required: bool,
+  /// What it is taken to be when it is left out, as JSON.
+  pub default: Option<String>,
+  pub description: String,
+}
+
+#[cfg(feature = "mcp")]
+impl ToolListing {
+  fn of(tool: &rmcp::model::Tool) -> Self {
+    let schema = &*tool.input_schema;
+    let required: Vec<&str> = schema
+      .get("required")
+      .and_then(serde_json::Value::as_array)
+      .into_iter()
+      .flatten()
+      .filter_map(serde_json::Value::as_str)
+      .collect();
+    let arguments = schema
+      .get("properties")
+      .and_then(serde_json::Value::as_object)
+      .into_iter()
+      .flatten()
+      .map(|(name, property)| Argument {
+        name: name.clone(),
+        kind: kind(property),
+        required: required.contains(&name.as_str()),
+        default: property.get("default").map(serde_json::Value::to_string),
+        description: text_of(property.get("description")),
+      })
+      .collect();
+    Self {
+      name: tool.name.to_string(),
+      title: tool.title.clone().filter(|title| *title != tool.name),
+      description: tool.description.as_deref().unwrap_or_default().trim().to_string(),
+      arguments,
+    }
+  }
+}
+
+#[cfg(feature = "mcp")]
+fn text_of(value: Option<&serde_json::Value>) -> String {
+  value
+    .and_then(serde_json::Value::as_str)
+    .unwrap_or_default()
+    .trim()
+    .to_string()
+}
+
+/// What a schema says a value is, in a few words: the values it may be when
+/// it lists them, its type otherwise, and `any` when it says neither.
+#[cfg(feature = "mcp")]
+fn kind(schema: &serde_json::Value) -> String {
+  use serde_json::Value;
+
+  let alternatives = |options: &Vec<Value>| options.iter().map(kind).collect::<Vec<_>>().join(" | ");
+  if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+    return values.iter().map(Value::to_string).collect::<Vec<_>>().join(" | ");
+  }
+  if let Some(value) = schema.get("const") {
+    return value.to_string();
+  }
+  if let Some(options) = ["anyOf", "oneOf"]
+    .iter()
+    .find_map(|key| schema.get(*key).and_then(Value::as_array))
+  {
+    return alternatives(options);
+  }
+  if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+    return reference.rsplit('/').next().unwrap_or(reference).to_string();
+  }
+  let one = |name: &str| match (name, schema.get("items")) {
+    ("array", Some(items)) => format!("array of {}", kind(items)),
+    _ => name.to_string(),
+  };
+  match schema.get("type") {
+    Some(Value::String(name)) => one(name),
+    Some(Value::Array(names)) => names
+      .iter()
+      .filter_map(Value::as_str)
+      .map(one)
+      .collect::<Vec<_>>()
+      .join(" | "),
+    _ => "any".into(),
   }
 }
 
@@ -1236,6 +1372,53 @@ mod tests {
       hole(false).insert("my fa"),
       ("&\"gh:repo://my fa/\"".to_string(), false)
     );
+  }
+
+  #[cfg(feature = "mcp")]
+  #[test]
+  fn a_listing_reads_what_a_tool_takes_out_of_its_schema() {
+    let schema = serde_json::json!({
+      "type": "object",
+      "properties": {
+        "query": { "type": "string", "description": " What to look for. " },
+        "limit": { "type": "integer", "default": 10 },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "order": { "enum": ["asc", "desc"] },
+        "since": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+        "filter": { "$ref": "#/$defs/Filter" },
+        "anything": {},
+      },
+      "required": ["query"],
+    });
+    let serde_json::Value::Object(schema) = schema else {
+      unreachable!()
+    };
+    let mut tool = rmcp::model::Tool::new("search", "Search the notes.\n", std::sync::Arc::new(schema));
+    tool.title = Some("search".into());
+    let listing = ToolListing::of(&tool);
+    assert_eq!(listing.name, "search");
+    // A title that only says the name again is not worth saying twice.
+    assert_eq!(listing.title, None);
+    assert_eq!(listing.description, "Search the notes.");
+    let read: Vec<_> = listing
+      .arguments
+      .iter()
+      .map(|a| (a.name.as_str(), a.kind.as_str(), a.required, a.default.as_deref()))
+      .collect();
+    // In the order the schema declares them, not sorted.
+    assert_eq!(
+      read,
+      [
+        ("query", "string", true, None),
+        ("limit", "integer", false, Some("10")),
+        ("tags", "array of string", false, None),
+        ("order", "\"asc\" | \"desc\"", false, None),
+        ("since", "string | null", false, None),
+        ("filter", "Filter", false, None),
+        ("anything", "any", false, None),
+      ]
+    );
+    assert_eq!(listing.arguments[0].description, "What to look for.");
   }
 
   #[cfg(feature = "mcp")]

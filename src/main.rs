@@ -18,6 +18,8 @@ mod images;
 mod keyring;
 mod markdown;
 mod mcp;
+#[cfg(test)]
+mod mock;
 mod modal;
 #[cfg(feature = "mcp")]
 mod oauth;

@@ -346,6 +346,12 @@ cut to the two worth having without naming every tool of every other server.
 Saying nothing is everything, which is not the same as allowing everything by
 name: a tool the server offers later is kept by the one and not by the other.
 
+`/mcp` shows what came of it: the servers that came up, then the tools one of
+them offers — after `tools` and `except`, so the ones the model is given — and
+then a single tool, with its description and each argument's type, whether it
+is required, its default and what it is for. `Enter` goes a level down, `Esc`
+comes back up, and the lists filter as you type, as every other list does.
+
 A token is better kept out of the file it is used from, so `env-command`,
 `token-command` and `headers-command` take the line of shell that produces the
 value instead of the value — `pass show …`, `gh auth token`, `op read …`. A
@@ -1289,6 +1295,8 @@ comes back to say otherwise.
 - `src/clipboard.rs` – copying as an OSC 52 escape handed to the terminal,
   rather than as a call on the machine this runs on — which is what makes it
   work over ssh.
+- `src/mock.rs` – the provider `src/agent.rs`'s tests run the agent against:
+  OpenAI's chat completions and Gemini's `generateContent`, scripted.
 - `tests/e2e.rs` – the binary driven through tmux against a mock provider: a
   call written token by token and its output landing under it, pass and fail
   as the stripe beside each, an aborted run keeping its work and carrying on
@@ -1325,14 +1333,9 @@ be reading each other's. Without tmux installed these skip rather than fail.
 The ACP tests in the same file need no terminal: they start `fa --acp` with
 pipes for stdin and stdout and talk JSON-RPC to it the way an editor would.
 
-`src/agent.rs` also has end-to-end tests against a mock server, gated on an
-environment variable each: `FA_TEST_BASE_URL` for the OpenAI-compatible ones
-(streaming, tool calls, compaction, image input) and `FA_TEST_GEMINI_BASE_URL`
-for the Gemini image one. Unset, each test prints why and returns, so
-`cargo test` passes without them. The server is not part of the repository —
-point these at one you are running, answering as the provider would; the model
-is sent as `mock`.
-
-```sh
-FA_TEST_BASE_URL=http://127.0.0.1:8123/v1 cargo test
-```
+`src/agent.rs` also has end-to-end tests of the agent itself — streaming, tool
+calls, compaction, image input — against `src/mock.rs`, a provider that speaks
+OpenAI's chat completions and Gemini's `generateContent` on a port of its own.
+Each test starts one, so these need nothing running beside them. Like the
+mock in `tests/e2e.rs`, it reads what to answer off the request, and it refuses
+what the real provider would: an image inside a tool message.

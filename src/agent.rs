@@ -1277,7 +1277,6 @@ pub fn start_compaction(
 
 #[cfg(test)]
 mod tests {
-  //! Runs against a mock OpenAI-compatible server when `FA_TEST_BASE_URL` is set.
   use super::*;
   use rig_core::driver::{Exchange, Opened, Opening, Transport};
   use rig_core::test_utils::{MockFrame, MockScript, MockStreamEvent};
@@ -1856,10 +1855,7 @@ mod tests {
 
   #[tokio::test]
   async fn mock_end_to_end() {
-    let Ok(base_url) = std::env::var("FA_TEST_BASE_URL") else {
-      eprintln!("FA_TEST_BASE_URL not set; skipping");
-      return;
-    };
+    let base_url = crate::mock::Mock::start().openai_url();
     let cfg = Config {
       provider: Provider::OpenAi,
       base_url: Some(base_url),
@@ -2006,10 +2002,7 @@ mod tests {
 
   #[tokio::test]
   async fn mock_compaction() {
-    let Ok(base_url) = std::env::var("FA_TEST_BASE_URL") else {
-      eprintln!("FA_TEST_BASE_URL not set; skipping");
-      return;
-    };
+    let base_url = crate::mock::Mock::start().openai_url();
     let cfg = Config {
       provider: Provider::OpenAi,
       base_url: Some(base_url),
@@ -2036,15 +2029,20 @@ mod tests {
       Some(AgentEvent::Compacted(Some(compacted))) => compacted,
       other => panic!("expected Compacted event, got {other:?}"),
     };
-    assert!(compacted.summary.contains("Mock summary"), "{}", compacted.summary);
-    assert_eq!(compacted.summarized, 2);
-    assert_eq!(
-      compacted.kept,
-      [Message::user("second question"), Message::assistant("second answer")]
+    // A budget of one token keeps only the last answer, which cuts the
+    // second turn in two: the first turn is the checkpoint, and the
+    // question the answer was to is summarized as the start of its turn.
+    assert!(
+      compacted.summary.contains(crate::mock::SUMMARY),
+      "{}",
+      compacted.summary
     );
+    assert!(compacted.summary.contains("split turn"), "{}", compacted.summary);
+    assert_eq!(compacted.summarized, 3);
+    assert_eq!(compacted.kept, [Message::assistant("second answer")]);
 
-    // With a single turn left after the summary and a budget it fits in,
-    // there is nothing to compact.
+    // With only that answer left after the summary and a budget it fits
+    // in, there is nothing to compact.
     let roomy = Settings {
       keep_recent_tokens: 1000,
       ..TEST_SETTINGS
@@ -2059,12 +2057,14 @@ mod tests {
       panic!("expected nothing to compact");
     };
 
-    // A tight budget forces the remaining turn into the existing summary:
-    // the update path, which feeds the previous summary back to the model.
+    // A tight budget forces a whole turn into the existing summary: the
+    // update path, which feeds the previous summary back to the model.
     let history = vec![
       compaction::summary_message("## Goal\nOld summary"),
       Message::user("third question"),
       Message::assistant("third answer"),
+      Message::user("fourth question"),
+      Message::assistant("fourth answer"),
     ];
     start_compaction(agents.runtime.clone(), history, TEST_SETTINGS, tx.clone())
       .await
@@ -2073,8 +2073,12 @@ mod tests {
       Some(AgentEvent::Compacted(Some(compacted))) => compacted,
       other => panic!("expected Compacted event, got {other:?}"),
     };
-    assert_eq!(compacted.summarized, 2);
-    assert!(compacted.kept.is_empty(), "one fresh summary, not nested");
+    assert_eq!(compacted.summarized, 3);
+    assert_eq!(compacted.kept, [Message::assistant("fourth answer")]);
+    assert!(
+      !compacted.kept.iter().any(compaction::is_summary),
+      "one fresh summary, not nested"
+    );
   }
 
   /// The provider counts what it was sent; only what has been said since is
@@ -2278,12 +2282,16 @@ mod tests {
     }
   }
 
+  /// A window an image fits in: one is weighed at more than the whole of
+  /// `TEST_SETTINGS`, and the run would compact it away before it ended.
+  const IMAGE_SETTINGS: Settings = Settings {
+    context_window: 100_000,
+    ..TEST_SETTINGS
+  };
+
   #[tokio::test]
   async fn mock_image_read() {
-    let Ok(base_url) = std::env::var("FA_TEST_BASE_URL") else {
-      eprintln!("FA_TEST_BASE_URL not set; skipping");
-      return;
-    };
+    let base_url = crate::mock::Mock::start().openai_url();
     let path = std::env::temp_dir().join("fa-test-image.png");
     let img = image::ImageBuffer::from_fn(8, 8, |x, _| image::Rgb([x as u8 * 30, 0, 0]));
     img.save(&path).unwrap();
@@ -2295,7 +2303,7 @@ mod tests {
       model: "mock".into(),
       system_prompt: None,
       max_tokens: None,
-      compaction: TEST_SETTINGS,
+      compaction: IMAGE_SETTINGS,
       vision: true,
       tools: Default::default(),
     };
@@ -2315,7 +2323,7 @@ mod tests {
         _ => None,
       })
       .expect("tool result");
-    assert_eq!(result, ("Read image file [image/png]\n[image]".to_string(), false));
+    assert_eq!(result, ("Read image file [image/png]".to_string(), false));
     assert!(!events.iter().any(|e| matches!(e, AgentEvent::Error(_))), "{events:?}");
     let Some(AgentEvent::Done { messages, .. }) = events.last() else {
       panic!("no Done")
@@ -2327,10 +2335,7 @@ mod tests {
   /// where the image travels inside the function response.
   #[tokio::test]
   async fn mock_gemini_image_read() {
-    let Ok(base_url) = std::env::var("FA_TEST_GEMINI_BASE_URL") else {
-      eprintln!("FA_TEST_GEMINI_BASE_URL not set; skipping");
-      return;
-    };
+    let base_url = crate::mock::Mock::start().gemini_url();
     let path = std::env::temp_dir().join("fa-test-image-gemini.png");
     let img = image::ImageBuffer::from_fn(8, 8, |x, _| image::Rgb([0, x as u8 * 30, 0]));
     img.save(&path).unwrap();
@@ -2342,7 +2347,7 @@ mod tests {
       model: "mock".into(),
       system_prompt: None,
       max_tokens: None,
-      compaction: TEST_SETTINGS,
+      compaction: IMAGE_SETTINGS,
       vision: true,
       tools: Default::default(),
     };
