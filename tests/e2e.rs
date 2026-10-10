@@ -1257,6 +1257,24 @@ fn poll(mut ready: impl FnMut() -> Option<String>) -> String {
   panic!("waited for the screen to settle");
 }
 
+/// Narrowing the commands picks the best match for what is typed, not the
+/// row that happened to be first before: `/` lists `compact` first, and
+/// `compact` has an `m` in it, but `/m` is `mcp`.
+#[test]
+fn narrowing_the_commands_picks_the_best_match() {
+  if !have_tmux() {
+    return;
+  }
+  let provider = Provider::start(Vec::new());
+  let term = Term::start("narrowing", &provider, &["--no-session"]);
+  term.type_in("/");
+  term.wait_for("/continue");
+  term.type_in("m");
+  poll(|| (!term.screen().contains("/continue")).then(String::new));
+  term.type_in("Tab");
+  poll(|| (term.typed() == "/mcp").then(String::new));
+}
+
 #[test]
 fn an_aborted_run_keeps_its_work_and_can_carry_on() {
   if !have_tmux() {
@@ -2956,6 +2974,8 @@ fn a_resource_is_completed_after_an_ampersand_and_sent_as_a_reference() {
   term.type_in("nday");
   term.wait_for("notes:note://today");
   term.wait_for("template");
+  // The template's `{day}` is the closer match, so it comes first.
+  term.type_in("Down");
   term.type_in("Enter");
   term.wait_for("│what is on &notes:note://today ");
   // And code, which is no server's.

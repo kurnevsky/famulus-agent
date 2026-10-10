@@ -296,6 +296,9 @@ struct Completion {
   /// The byte range accepting a row replaces. `None` for the command list,
   /// which replaces the whole line.
   replacing: Option<(usize, usize)>,
+  /// The input the list was filtered for. The row picked in it is kept only
+  /// while this is still what the box holds.
+  text: String,
 }
 
 /// A list drawn over the transcript. Moving through one and dismissing it are
@@ -1252,9 +1255,14 @@ impl App {
       self.completion = None;
       return;
     }
+    // The row picked stays picked while the text is the same — a server's
+    // suggestions arriving, say. Typing asks for a different list, and its
+    // best match comes first: a row that was only first in the old list, and
+    // happens to match the new query too, is not one anybody chose.
     let selected = self
       .completion
       .as_ref()
+      .filter(|c| c.text == text)
       .and_then(|c| c.items.get(c.selected).map(key))
       .and_then(|prev| items.iter().position(|m| key(m) == prev))
       .unwrap_or(0);
@@ -1262,6 +1270,7 @@ impl App {
       items,
       selected,
       replacing,
+      text,
     });
   }
 
