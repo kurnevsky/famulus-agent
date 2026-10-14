@@ -3507,6 +3507,7 @@ impl App {
               width: width as usize,
               from_end,
               cursor: false,
+              to_edge: true,
             }
             .draw(&mut lines);
           }
@@ -3651,6 +3652,7 @@ impl App {
         // The tail is what is being written; what came before is already said.
         from_end: true,
         cursor: true,
+        to_edge: true,
       }
       .draw(&mut lines);
     }
@@ -3918,6 +3920,7 @@ fn draw_image(
     width: width as usize,
     from_end: false,
     cursor: false,
+    to_edge: false,
   }
   .draw(lines);
   if matches!(picture, Picture::Graphic(_)) && shown > 0 {
@@ -4506,6 +4509,10 @@ struct Preview {
   from_end: bool,
   /// Mark the last line kept as where the model has got to.
   cursor: bool,
+  /// Carry a line's background on to the edge of the block. A changed line
+  /// wants it; a picture's row does not, since its first cell's background is
+  /// a pixel of it, not the line's.
+  to_edge: bool,
 }
 
 impl Preview {
@@ -4518,6 +4525,7 @@ impl Preview {
       width,
       from_end,
       cursor,
+      to_edge,
     } = self;
     // Collapsed, the block is not drawn at all, not even to say it is there.
     if fold == Fold::Collapsed {
@@ -4546,7 +4554,7 @@ impl Preview {
         .map(|(i, piece)| {
           // A line on a background of its own, a changed one, has it to the
           // edge of the block rather than to where its text happens to stop.
-          let bg = piece.first().and_then(|span| span.style.bg);
+          let bg = piece.first().and_then(|span| span.style.bg).filter(|_| to_edge);
           let used: usize = piece.iter().map(Span::width).sum();
           let mut spans = vec![Span::raw("  "), gutter.clone()];
           spans.extend(piece);
@@ -6249,6 +6257,7 @@ mod tests {
         width: 20,
         from_end: false,
         cursor: false,
+        to_edge: true,
       }
       .draw(&mut out);
       out
@@ -6281,6 +6290,7 @@ mod tests {
         width: 20,
         from_end: false,
         cursor,
+        to_edge: true,
       }
       .draw(&mut out);
       out
