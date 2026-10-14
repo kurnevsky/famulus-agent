@@ -2664,14 +2664,21 @@ impl App {
         // one the transcript keeps — whichever of the pending lines it is.
         self.writing.retain(|writing| writing.id != internal);
         let summary = summarize_args(&name, &args);
+        let command = name == "bash";
         self.entries.push(Entry::ToolCall {
           wrote: wrote_content(&name, &args),
           edited: edited_path(&name, &args),
           name,
           summary,
-          call,
+          call: call.clone(),
           started: Instant::now(),
         });
+        // A command's clock runs from the moment it starts, not from the
+        // first thing it says: one that works in silence, or whose output
+        // sits in a buffer until it exits, would otherwise show none at all.
+        if command {
+          place_output(&mut self.entries, call, String::new());
+        }
       }
       // Output goes under the call it came from, wherever that call's line
       // has ended up — not under whatever the transcript happens to end with.
@@ -6570,6 +6577,27 @@ mod tests {
       })
       .collect();
     assert_eq!(failed, [true, false]);
+  }
+
+  #[test]
+  fn a_silent_command_is_timed_from_its_start() {
+    // A command is given its running block before it has said anything, so
+    // the clock under it counts from the start; what it says later fills
+    // that block rather than starting another, and the finish keeps the time
+    // it started at.
+    let mut entries = vec![announced("sleep 10", "a")];
+    place_output(&mut entries, "a".into(), String::new());
+    let started = |entries: &[Entry]| match entries {
+      [_, Entry::ToolResult { started, .. }] => *started,
+      _ => panic!("expected one result under the call"),
+    };
+    let at = started(&entries);
+    assert!(matches!(entries[1], Entry::ToolResult { running: true, .. }));
+    place_output(&mut entries, "a".into(), "late".into());
+    assert_eq!(shapes(&entries), ["call bash sleep 10", "out bash late"]);
+    place_result(&mut entries, finished("done", false, "a"));
+    assert_eq!(shapes(&entries), ["call bash sleep 10", "out bash done"]);
+    assert_eq!(started(&entries), at);
   }
 
   #[test]
