@@ -16,9 +16,7 @@ use rustix::process::{Pid, Signal, kill_process_group};
 use crate::ask::{self, Dialog, Question};
 use crate::modal::Host;
 use crate::{edit, images, pdf};
-use schemars::generate::SchemaSettings;
-use schemars::transform::RecursiveTransform;
-use schemars::{JsonSchema, Schema};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
@@ -145,7 +143,7 @@ macro_rules! tool_args {
     type Error = $crate::tools::ToolError;
 
     fn parameters(&self) -> serde_json::Value {
-      $crate::tools::schema::<$args>()
+      rig_core::tool::args_schema::<$args>()
     }
 
     fn map_error(&self, error: $crate::tools::ToolError) -> rig_agent::tool::ToolExecutionError {
@@ -155,23 +153,6 @@ macro_rules! tool_args {
 }
 #[cfg_attr(not(feature = "mcp"), allow(unused_imports))]
 pub(crate) use tool_args;
-
-/// JSON schema for a tool's arguments, stripped of metadata that some
-/// OpenAI-compatible servers reject (`$schema`, `title`, integer `format`).
-///
-/// Taken off every schema and subschema, and only those: an argument that
-/// happens to be called `title` is a property rather than metadata, and stays.
-pub fn schema<T: JsonSchema>() -> serde_json::Value {
-  SchemaSettings::draft2020_12()
-    .with(|settings| settings.meta_schema = None)
-    .with_transform(RecursiveTransform(|schema: &mut Schema| {
-      schema.remove("title");
-      schema.remove("format");
-    }))
-    .into_generator()
-    .into_root_schema_for::<T>()
-    .to_value()
-}
 
 /// Path normalization: Unicode spaces folded, a leading `@` (chat file
 /// reference) stripped, `~` expanded, `file://` URLs accepted, then resolved
@@ -1561,10 +1542,10 @@ mod bash_tests {
     // last would be a nameless block of text until it finished. Sorting the
     // properties (serde_json's default) put `content` before `path`.
     let first = |schema: serde_json::Value| schema["properties"].as_object().unwrap().keys().next().unwrap().clone();
-    assert_eq!(first(schema::<WriteArgs>()), "path");
-    assert_eq!(first(schema::<EditArgs>()), "path");
-    assert_eq!(first(schema::<ReadArgs>()), "path");
-    assert_eq!(first(schema::<BashArgs>()), "command");
+    assert_eq!(first(rig_core::tool::args_schema::<WriteArgs>()), "path");
+    assert_eq!(first(rig_core::tool::args_schema::<EditArgs>()), "path");
+    assert_eq!(first(rig_core::tool::args_schema::<ReadArgs>()), "path");
+    assert_eq!(first(rig_core::tool::args_schema::<BashArgs>()), "command");
   }
 
   #[test]
@@ -1575,7 +1556,7 @@ mod bash_tests {
       title: String,
       format: Option<u32>,
     }
-    let schema = schema::<Titled>();
+    let schema = rig_core::tool::args_schema::<Titled>();
     let properties = schema["properties"].as_object().unwrap();
     assert!(
       properties.contains_key("title") && properties.contains_key("format"),
@@ -1595,7 +1576,7 @@ mod bash_tests {
     // A command reports its output down whatever it was handed, and is
     // told nothing else — so the model is never offered a field that is
     // not its own, and the arguments it sends are only ever its own too.
-    let schema = schema::<BashArgs>();
+    let schema = rig_core::tool::args_schema::<BashArgs>();
     let properties = schema["properties"].as_object().unwrap();
     assert_eq!(properties.len(), 2, "{schema}");
     assert!(properties.contains_key("command") && properties.contains_key("timeout"));
@@ -1844,13 +1825,13 @@ mod ask_tests {
   fn the_model_is_told_what_a_question_may_be() {
     // The bounds are the schema's to advertise; a model that ignores them is
     // caught again by `ask::validate` before anything is drawn.
-    let schema = schema::<AskArgs>();
-    let question = &schema["$defs"]["Question"]["properties"];
+    let schema = rig_core::tool::args_schema::<AskArgs>();
+    let question = &schema["properties"]["questions"]["items"]["properties"];
     assert_eq!(schema["properties"]["questions"]["maxItems"], 4);
     assert_eq!(question["options"]["minItems"], 2);
     assert_eq!(question["options"]["maxItems"], 4);
     assert_eq!(question["header"]["maxLength"], 16);
-    assert_eq!(schema["$defs"]["Choice"]["properties"]["label"]["maxLength"], 60);
+    assert_eq!(question["options"]["items"]["properties"]["label"]["maxLength"], 60);
     // The name the extension's models have been writing all along.
     assert!(question.get("multiSelect").is_some(), "{schema}");
   }

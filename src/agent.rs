@@ -18,12 +18,12 @@ use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use rig_agent::tool::server::{ToolServer, ToolServerHandle};
 use rig_agent::tool::{ToolContext, ToolExecutionError, ToolResult};
-use rig_core::DynModel;
 use rig_core::completion::{CompletionRequest, Message, ToolDefinition, Usage};
 use rig_core::message::{AssistantContent, AssistantMessage, Reasoning, ToolCall, ToolResultContent, UserContent};
 use rig_core::operation::Completion;
 use rig_core::providers::{anthropic, cohere, gemini, ollama, openai, xai};
 use rig_core::streaming::{Item, Part, PartKind, StreamEvent};
+use rig_core::{DynModel, ProviderError};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -899,7 +899,7 @@ async fn run(
       .max_tokens(rt.max_tokens);
     let mut stream = match rt.model.stream(request) {
       Ok(stream) => stream,
-      Err(err) => return Some(Stop::Failed(err.to_string())),
+      Err(err) => return Some(refused(control, &err)),
     };
 
     let mut partial = Partial::new();
@@ -922,7 +922,7 @@ async fn run(
         Ok(Item::Unknown(_)) => None,
         Err(err) => {
           made.extend(partial.cut_off());
-          return Some(Stop::Failed(err.to_string()));
+          return Some(refused(control, &err));
         }
       };
       if let Some(event) = event {
@@ -938,7 +938,7 @@ async fn run(
     // replays — there is only ever the one.
     let response = match stream.finish().await {
       Ok(response) => response,
-      Err(err) => return Some(Stop::Failed(err.to_string())),
+      Err(err) => return Some(refused(control, &err)),
     };
     weigh.answered(&response.usage, sent);
     let _ = tx.send(AgentEvent::Usage {
@@ -1162,6 +1162,17 @@ fn shown(message: &Message) -> Option<Message> {
   (!turn.content.is_empty()).then_some(Message::Assistant(turn))
 }
 
+/// What a request the provider failed stops the run with. One it refused
+/// for not fitting the window marks the run as out of room too, whatever the
+/// estimate made of it beforehand: the error is shown, and the run makes
+/// room and carries on as it would have had the estimate seen it coming.
+fn refused(control: &Control, err: &ProviderError) -> Stop {
+  if err.report().is_context_overflow() {
+    control.overflowed_now();
+  }
+  Stop::Failed(err.to_string())
+}
+
 /// A call answered without being run.
 fn aborted(call: &ToolCall) -> UserContent {
   UserContent::ToolResult(call.result(vec![ToolResultContent::text(ABORTED)]))
@@ -1170,8 +1181,8 @@ fn aborted(call: &ToolCall) -> UserContent {
 impl Runtime {
   /// What this session offers the model, in a stable order — a tool set that
   /// shuffled between requests would be a different prompt every time.
-  fn definitions(&self) -> Vec<ToolDefinition> {
-    let mut definitions = self.tools.now().static_tool_defs();
+  fn definitions(&self) -> Vec<Arc<ToolDefinition>> {
+    let mut definitions = self.tools.now().snapshot().take_definitions();
     definitions.retain(|definition| self.rules.permits(&definition.name));
     definitions
   }
@@ -1218,13 +1229,14 @@ impl Runtime {
       ),
       (true, Some(raw)) => ToolResult::failed(
         ToolExecutionError::invalid_args(format!("`{name}` was called with arguments that are not an object"))
-          .with_model_feedback(rig_core::transcript::invalid_arguments_feedback(&name, raw)),
+          .with_model_feedback(rig_core::tool::feedback::invalid_arguments_feedback(&name, raw)),
       ),
       (true, None) => {
         self
           .tools
           .now()
-          .execute(&name, &call.function.arguments_value().to_string(), &mut context)
+          .toolset()
+          .execute(&name, call.function.arguments_value().to_string(), &mut context)
           .await
       }
     };
@@ -1345,6 +1357,10 @@ mod tests {
     hang: bool,
     /// The cap each request carried, in the order they came.
     caps: Arc<Mutex<Vec<Option<u64>>>>,
+    /// The streamed request, counting from nought, the provider refuses as
+    /// too big for the window. It takes no turn of the script.
+    too_big: Option<usize>,
+    streamed: Arc<std::sync::atomic::AtomicUsize>,
   }
 
   impl Transport<MockScript> for Scripted {
@@ -1356,6 +1372,12 @@ mod tests {
         // Only the summarizer asks without streaming, and it is told the
         // same every time.
         Mode::Unary => (vec![said("Something about fruit.")], false),
+        Mode::Streaming if Some(self.streamed.fetch_add(1, Ordering::Relaxed)) == self.too_big => {
+          return Opening::failed(ProviderError::from_http_response(
+            http::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"This model's maximum context length is 1000 tokens.","code":"context_length_exceeded"}}"#,
+          ));
+        }
         Mode::Streaming => (
           self
             .turns
@@ -1399,17 +1421,21 @@ mod tests {
   /// A runtime whose model reads from `turns` and whose only tool is the
   /// real `bash`, which is the one that can be told to take its time.
   fn scripted(turns: Vec<Vec<MockStreamEvent>>, hang: bool) -> Arc<Runtime> {
+    on_script(Scripted {
+      turns: Arc::new(Mutex::new(turns.into())),
+      hang,
+      ..Scripted::default()
+    })
+  }
+
+  /// [`scripted`], for a script that asks for more than the turns.
+  fn on_script(model: Scripted) -> Arc<Runtime> {
     let tools = ToolServer::new()
       .tool(BashTool {
         cwd: std::env::temp_dir(),
       })
       .run();
     let tools = Tools::new(tools);
-    let model = Scripted {
-      turns: Arc::new(Mutex::new(turns.into())),
-      hang,
-      ..Scripted::default()
-    };
     Arc::new(Runtime {
       model: model.model(),
       tools,
@@ -1862,6 +1888,53 @@ mod tests {
     handle.await.expect("the run to finish");
     assert_eq!(seen, ["compacting", "compacted"]);
     // Only what came after the room was made: the rest went out before it.
+    assert_eq!(shapes(&done), ["said \"all done\""]);
+  }
+
+  /// A request the provider refuses as too big for the window is room the
+  /// run has run out of, whatever the estimate made of it: the refusal is
+  /// shown, and the run makes room and asks again.
+  #[tokio::test]
+  async fn a_request_refused_for_its_size_compacts_and_carries_on() {
+    let runtime = on_script(Scripted {
+      turns: Arc::new(Mutex::new(
+        [vec![asks("call_1", "echo ok")], vec![said("all done")]].into(),
+      )),
+      too_big: Some(1),
+      ..Scripted::default()
+    });
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let handle = start_run(
+      runtime,
+      Control::default(),
+      Vec::new(),
+      vec![Message::user("hello")],
+      tx,
+    );
+    let mut seen = Vec::new();
+    let done = loop {
+      let event = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+        .await
+        .expect("an event within 10s")
+        .expect("the channel open");
+      match event {
+        AgentEvent::Error(err) => {
+          assert!(err.contains("maximum context length"), "{err}");
+          seen.push("refused");
+        }
+        AgentEvent::Compacting { messages, resuming } => {
+          assert!(resuming, "it stopped for room, so it goes on");
+          assert_eq!(shapes(&messages), ["user hello", "call call_1", "result call_1 ok"]);
+          seen.push("compacting");
+        }
+        AgentEvent::Compacted(Some(_)) => seen.push("compacted"),
+        AgentEvent::Done { messages } => break messages,
+        AgentEvent::Ended { .. } => panic!("the run stopped short after {seen:?}"),
+        _ => {}
+      }
+    };
+    handle.await.expect("the run to finish");
+    assert_eq!(seen, ["refused", "compacting", "compacted"]);
     assert_eq!(shapes(&done), ["said \"all done\""]);
   }
 

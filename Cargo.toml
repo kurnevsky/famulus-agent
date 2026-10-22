@@ -142,13 +142,13 @@ ratatui = { version = "0.30", features = ["serde"] }
 # goes on reading input after it has given up waiting, and takes the answer
 # to the next question anyone asks — which, inside a tmux that nothing outside
 # answers, is crossterm's, and fa never starts.
-ratatui-image = { version = "=12.0.0-rc.2", default-features = false, features = ["crossterm"] }
+ratatui-image = { version = "=12.0.0-rc.3", default-features = false, features = ["crossterm"] }
 # The client rmcp calls a server with once it is signed in to, and the address
 # the browser comes back to; both already in the tree through rmcp.
 reqwest = { version = "0.13", default-features = false, optional = true }
 ratatui-textarea = "0.9"
-rig-agent = "0.44"
-rig-core = { version = "0.44", features = ["reqwest"] }
+rig-agent = "0.45"
+rig-core = { version = "0.45", features = ["reqwest"] }
 rmcp = { version = "3", features = [
   "client",
   "transport-child-process",
@@ -217,4 +217,4 @@ uuid = { version = "1.27.0", features = ["v4"] }
 
 # The scripted model the run loop is tested against.
 [dev-dependencies]
-rig-core = { version = "0.44", features = ["test-utils"] }
+rig-core = { version = "0.45", features = ["test-utils"] }
