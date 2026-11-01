@@ -874,7 +874,7 @@ async fn run(
       return Some(Stop::Paused);
     }
 
-    let chat: Vec<Message> = history.iter().chain(made.iter()).filter_map(shown).collect();
+    let chat: Vec<Message> = history.iter().chain(made.iter()).cloned().collect();
 
     // Weighed before it is sent rather than once the answer comes back: a
     // tool can return a file the size of the window, and the request
@@ -912,7 +912,7 @@ async fn run(
       // Nothing of this turn has run, so the half of it that was written is
       // kept for the transcript's sake and no more.
       let Some(item) = stopped else {
-        made.extend(partial.cut_off());
+        made.extend(partial.cut_off("stopped"));
         return Some(Stop::Cancelled);
       };
       let Some(item) = item else { break };
@@ -921,7 +921,7 @@ async fn run(
         // Something the provider sent that rig has no word for.
         Ok(Item::Unknown(_)) => None,
         Err(err) => {
-          made.extend(partial.cut_off());
+          made.extend(partial.cut_off(err.to_string()));
           return Some(refused(control, &err));
         }
       };
@@ -1118,7 +1118,15 @@ impl Partial {
   ///
   /// The calls are left out, finished or not — a call nobody ran is one
   /// nothing would answer — and so is text with nothing in it.
-  fn cut_off(self) -> Option<Message> {
+  ///
+  /// The turn is marked as stopped for `why`, and its thinking is kept for
+  /// the transcript and no further: a stopped turn is replayed as the text
+  /// it had sent alone. Sent as words the model had said, its abandoned
+  /// thoughts are what it would go on with — thinking out loud, with the
+  /// turn last, where a provider carries it on. A turn that was nothing but
+  /// thinking is not replayed at all, so `/continue` asks for the answer
+  /// afresh.
+  fn cut_off(self, why: impl Into<String>) -> Option<Message> {
     let content: Vec<AssistantContent> = self
       .parts
       .into_iter()
@@ -1136,30 +1144,8 @@ impl Partial {
     // No origin: the provider never finished the reply, and what arrived of
     // it goes back as what it said rather than as the provider's own items —
     // the way a turn written by hand does.
-    (!content.is_empty()).then(|| Message::Assistant(AssistantMessage::new(content)))
+    (!content.is_empty()).then(|| Message::Assistant(AssistantMessage::aborted(None, content, why)))
   }
-}
-
-/// `message` as the model is shown it, or nothing if it has nothing left to
-/// show.
-///
-/// A turn that was cut off has no origin, and its thinking is kept for the
-/// transcript and no further. A provider replays a turn of no origin as
-/// another model's, with its thinking as plain text: the model would read
-/// its own abandoned thoughts as something it had said, and — with the turn
-/// last, where a provider carries it on — go on thinking out loud. A turn
-/// that was nothing but thinking goes altogether, so `/continue` asks for
-/// the answer afresh.
-fn shown(message: &Message) -> Option<Message> {
-  let Message::Assistant(turn) = message else {
-    return Some(message.clone());
-  };
-  if turn.origin.is_some() || !turn.content.iter().any(|c| matches!(c, AssistantContent::Reasoning(_))) {
-    return Some(message.clone());
-  }
-  let mut turn = turn.clone();
-  turn.content.retain(|c| !matches!(c, AssistantContent::Reasoning(_)));
-  (!turn.content.is_empty()).then_some(Message::Assistant(turn))
 }
 
 /// What a request the provider failed stops the run with. One it refused
@@ -1217,15 +1203,21 @@ impl Runtime {
     // A tool the session was not offered is not run for being named anyway:
     // the list the model was shown is the boundary, not a hint. It is
     // answered as a tool that is not there, which is all the model was ever
-    // told about it.
+    // told about it — the same answer as for a name nothing goes by, with
+    // the tools it does have, so it can pick one of those instead.
     //
     // Arguments that are not an object are not guessed at either: what could
     // be read of them is a call cut short, and running a `write` on half a
     // file is worse than asking again.
-    let result = match (self.rules.permits(&name), &call.function.invalid_arguments) {
+    let offered = self.definitions();
+    let result = match (
+      offered.iter().any(|tool| tool.name == name),
+      &call.function.invalid_arguments,
+    ) {
       (false, _) => ToolResult::failed(
-        ToolExecutionError::not_found(format!("`{name}` is not offered in this session"))
-          .with_model_feedback(format!("tool `{name}` not found")),
+        ToolExecutionError::not_found(format!("`{name}` is not offered in this session")).with_model_feedback(
+          rig_core::tool::feedback::unknown_tool_feedback(&name, offered.iter().map(|tool| tool.name.as_str())),
+        ),
       ),
       (true, Some(raw)) => ToolResult::failed(
         ToolExecutionError::invalid_args(format!("`{name}` was called with arguments that are not an object"))
@@ -1800,6 +1792,7 @@ mod tests {
   /// naming it anyway does not get it.
   #[tokio::test]
   async fn a_refused_tool_is_not_run_for_being_named() {
+    const REFUSED: &str = "There is no tool named `bash`. You have no tools available. Answer without calling tools.";
     let witness = std::env::temp_dir().join(format!("fa-refused-{}", std::process::id()));
     let _ = std::fs::remove_file(&witness);
     let mut runtime = Arc::into_inner(scripted(
@@ -1830,7 +1823,7 @@ mod tests {
       match event {
         AgentEvent::ToolResult { output, is_error, .. } => {
           assert!(is_error, "{output}");
-          assert_eq!(output, "tool `bash` not found");
+          assert_eq!(output, REFUSED);
           refused = true;
         }
         AgentEvent::Done { messages } => break messages,
@@ -1843,7 +1836,11 @@ mod tests {
     assert!(!witness.exists(), "the command was not run");
     assert_eq!(
       shapes(&messages)[1..],
-      ["call call_1", "result call_1 tool `bash` not found", "said \"fine\""]
+      [
+        "call call_1".to_string(),
+        format!("result call_1 {REFUSED}"),
+        "said \"fine\"".to_string()
+      ]
     );
   }
 

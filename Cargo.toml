@@ -112,7 +112,7 @@ lang-yaml = ["syntax", "dep:tree-sitter-yaml"]
 lang-zig = ["syntax", "dep:tree-sitter-zig"]
 
 [dependencies]
-agent-client-protocol = { version = "3.1", features = ["stdio"], optional = true }
+agent-client-protocol = { version = "3.6", features = ["stdio"], optional = true }
 anyhow = "1.0.104"
 # The shape rmcp gives the store an OAuth login is kept in.
 async-trait = { version = "0.1.92", optional = true }
@@ -147,8 +147,8 @@ ratatui-image = { version = "=12.0.0-rc.3", default-features = false, features =
 # the browser comes back to; both already in the tree through rmcp.
 reqwest = { version = "0.13", default-features = false, optional = true }
 ratatui-textarea = "0.9"
-rig-agent = "0.45"
-rig-core = { version = "0.45", features = ["reqwest"] }
+rig-agent = "0.46"
+rig-core = { version = "0.46", features = ["reqwest"] }
 rmcp = { version = "3", features = [
   "client",
   "transport-child-process",
@@ -160,11 +160,11 @@ rustix = { version = "1", features = ["process"] }
 # in the order it is offered them, and the path wants to come first.
 schemars = { version = "1", features = ["preserve_order"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-similar = "3.2.0"
+serde_json = "1.0.154"
+similar = "3.2.1"
 thiserror = "2.0.21"
 toml = { version = "1", default-features = false, features = ["parse", "serde"] }
-tokio = { version = "1.53.2", features = ["full"] }
+tokio = { version = "1.54.1", features = ["full"] }
 tree-sitter = { version = "0.27", optional = true }
 tree-sitter-bash = { version = "0.25", optional = true }
 tree-sitter-c = { version = "0.24", optional = true }
@@ -172,7 +172,7 @@ tree-sitter-c-sharp = { version = "0.23", optional = true }
 tree-sitter-cmake = { version = "0.7", optional = true }
 tree-sitter-cpp = { version = "0.23", optional = true }
 tree-sitter-css = { version = "0.25", optional = true }
-tree-sitter-dart = { version = "0.2", optional = true }
+tree-sitter-dart = { version = "0.3", optional = true }
 tree-sitter-diff = { version = "0.1", optional = true }
 tree-sitter-elixir = { version = "0.3", optional = true }
 tree-sitter-erlang = { version = "0.21", optional = true }
@@ -210,11 +210,11 @@ tree-sitter-typescript = { version = "0.23", optional = true }
 tree-sitter-xml = { version = "0.7", optional = true }
 tree-sitter-yaml = { version = "0.7", optional = true }
 tree-sitter-zig = { version = "1.1", optional = true }
-unicode-normalization = "0.1.25"
+unicode-normalization = "0.1.26"
 unicode-width = "0.2"
 url = { version = "2", optional = true }
-uuid = { version = "1.27.0", features = ["v4"] }
+uuid = { version = "1.29.0", features = ["v4"] }
 
 # The scripted model the run loop is tested against.
 [dev-dependencies]
-rig-core = { version = "0.45", features = ["test-utils"] }
+rig-core = { version = "0.46", features = ["test-utils"] }
