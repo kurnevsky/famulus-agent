@@ -1079,8 +1079,8 @@ Whichever weighing finds the window full, the run stops at its next turn
 boundary, which is the only place a run can be cut without leaving a tool call
 unanswered: what it got through is kept the way an abort keeps it.
 
-Then the older part of the history is rendered as a transcript and summarized
-by the same model into pi's structured checkpoint format (goal, progress,
+Then the older part of the history is summarized by the same model into
+pi's structured checkpoint format (goal, progress,
 decisions, next steps, critical context). The summary replaces those messages
 as a single user message; the most recent turns, about `keep_recent_tokens`
 worth, stay verbatim as entries of their own, so `/tree` can still go back to
@@ -1105,13 +1105,26 @@ instead: the call the model made and what came back. Keeping nothing would
 hand it a summary and no work, which is the state compaction is there to
 rescue it from.
 
+The summary is asked for as the next message of the conversation itself:
+the same preamble, the same tools and the same messages a run sends, with the
+instructions after them. A server that keeps the last prompt it read —
+llama.cpp, Ollama, and the hosted APIs that cache prefixes — finds all of it
+already read, and reads only the instructions; a summarizer with a preamble
+of its own would be a different prompt from the first token, and the whole
+conversation would be read again, which on a local model is the slow part of
+compacting. When that request is too big for the window, or the answer calls
+a tool or says nothing, the part to summarize is rendered as a transcript
+instead, tool results cut to 2000 characters, and asked about with the
+summarizer's own preamble and no tools.
+
 When the cut does fall inside a turn, the beginning of that turn is
 summarized a second time, by pi's prompt for it: where the checkpoint
 describes a conversation that is over, this one is written for the half of
-the turn still on screen — *"This is the PREFIX of a turn that was too large
-to keep. The SUFFIX (recent work) is retained"*, and asks for the original
-request, how far it got, and what the kept half needs to be read by. The two
-come back as one message:
+the turn still on screen — *"The SUFFIX (recent work) is retained"* — and
+asks for the original request, how far it got, and what the kept half needs
+to be read by. It is asked first, at the cut, and the checkpoint after it, at
+the start of the turn: the shorter request is a prefix of the longer, so it
+is all still in what the server kept. The two come back as one message:
 
 ```
 ## Goal

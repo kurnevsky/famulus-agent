@@ -46,13 +46,13 @@ enum Turn {
   Echo,
 }
 
-/// A phrase from the summarizer's own preamble, which is how a request for a
+/// A phrase from what the summarizer is told, which is how a request for a
 /// summary is told from a turn of the conversation.
 const SUMMARIZING: &str = "context summarization assistant";
 
 /// A phrase from the prompt the beginning of a split turn is asked for with,
-/// which is how the second summarization request is told from the first.
-const SUMMARIZING_TURN: &str = "This is the PREFIX of a turn";
+/// which is how the one summarization request is told from the other.
+const SUMMARIZING_TURN: &str = "turn that was too large to keep";
 
 /// What the mock always summarizes a conversation into. Distinctive enough to
 /// find again in a later request, and it says nothing the conversation said.
@@ -184,9 +184,9 @@ fn serve(
   // the summarizer, asking with a preamble of its own.
   let done = body.matches("\"tool_call_id\"").count();
   let turn = if body.contains(SUMMARIZING_TURN) {
-    // Both summarizations speak with the summarizer's preamble, so the one
-    // for a split turn is known by what it asks for, and answered with
-    // something the other would never say.
+    // Both summarizations are told they are the summarizer, so the one for a
+    // split turn is known by what it asks for, and answered with something
+    // the other would never say.
     Turn::Say(TURN_SUMMARY)
   } else if body.contains(SUMMARIZING) {
     Turn::Say(SUMMARY)
@@ -2423,15 +2423,19 @@ fn the_start_of_a_split_turn_is_summarized_on_its_own() {
   };
 
   let (screen, asked) = compacted(true);
-  assert_eq!(asked.len(), 2, "the conversation, then the turn: {asked:?}");
+  assert_eq!(asked.len(), 2, "the turn, then the conversation: {asked:?}");
+  // The longer of the two first, so the shorter is still in what the server
+  // kept of it.
   assert!(
-    asked[0].contains("remember the kumquat") && !asked[0].contains("and the pomelo"),
-    "the first asks about the turns before the one being split: {}",
+    asked[0].contains(SUMMARIZING_TURN) && asked[0].contains("and the pomelo"),
+    "the first about the beginning of that turn, by its own prompt: {}",
     asked[0]
   );
   assert!(
-    asked[1].contains(SUMMARIZING_TURN) && asked[1].contains("and the pomelo"),
-    "the second about the beginning of that turn, by its own prompt: {}",
+    asked[1].contains("remember the kumquat")
+      && !asked[1].contains("and the pomelo")
+      && !asked[1].contains(SUMMARIZING_TURN),
+    "the second about the turns before the one being split: {}",
     asked[1]
   );
   // Both come back as the one message the conversation keeps.

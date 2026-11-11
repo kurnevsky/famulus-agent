@@ -2,6 +2,14 @@
 //! `context_window - reserve_tokens`, the older part of the conversation is
 //! summarized by the model and replaced with a structured checkpoint, while the
 //! most recent ~`keep_recent_tokens` stay verbatim.
+//!
+//! The summary is asked for at the end of the conversation itself — the same
+//! preamble, the same tools, the same messages a run sends — so a server that
+//! keeps the last prompt it read has most of the request already, and reads
+//! only the instructions. Rendered as a transcript of its own instead, the
+//! conversation would be read from its first token again, which on a local
+//! model is minutes rather than seconds. The transcript is what is left for
+//! when that cannot work.
 
 use crate::agent::Runtime;
 use rig_core::completion::Message;
@@ -39,7 +47,12 @@ pub const SUMMARY_PREFIX: &str =
   "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
 pub const SUMMARY_SUFFIX: &str = "\n</summary>";
 
+/// The preamble of a summary asked for over a transcript.
 pub const SYSTEM_PROMPT: &str = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.\n\nDo NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
+
+/// What a summary asked for at the end of the conversation is told first: the
+/// preamble above it is the agent's own, and the tools are still on offer.
+const IN_PLACE_LEAD: &str = "The conversation stops here to be compacted, and you are its context summarization assistant now. Do NOT continue the conversation. Do NOT respond to any questions in it. Do NOT call any tools. ONLY output the structured summary asked for below.\n\n";
 
 const SUMMARIZATION_PROMPT: &str = "The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.
 
@@ -74,7 +87,7 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.";
 
-const UPDATE_SUMMARIZATION_PROMPT: &str = "The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.
+const UPDATE_SUMMARIZATION_PROMPT: &str = "The messages above open with a summary of the conversation before them, in <summary> tags. The messages after it are NEW conversation messages to incorporate into that existing summary.
 
 Update the existing structured summary with new information. RULES:
 - PRESERVE all existing information from the previous summary
@@ -113,11 +126,11 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, and error messages.";
 
-/// pi's prompt for the other half of a split turn, word for word.
-const TURN_PREFIX_SUMMARIZATION_PROMPT: &str =
-  "This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.
-
-Summarize the prefix to provide context for the retained suffix:
+/// What the beginning of a split turn is summarized into, however it was
+/// shown.
+macro_rules! turn_prefix_format {
+  () => {
+    "Summarize the prefix to provide context for the retained suffix:
 
 ## Original Request
 [What did the user ask for in this turn?]
@@ -128,10 +141,25 @@ Summarize the prefix to provide context for the retained suffix:
 ## Context for Suffix
 - [Information needed to understand the retained recent work]
 
-Be concise. Focus on what's needed to understand the kept suffix.";
+Be concise. Focus on what's needed to understand the kept suffix."
+  };
+}
+
+/// The beginning of a split turn, asked about at the end of the conversation:
+/// everything before the turn is there too, and is summarized apart.
+const TURN_PREFIX_IN_PLACE_PROMPT: &str = concat!(
+  "The conversation above ends partway through a turn that was too large to keep: the one the user's latest request began. Only the PREFIX of that turn is shown, from that request on. The SUFFIX (recent work) is retained, and everything before the request is summarized separately.\n\n",
+  turn_prefix_format!()
+);
+
+/// The beginning of a split turn, rendered as a transcript of its own.
+const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = concat!(
+  "This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.\n\n",
+  turn_prefix_format!()
+);
 
 /// What stands in for the checkpoint when the split turn is all there was to
-/// summarize — pi's words.
+/// summarize.
 const NO_PRIOR_HISTORY: &str = "No prior history.";
 
 /// How the two are joined into the one message the conversation keeps.
@@ -367,21 +395,50 @@ pub fn summary_message(summary: &str) -> Message {
   Message::user(format!("{SUMMARY_PREFIX}{}{SUMMARY_SUFFIX}", summary.trim()))
 }
 
-/// A summary of `messages` written to `instructions`, updating `previous`
-/// when there is one.
+/// The messages a summary is asked for with at the end of `prefix`: the
+/// prefix itself, untouched, and `instructions` after it.
 ///
-/// Block order: conversation, previous summary, instructions.
+/// After a message of the user's own they are appended to it rather than sent
+/// as one more: some chat templates refuse two user messages in a row, and the
+/// text before the instructions is the same either way. After anything else —
+/// a tool's answer, which travels as a message of its own, or the model's —
+/// they are a new message.
+pub fn continued(prefix: &[Message], instructions: &str) -> Vec<Message> {
+  let instructions = format!("{IN_PLACE_LEAD}{instructions}");
+  let mut messages = prefix.to_vec();
+  match messages.last_mut() {
+    Some(Message::User { content }) if !content.iter().any(|c| matches!(c, UserContent::ToolResult(_))) => {
+      match content.last_mut() {
+        Some(UserContent::Text(text)) => text.text = format!("{}\n\n{instructions}", text.text),
+        _ => content.push(UserContent::text(instructions)),
+      }
+    }
+    _ => messages.push(Message::user(instructions)),
+  }
+  messages
+}
+
+/// A summary written to `instructions` at the end of `prefix`, the
+/// conversation as far as the summary is to cover.
+///
+/// Asked as the next message of the conversation, so all of `prefix` is what a
+/// server that kept the last request has already read. Failing that — too big
+/// a request for the window, or an answer that is no summary — over a
+/// transcript of `prefix[from..]`, written to `transcript` instead.
 async fn summarize(
   summarizer: &Runtime,
-  messages: &[Message],
-  previous: Option<&str>,
+  prefix: &[Message],
+  from: usize,
   instructions: &str,
+  transcript: &str,
 ) -> anyhow::Result<String> {
-  let mut prompt = format!("<conversation>\n{}\n</conversation>\n\n", serialize(messages));
-  if let Some(previous) = previous {
-    prompt.push_str(&format!("<previous-summary>\n{previous}\n</previous-summary>\n\n"));
+  if let Some(summary) = summarizer.ask_after(continued(prefix, instructions)).await? {
+    return Ok(summary);
   }
-  prompt.push_str(instructions);
+  let prompt = format!(
+    "<conversation>\n{}\n</conversation>\n\n{transcript}",
+    serialize(&prefix[from..])
+  );
   answer(summarizer, prompt).await
 }
 
@@ -403,6 +460,13 @@ async fn answer(summarizer: &Runtime, prompt: String) -> anyhow::Result<String> 
 /// `turn_summary` is on: the conversation before that turn, and the beginning
 /// of the turn itself — asked for in terms of the rest of that turn, which is
 /// still there underneath it — joined into the one message the history keeps.
+///
+/// The turn is asked about first. Both are asked at the end of the
+/// conversation, the turn's beginning at the cut and the checkpoint where the
+/// turn begins, so the one is a prefix of the other: asked longest first, the
+/// shorter finds all of itself in what the server kept of the longer. The
+/// other way about, the server would have dropped the turn by the time it was
+/// asked to read it again.
 pub async fn compact(
   summarizer: &Runtime,
   mut history: Vec<Message>,
@@ -418,9 +482,27 @@ pub async fn compact(
     .then(|| split_turn(&history, cut, start))
     .flatten();
 
+  let turn = match split {
+    Some(turn) => Some(
+      summarize(
+        summarizer,
+        &history[..cut],
+        turn,
+        TURN_PREFIX_IN_PLACE_PROMPT,
+        TURN_PREFIX_SUMMARIZATION_PROMPT,
+      )
+      .await?,
+    ),
+    None => None,
+  };
+
   // The checkpoint stops where a split turn begins. When the turn is all
   // there was to summarize it has nothing new to say, and the last
   // compaction's summary — or the words for having none — stands.
+  //
+  // Its transcript starts from the first message, the previous summary
+  // included: the instructions find it where the conversation opens, either
+  // way it is shown.
   let end = split.unwrap_or(cut);
   let checkpoint = match end > start {
     true => {
@@ -428,15 +510,12 @@ pub async fn compact(
         Some(_) => UPDATE_SUMMARIZATION_PROMPT,
         None => SUMMARIZATION_PROMPT,
       };
-      summarize(summarizer, &history[start..end], previous, instructions).await?
+      summarize(summarizer, &history[..end], 0, instructions, instructions).await?
     }
     false => previous.unwrap_or(NO_PRIOR_HISTORY).to_string(),
   };
-  let summary = match split {
-    Some(turn) => {
-      let prefix = summarize(summarizer, &history[turn..cut], None, TURN_PREFIX_SUMMARIZATION_PROMPT).await?;
-      format!("{checkpoint}\n\n---\n\n{TURN_SUMMARY_HEADING}\n\n{prefix}")
-    }
+  let summary = match turn {
+    Some(prefix) => format!("{checkpoint}\n\n---\n\n{TURN_SUMMARY_HEADING}\n\n{prefix}"),
     None => checkpoint,
   };
 
@@ -588,6 +667,41 @@ mod tests {
     // And one nothing here comes near keeps the last turn. Either way the
     // cut is past the summary, which is not summarized a second time.
     assert_eq!(cut(&history, 1_000), Some(3));
+  }
+
+  /// The instructions go after the conversation without touching any of
+  /// it, and after the user's own words they join them rather than make two
+  /// user messages in a row.
+  #[test]
+  fn instructions_follow_the_conversation_as_it_was() {
+    let instructed = |messages: &[Message]| match messages.last() {
+      Some(Message::User { content }) => match content.last() {
+        Some(UserContent::Text(t)) => t.text.clone(),
+        other => panic!("ends in text, not {other:?}"),
+      },
+      other => panic!("ends with the user, not {other:?}"),
+    };
+
+    // After the model's words, a message of their own.
+    let prefix = vec![user("q"), assistant("a")];
+    let asked = continued(&prefix, "Summarize.");
+    assert_eq!(asked[..2], prefix[..]);
+    assert_eq!(asked.len(), 3);
+    assert_eq!(instructed(&asked), format!("{IN_PLACE_LEAD}Summarize."));
+
+    // After a tool's answer too, which travels as a message apart.
+    let (call, result) = tool_turn();
+    let prefix = vec![user("q"), call, result];
+    let asked = continued(&prefix, "Summarize.");
+    assert_eq!(asked[..3], prefix[..]);
+    assert_eq!(asked.len(), 4);
+
+    // After the user's own, joined onto them.
+    let prefix = vec![user("q"), assistant("a"), user("next")];
+    let asked = continued(&prefix, "Summarize.");
+    assert_eq!(asked[..2], prefix[..2]);
+    assert_eq!(asked.len(), 3);
+    assert_eq!(instructed(&asked), format!("next\n\n{IN_PLACE_LEAD}Summarize."));
   }
 
   #[test]

@@ -364,13 +364,42 @@ impl Runtime {
   }
 
   /// One question to the model with no tools and the summarizer's preamble,
-  /// and its answer: how compaction summarizes. Nothing here is a
-  /// conversation.
+  /// and its answer: how compaction summarizes a transcript. Nothing here is
+  /// a conversation.
   pub async fn ask(&self, prompt: String) -> Result<String> {
     let request = CompletionRequest::new(Message::user(prompt))
       .preamble(compaction::SYSTEM_PROMPT)
       .max_tokens(self.max_tokens);
     Ok(self.model.call(request).await?.text())
+  }
+
+  /// The request a run sends over `chat`.
+  ///
+  /// Whatever else asks over the conversation asks with this too: a server
+  /// that keeps the last prompt it read reuses it only as far as the two
+  /// agree, and a preamble or a tool set of its own is a different prompt
+  /// from the first token.
+  fn request(&self, chat: Vec<Message>) -> CompletionRequest {
+    CompletionRequest::from(chat)
+      .preamble(self.preamble.clone())
+      .tools(self.definitions())
+      .max_tokens(self.max_tokens)
+  }
+
+  /// The model's answer to `chat`, a conversation ending in a question for it
+  /// to answer in words: how compaction summarizes in place.
+  ///
+  /// `None` when that came to nothing to use — the conversation too big for
+  /// the window, or an answer that called a tool or said nothing — so the
+  /// caller can ask some other way.
+  pub async fn ask_after(&self, chat: Vec<Message>) -> Result<Option<String>> {
+    let response = match self.model.call(self.request(chat)).await {
+      Ok(response) => response,
+      Err(err) if err.report().is_context_overflow() => return Ok(None),
+      Err(err) => return Err(err.into()),
+    };
+    let text = response.text().trim().to_string();
+    Ok((response.tool_calls().next().is_none() && !text.is_empty()).then_some(text))
   }
 }
 
@@ -893,10 +922,7 @@ async fn run(
     // Asked again every turn, since an MCP server can change what it offers
     // in the middle of a run — as the answer to one of its own tools, even.
     let sent = chat.len();
-    let request = CompletionRequest::from(chat)
-      .preamble(rt.preamble.clone())
-      .tools(rt.definitions())
-      .max_tokens(rt.max_tokens);
+    let request = rt.request(chat);
     let mut stream = match rt.model.stream(request) {
       Ok(stream) => stream,
       Err(err) => return Some(refused(control, &err)),
@@ -1349,6 +1375,11 @@ mod tests {
     hang: bool,
     /// The cap each request carried, in the order they came.
     caps: Arc<Mutex<Vec<Option<u64>>>>,
+    /// Every request, in the order they came, and whether it was streamed.
+    requests: Arc<Mutex<Vec<(bool, CompletionRequest)>>>,
+    /// What the requests that are not streamed are answered with, in turn,
+    /// before they all get the same summary.
+    unary: Arc<Mutex<VecDeque<Vec<MockStreamEvent>>>>,
     /// The streamed request, counting from nought, the provider refuses as
     /// too big for the window. It takes no turn of the script.
     too_big: Option<usize>,
@@ -1360,10 +1391,20 @@ mod tests {
     #[allow(clippy::result_large_err)]
     fn send(&self, request: CompletionRequest, exchange: Exchange) -> Opening<MockFrame> {
       self.caps.lock().unwrap().push(request.max_tokens);
+      let streamed = matches!(exchange.mode, Mode::Streaming);
+      self.requests.lock().unwrap().push((streamed, request));
       let (turn, hang) = match exchange.mode {
         // Only the summarizer asks without streaming, and it is told the
-        // same every time.
-        Mode::Unary => (vec![said("Something about fruit.")], false),
+        // same every time — unless the test says otherwise first.
+        Mode::Unary => (
+          self
+            .unary
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| vec![said("Something about fruit.")]),
+          false,
+        ),
         Mode::Streaming if Some(self.streamed.fetch_add(1, Ordering::Relaxed)) == self.too_big => {
           return Opening::failed(ProviderError::from_http_response(
             http::StatusCode::BAD_REQUEST,
@@ -2223,6 +2264,125 @@ mod tests {
       !compacted.kept.iter().any(compaction::is_summary),
       "one fresh summary, not nested"
     );
+  }
+
+  /// A runtime on `model` with a preamble and a tool, so a request that
+  /// dropped either would show it.
+  fn with_preamble(model: &Scripted) -> Arc<Runtime> {
+    Arc::new(Runtime {
+      model: model.model(),
+      tools: Tools::new(
+        ToolServer::new()
+          .tool(BashTool {
+            cwd: std::env::temp_dir(),
+          })
+          .run(),
+      ),
+      preamble: "Be brief.".to_string(),
+      compaction: TEST_SETTINGS,
+      rules: Default::default(),
+      max_tokens: None,
+    })
+  }
+
+  /// The text of a request's last message.
+  fn last_text(request: &CompletionRequest) -> String {
+    match request.chat_history.last().map(|m| &**m) {
+      Some(Message::User { content }) => content
+        .iter()
+        .filter_map(|c| match c {
+          UserContent::Text(t) => Some(t.text.as_str()),
+          _ => None,
+        })
+        .collect(),
+      other => panic!("a request ending in the user's words, not {other:?}"),
+    }
+  }
+
+  /// A server that keeps the last prompt it read reuses it as far as the
+  /// next one agrees with it, so a summary is asked for with what the run
+  /// sent — preamble, tools and messages — and the instructions only after.
+  /// And of the two a split turn takes, the longer is asked first, so the
+  /// shorter is all there still.
+  #[tokio::test]
+  async fn summaries_are_asked_at_the_end_of_what_the_run_sent() {
+    let model = Scripted {
+      turns: Arc::new(Mutex::new([vec![said("second answer")]].into())),
+      ..Scripted::default()
+    };
+    let runtime = with_preamble(&model);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let first = vec![Message::user("first question"), Message::assistant("first answer")];
+    collect(&runtime, first.clone(), "second question", &mut rx, &tx).await;
+
+    let history = [
+      first,
+      vec![Message::user("second question"), Message::assistant("second answer")],
+    ]
+    .concat();
+    let compacted = compaction::compact(&runtime, history, &TEST_SETTINGS)
+      .await
+      .unwrap()
+      .expect("something to compact");
+    // The cut falls on the last answer, inside the second turn.
+    assert_eq!(compacted.kept, [Message::assistant("second answer")]);
+
+    let requests = model.requests.lock().unwrap().clone();
+    let [(true, run), (false, turn), (false, checkpoint)] = requests.as_slice() else {
+      panic!("the run's request, then two summaries: {requests:?}");
+    };
+    // The turn first, at the cut: everything the run sent, the request that
+    // began the turn with the instructions after it rather than a second
+    // user message in a row.
+    assert_eq!(turn.chat_history.len(), run.chat_history.len());
+    assert_eq!(turn.chat_history[..3], run.chat_history[..3]);
+    assert_eq!(turn.tools, run.tools);
+    assert!(!turn.tools.is_empty(), "the tools are part of the prompt");
+    let asked = last_text(turn);
+    assert!(
+      asked.starts_with("second question\n\n") && asked.contains("PREFIX of that turn"),
+      "{asked}"
+    );
+    // Then the checkpoint, where the turn begins: a prefix of the first.
+    assert_eq!(checkpoint.chat_history.len(), 4);
+    assert_eq!(checkpoint.chat_history[..3], run.chat_history[..3]);
+    assert_eq!(checkpoint.tools, run.tools);
+    assert!(last_text(checkpoint).contains("conversation to summarize"));
+  }
+
+  /// An answer that is no summary — a tool called, nothing said — is not
+  /// taken for one: the summary is asked for again over a transcript, with
+  /// the summarizer's own preamble and no tools to call.
+  #[tokio::test]
+  async fn a_summary_that_calls_a_tool_is_asked_for_again_over_a_transcript() {
+    let model = Scripted {
+      unary: Arc::new(Mutex::new([vec![asks("c1", "ls")]].into())),
+      ..Scripted::default()
+    };
+    let runtime = with_preamble(&model);
+    let history = vec![
+      Message::user("first question"),
+      Message::assistant("first answer"),
+      Message::user("second question"),
+      Message::assistant("second answer"),
+    ];
+    let settings = Settings {
+      turn_summary: false,
+      ..TEST_SETTINGS
+    };
+    let compacted = compaction::compact(&runtime, history, &settings)
+      .await
+      .unwrap()
+      .expect("something to compact");
+    assert_eq!(compacted.summary, "Something about fruit.");
+
+    let requests = model.requests.lock().unwrap().clone();
+    let [(false, _), (false, transcript)] = requests.as_slice() else {
+      panic!("asked in place, then over a transcript: {requests:?}");
+    };
+    assert_eq!(*transcript.chat_history[0], Message::system(compaction::SYSTEM_PROMPT));
+    assert!(transcript.tools.is_empty());
+    assert!(last_text(transcript).contains("[User]: second question"));
   }
 
   /// The provider counts what it was sent; only what has been said since is
