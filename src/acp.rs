@@ -18,19 +18,20 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
   AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, CancelNotification, CloseSessionRequest,
   CloseSessionResponse, ContentBlock, ContentChunk, DeleteSessionRequest, DeleteSessionResponse, Diff,
-  EmbeddedResourceResource, Error, ImageContent, Implementation, InitializeRequest, InitializeResponse,
-  ListSessionsRequest, ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer,
-  NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ResumeSessionRequest,
-  ResumeSessionResponse, SessionCapabilities, SessionCloseCapabilities, SessionConfigOption,
-  SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelectOption, SessionDeleteCapabilities,
-  SessionId, SessionInfo, SessionInfoUpdate, SessionListCapabilities, SessionNotification, SessionResumeCapabilities,
-  SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, ToolCall, ToolCallContent,
+  EmbeddedResourceResource, ImageContent, Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
+  ListSessionsResponse, LoadSessionRequest, LoadSessionResponse, McpCapabilities, McpServer, NewSessionRequest,
+  NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, ResumeSessionRequest, ResumeSessionResponse,
+  SessionCapabilities, SessionCloseCapabilities, SessionConfigOption, SessionConfigOptionCategory,
+  SessionConfigOptionValue, SessionConfigSelectOption, SessionDeleteCapabilities, SessionId, SessionInfo,
+  SessionInfoUpdate, SessionListCapabilities, SessionNotification, SessionResumeCapabilities, SessionUpdate,
+  SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, ToolCall, ToolCallContent,
   ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
-use agent_client_protocol::{Agent, Client, ConnectionTo, Responder, Stdio};
+use agent_client_protocol::v1::{ConnectionTo, Responder};
+use agent_client_protocol::{Agent, Client, Error, Stdio};
 use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -98,7 +99,7 @@ pub async fn serve(setup: Setup) -> Result<()> {
     fa.clone(),
   );
   Agent
-    .builder()
+    .v1()
     .name("fa")
     .on_receive_request(
       async move |request: InitializeRequest, responder: Responder<InitializeResponse>, _: ConnectionTo<Client>| {
@@ -378,7 +379,10 @@ impl Fa {
       None => Default::default(),
     };
     add_servers(&mut config, servers, &mut notes);
-    let servers = mcp::connect(config, &host).await;
+    // Boxed: connecting nests rmcp's transports deeply enough that laying
+    // out the futures every session request is answered in overflows the
+    // compiler's query depth.
+    let servers = Box::pin(mcp::connect(config, &host)).await;
     notes.extend(servers.notes().iter().cloned());
 
     let mut cfg = self.setup.cfg.clone();
@@ -480,7 +484,7 @@ impl Fa {
       .into_iter()
       .find(|info| *info.id == *id.0)
       .map(|info| info.path)
-      .ok_or_else(|| Error::resource_not_found(Some(id.to_string())))
+      .ok_or_else(|| agent_client_protocol::v1::schema::Error::resource_not_found(Some(id.to_string())).into())
   }
 
   fn list_sessions(&self, request: ListSessionsRequest) -> ListSessionsResponse {
@@ -716,7 +720,7 @@ fn quoted(word: &str) -> String {
 /// told. An editor that fails to answer at all is the user walking away.
 #[cfg(feature = "mcp")]
 fn elicitation(cx: ConnectionTo<Client>, id: SessionId) -> crate::elicit::Forward {
-  use agent_client_protocol::schema::v1::{CreateElicitationRequest, ElicitationFormMode, ElicitationSessionScope};
+  use agent_client_protocol::v1::schema::{CreateElicitationRequest, ElicitationFormMode, ElicitationSessionScope};
   use rmcp::model::{ElicitResult, ElicitationAction};
 
   Arc::new(move |server, message, schema| {
@@ -744,7 +748,7 @@ fn elicitation(cx: ConnectionTo<Client>, id: SessionId) -> crate::elicit::Forwar
 /// beside them, which MCP keeps for the servers that still send one and ACP
 /// never had: it becomes the titled options both of them know.
 #[cfg(feature = "mcp")]
-fn form(schema: &rmcp::model::ElicitationSchema) -> Option<agent_client_protocol::schema::v1::ElicitationSchema> {
+fn form(schema: &rmcp::model::ElicitationSchema) -> Option<agent_client_protocol::v1::schema::ElicitationSchema> {
   let mut schema = serde_json::to_value(schema).ok()?;
   if let Some(properties) = schema.get_mut("properties").and_then(|it| it.as_object_mut()) {
     for property in properties.values_mut().filter_map(|it| it.as_object_mut()) {
@@ -771,8 +775,8 @@ fn form(schema: &rmcp::model::ElicitationSchema) -> Option<agent_client_protocol
 /// What the editor answered, as the server is told it. An answer of a kind
 /// this does not know is no answer.
 #[cfg(feature = "mcp")]
-fn answer(action: agent_client_protocol::schema::v1::ElicitationAction) -> rmcp::model::ElicitResult {
-  use agent_client_protocol::schema::v1::ElicitationAction as Answered;
+fn answer(action: agent_client_protocol::v1::schema::ElicitationAction) -> rmcp::model::ElicitResult {
+  use agent_client_protocol::v1::schema::ElicitationAction as Answered;
   use rmcp::model::{ElicitResult, ElicitationAction};
 
   match action {
@@ -1065,7 +1069,7 @@ impl Turn {
       }
       AgentEvent::Usage { context_tokens, .. } => {
         self.tell(SessionUpdate::UsageUpdate(
-          agent_client_protocol::schema::v1::UsageUpdate::new(context_tokens, self.window),
+          agent_client_protocol::v1::schema::UsageUpdate::new(context_tokens, self.window),
         ));
       }
       // Nothing here asks the user: an editor has no way to answer.
@@ -1336,7 +1340,7 @@ fn replay(session: &Session, cwd: &Path) -> Vec<SessionUpdate> {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use agent_client_protocol::schema::v1::{EmbeddedResource, ResourceLink, TextContent, TextResourceContents};
+  use agent_client_protocol::v1::schema::{EmbeddedResource, ResourceLink, TextContent, TextResourceContents};
 
   #[test]
   fn a_prompt_reads_its_mentions_where_they_were_made() {
@@ -1401,7 +1405,7 @@ mod tests {
   #[cfg(feature = "mcp")]
   #[test]
   fn a_servers_form_reaches_the_editor_with_its_choices_titled() {
-    use agent_client_protocol::schema::v1::ElicitationPropertySchema;
+    use agent_client_protocol::v1::schema::ElicitationPropertySchema;
 
     let schema: rmcp::model::ElicitationSchema = serde_json::from_value(serde_json::json!({
       "type": "object",
@@ -1442,7 +1446,7 @@ mod tests {
   #[cfg(feature = "mcp")]
   #[test]
   fn what_the_editor_answers_is_what_the_server_is_told() {
-    use agent_client_protocol::schema::v1::{ElicitationAcceptAction, ElicitationAction as Answered};
+    use agent_client_protocol::v1::schema::{ElicitationAcceptAction, ElicitationAction as Answered};
     use rmcp::model::ElicitationAction;
 
     let content = std::collections::BTreeMap::from([

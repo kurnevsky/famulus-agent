@@ -112,7 +112,7 @@ lang-yaml = ["syntax", "dep:tree-sitter-yaml"]
 lang-zig = ["syntax", "dep:tree-sitter-zig"]
 
 [dependencies]
-agent-client-protocol = { version = "3.6", features = ["stdio"], optional = true }
+agent-client-protocol = { version = "5.2", features = ["stdio"], optional = true }
 anyhow = "1.0.104"
 # The shape rmcp gives the store an OAuth login is kept in.
 async-trait = { version = "0.1.92", optional = true }
@@ -128,7 +128,7 @@ mdstitch = "0.1"
 nucleo-matcher = "0.3.1"
 # The system keyring — Secret Service, or the portal inside a sandbox — which
 # is where an MCP server's OAuth tokens are kept between sessions.
-oo7 = { version = "0.6", optional = true }
+oo7 = { version = "0.7", optional = true }
 # PDFs `read` is given, turned into Markdown. Without its OCR features: a
 # scanned page is reported as having no text rather than read from pixels.
 pdf-inspector = "1.25"
